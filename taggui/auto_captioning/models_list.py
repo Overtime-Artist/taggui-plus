@@ -7,7 +7,10 @@ from auto_captioning.models.llava_llama_3 import LlavaLlama3
 from auto_captioning.models.llava_next import (LlavaNext34b, LlavaNextMistral,
                                                LlavaNextVicuna)
 from auto_captioning.models.moondream import Moondream1, Moondream2
+from auto_captioning.models.pixai_tagger import PixAiTagger
 from auto_captioning.models.phi_3_vision import Phi3Vision
+from auto_captioning.models.qwen_vl import (Qwen2Vl, Qwen2Point5Vl, Qwen3Vl,
+                                            Qwen3VlThinking)
 from auto_captioning.models.wd_tagger import WdTagger
 
 MODELS = [
@@ -18,6 +21,16 @@ MODELS = [
     'microsoft/Florence-2-base',
     'MiaoshouAI/Florence-2-large-PromptGen-v2.0',
     'MiaoshouAI/Florence-2-base-PromptGen-v2.0',
+    'Qwen/Qwen3-VL-8B-Thinking',
+    'Qwen/Qwen3-VL-8B-Instruct',
+    'Qwen/Qwen3-VL-4B-Thinking',
+    'Qwen/Qwen3-VL-4B-Instruct',
+    'Felldude/Qwen3-VL-8B-Instruct-Uncensored-V2',
+    'Felldude/Qwen3-VL-4B-Instruct-Uncensored',
+    'Qwen/Qwen2.5-VL-7B-Instruct',
+    'Qwen/Qwen2.5-VL-3B-Instruct',
+    'Qwen/Qwen2-VL-7B-Instruct',
+    'Qwen/Qwen2-VL-2B-Instruct',
     'microsoft/Phi-3-vision-128k-instruct',
     'llava-hf/llava-v1.6-mistral-7b-hf',
     'llava-hf/llava-v1.6-vicuna-7b-hf',
@@ -25,30 +38,15 @@ MODELS = [
     'llava-hf/llava-v1.6-34b-hf',
     'xtuner/llava-llama-3-8b-v1_1-transformers',
     'vikhyatk/moondream2',
-    'vikhyatk/moondream1',
     'SmilingWolf/wd-eva02-large-tagger-v3',
     'SmilingWolf/wd-vit-large-tagger-v3',
     'SmilingWolf/wd-swinv2-tagger-v3',
     'SmilingWolf/wd-convnext-tagger-v3',
     'SmilingWolf/wd-vit-tagger-v3',
-    'SmilingWolf/wd-v1-4-moat-tagger-v2',
-    'SmilingWolf/wd-v1-4-swinv2-tagger-v2',
-    'SmilingWolf/wd-v1-4-convnext-tagger-v2',
-    'SmilingWolf/wd-v1-4-convnextv2-tagger-v2',
-    'SmilingWolf/wd-v1-4-vit-tagger-v2',
+    'deepghs/pixai-tagger-v0.9-onnx',
     'llava-hf/llava-1.5-7b-hf',
     'llava-hf/llava-1.5-13b-hf',
-    'llava-hf/bakLlava-v1-hf',
-    'Salesforce/instructblip-vicuna-7b',
-    'Salesforce/instructblip-vicuna-13b',
-    'Salesforce/instructblip-flan-t5-xl',
-    'Salesforce/instructblip-flan-t5-xxl',
-    'Salesforce/blip2-opt-2.7b',
-    'Salesforce/blip2-opt-6.7b',
-    'Salesforce/blip2-opt-6.7b-coco',
-    'Salesforce/blip2-flan-t5-xl',
-    'Salesforce/blip2-flan-t5-xxl',
-    'microsoft/kosmos-2-patch14-224'
+    'llava-hf/bakLlava-v1-hf'
 ]
 
 
@@ -78,6 +76,16 @@ def get_model_class(model_id: str) -> type[AutoCaptioningModel]:
         return Moondream2
     if 'phi-3' in lowercase_model_id:
         return Phi3Vision
+    if 'qwen3-vl' in lowercase_model_id or 'qwen3_vl' in lowercase_model_id:
+        if 'thinking' in lowercase_model_id:
+            return Qwen3VlThinking
+        return Qwen3Vl
+    if 'qwen2.5-vl' in lowercase_model_id or 'qwen2_5-vl' in lowercase_model_id:
+        return Qwen2Point5Vl
+    if 'qwen2-vl' in lowercase_model_id:
+        return Qwen2Vl
+    if 'pixai' in lowercase_model_id and 'tagger' in lowercase_model_id:
+        return PixAiTagger
     if 'wd' in lowercase_model_id and 'tagger' in lowercase_model_id:
         return WdTagger
     return AutoCaptioningModel

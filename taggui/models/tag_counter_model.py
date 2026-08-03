@@ -1,8 +1,10 @@
 from collections import Counter
 
 from PySide6.QtCore import QAbstractListModel, Qt, Signal, Slot
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QMessageBox
 
+from models.tag_library_model import TagLibraryModel
 from utils.image import Image
 from utils.utils import get_confirmation_dialog_reply, list_with_and, pluralize
 
@@ -10,16 +12,20 @@ from utils.utils import get_confirmation_dialog_reply, list_with_and, pluralize
 class TagCounterModel(QAbstractListModel):
     tags_renaming_requested = Signal(list, str)
 
-    def __init__(self):
+    def __init__(self, tag_library_model: TagLibraryModel):
         super().__init__()
+        self.tag_library_model = tag_library_model
         self.tag_counter = Counter()
         self.most_common_tags = []
         self.all_tags_list = None
+        self.tag_library_model.modelReset.connect(self.refresh_tag_colors)
+        self.tag_library_model.categories_changed.connect(
+            self.refresh_tag_colors)
 
     def rowCount(self, parent=None) -> int:
         return len(self.most_common_tags)
 
-    def data(self, index, role=None) -> tuple[str, int] | str:
+    def data(self, index, role=None) -> tuple[str, int] | str | QColor | None:
         tag, count = self.most_common_tags[index.row()]
         if role == Qt.ItemDataRole.UserRole:
             return tag, count
@@ -27,6 +33,15 @@ class TagCounterModel(QAbstractListModel):
             return f'{tag} ({count})'
         if role == Qt.ItemDataRole.EditRole:
             return tag
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return f'{tag} ({count})'
+        if role == Qt.ItemDataRole.ForegroundRole:
+            category = self.tag_library_model.get_category_for_tag(tag)
+            if category:
+                color = QColor(category['color'])
+                if color.isValid():
+                    return color
+        return None
 
     def flags(self, index) -> Qt.ItemFlag:
         """Make the tags editable."""
@@ -68,8 +83,18 @@ class TagCounterModel(QAbstractListModel):
 
     @Slot()
     def count_tags(self, images: list[Image]):
+        self.beginResetModel()
         self.tag_counter.clear()
         for image in images:
             self.tag_counter.update(image.tags)
         self.most_common_tags = self.tag_counter.most_common()
-        self.modelReset.emit()
+        self.endResetModel()
+
+    @Slot()
+    def refresh_tag_colors(self):
+        row_count = self.rowCount()
+        if row_count == 0:
+            return
+        self.dataChanged.emit(
+            self.index(0), self.index(row_count - 1),
+            [Qt.ItemDataRole.ForegroundRole])

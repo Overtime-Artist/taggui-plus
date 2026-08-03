@@ -1,3 +1,6 @@
+import sys
+from pathlib import Path
+
 import torch
 from transformers import AutoModelForCausalLM, BatchFeature
 
@@ -14,6 +17,28 @@ class Phi3Vision(AutoCaptioningModel):
                  caption_settings: dict):
         super().__init__(captioning_thread_, caption_settings)
         self.input_length = None
+
+    def patch_source_code(self) -> bool:
+        """Patch the remote code for compatibility with Transformers >= 4.49.
+
+        `Cache.get_max_length()` was removed in favor of
+        `get_max_cache_shape()`, which breaks Phi-3-Vision's
+        `prepare_inputs_for_generation`.
+        """
+        module = next((module for name, module in sys.modules.items()
+                       if 'modeling_phi3_v' in name), None)
+        if module is None or not getattr(module, '__file__', None):
+            return False
+        source_path = Path(module.__file__)
+        source = source_path.read_text(encoding='utf-8')
+        old = 'past_key_values.get_max_length()'
+        new = 'past_key_values.get_max_cache_shape()'
+        if old not in source:
+            return False
+        source = source.replace(old, new)
+        source_path.write_text(source, encoding='utf-8')
+        del sys.modules[module.__name__]
+        return True
 
     @staticmethod
     def get_default_prompt() -> str:

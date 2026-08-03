@@ -8,16 +8,82 @@ from pathlib import Path
 
 import exifread
 import imagesize
-from PySide6.QtCore import (QAbstractListModel, QModelIndex, QSize, Qt, Signal,
-                            Slot)
-from PySide6.QtGui import QIcon, QImageReader, QPixmap
+from PySide6.QtCore import (QAbstractListModel, QModelIndex, QObject,
+                            QRunnable, QSize, Qt, QThreadPool, Signal, Slot)
+from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap
 from PySide6.QtWidgets import QMessageBox
 
-from utils.image import Image
+from utils.completion_store import get_completion_store
+from utils.enums import ImageListSortBy, SortOrder
+from utils.image import Image, build_caption_text, parse_caption_text
 from utils.settings import DEFAULT_SETTINGS, get_settings
+from utils.thumbnail_cache import evict_to_limit, get_cache_path
 from utils.utils import get_confirmation_dialog_reply, pluralize
 
 UNDO_STACK_SIZE = 32
+
+# Relative priorities for thumbnail work submitted to the capped preload pool.
+# On-demand thumbnails (items currently scrolling into view) should run before
+# speculative bulk preloads.
+ON_DEMAND_THUMBNAIL_PRIORITY = 1
+# Background warming of never-cached thumbnails runs at a lower priority than
+# on-demand loads so that items scrolling into view always jump ahead and the
+# UI stays responsive.
+BACKGROUND_THUMBNAIL_PRIORITY = 0
+
+
+class BackgroundThumbnailWarmer(QRunnable):
+    """
+    Walks the current image list in a single low-priority background thread and
+    writes a disk thumbnail for any image that has never been cached, so the
+    Images pane no longer has to decode them the first time they scroll into
+    view. It only touches the on-disk cache (it does not keep thumbnails in
+    memory), so warming even a very large directory costs almost no RAM. The
+    generation check lets it stop the instant the user switches directory or
+    changes the thumbnail size.
+    """
+
+    def __init__(self, entries: list[tuple[Path, int | None]],
+                 image_width: int, generation: int, is_current):
+        super().__init__()
+        self.entries = entries
+        self.image_width = image_width
+        self.generation = generation
+        self.is_current = is_current
+
+    def run(self):
+        for image_path, file_modified_time_ns in self.entries:
+            # Bail out as soon as this work is superseded (directory switched
+            # or thumbnail size changed).
+            if not self.is_current(self.generation):
+                return
+            cache_path = get_cache_path(
+                image_path, file_modified_time_ns, self.image_width)
+            # Skip images with no stable key or that are already cached; this is
+            # what makes warming cheap on a directory that's mostly cached.
+            if cache_path is None or cache_path.exists():
+                continue
+            image_reader = QImageReader(str(image_path))
+            # Rotate the image based on the orientation tag.
+            image_reader.setAutoTransform(True)
+            image = image_reader.read()
+            if image.isNull():
+                continue
+            thumbnail_image = image.scaledToWidth(
+                self.image_width, Qt.TransformationMode.SmoothTransformation)
+            if not thumbnail_image.isNull():
+                thumbnail_image.save(str(cache_path))
+
+
+class _CacheEvictionRunner(QRunnable):
+    """Runs LRU cache eviction once at startup so over-limit entries are pruned."""
+
+    def __init__(self, max_bytes: int):
+        super().__init__()
+        self.max_bytes = max_bytes
+
+    def run(self):
+        evict_to_limit(self.max_bytes)
 
 
 def get_file_paths(directory_path: Path) -> set[Path]:
@@ -34,10 +100,61 @@ def get_file_paths(directory_path: Path) -> set[Path]:
     return file_paths
 
 
+def read_caption_file(text_file_path: Path,
+                      tag_separator: str) -> tuple[list[str], str, int | None]:
+    """
+    Read and parse a caption `.txt` file.
+
+    Returns (tags, natural_language_prompt, caption_file_modified_time_ns).
+    The modified time is None when the file does not exist or cannot be read.
+    """
+    tags: list[str] = []
+    natural_language_prompt = ''
+    try:
+        caption_file_modified_time_ns = text_file_path.stat().st_mtime_ns
+    except OSError:
+        return tags, natural_language_prompt, None
+    # `errors='replace'` inserts a replacement marker such as '?' when there
+    # is malformed data.
+    try:
+        caption = text_file_path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return tags, natural_language_prompt, None
+    if caption:
+        tags, natural_language_prompt = parse_caption_text(caption,
+                                                           tag_separator)
+    return tags, natural_language_prompt, caption_file_modified_time_ns
+
+
+def get_image_dimensions(image_path: Path) -> tuple[int, int] | None:
+    try:
+        dimensions = imagesize.get(image_path)
+        # Check the Exif orientation tag and rotate the dimensions if
+        # necessary.
+        with open(image_path, 'rb') as image_file:
+            try:
+                exif_tags = exifread.process_file(
+                    image_file, details=False,
+                    stop_tag='Image Orientation')
+                if 'Image Orientation' in exif_tags:
+                    orientations = exif_tags['Image Orientation'].values
+                    if any(value in orientations for value in (5, 6, 7, 8)):
+                        dimensions = (dimensions[1], dimensions[0])
+            except Exception as exception:
+                print(f'Failed to get Exif tags for {image_path}: '
+                      f'{exception}', file=sys.stderr)
+        return dimensions
+    except (ValueError, OSError) as exception:
+        print(f'Failed to get dimensions for {image_path}: '
+              f'{exception}', file=sys.stderr)
+        return None
+
+
 @dataclass
 class HistoryItem:
     action_name: str
     tags: list[list[str]]
+    natural_language_prompts: list[str]
     should_ask_for_confirmation: bool
 
 
@@ -47,21 +164,412 @@ class Scope(str, Enum):
     SELECTED_IMAGES = 'Selected images'
 
 
+class DirectoryScanner(QObject, QRunnable):
+    """Scans a directory for images and captions off the main thread."""
+    scan_complete = Signal(list)
+
+    def __init__(self, directory_path: Path, image_suffixes: list,
+                 tag_separator: str):
+        QObject.__init__(self)
+        QRunnable.__init__(self)
+        self.directory_path = directory_path
+        self.image_suffixes = image_suffixes
+        self.tag_separator = tag_separator
+        self.setAutoDelete(False)
+
+    @Slot()
+    def run(self):
+        from utils.scan_cache import ScanCache
+        scan_cache = ScanCache()
+        scan_cache.load()
+        completion_store = get_completion_store()
+        completion_store.load()
+
+        file_paths = get_file_paths(self.directory_path)
+        image_paths = sorted(
+            p for p in file_paths if p.suffix.lower() in self.image_suffixes
+        )
+        text_file_path_strings = {str(p) for p in file_paths
+                                  if p.suffix == '.txt'}
+
+        dim_updates: dict = {}
+        cap_updates: dict = {}
+        images: list = []
+        # Per-image info handed to the completion store so it can refresh
+        # hashes and re-home "complete" flags after external moves/renames.
+        scanned_for_completion: list = []
+
+        for image_path in image_paths:
+            # Single stat for image mtime/size (cache key + Image attribute +
+            # completion-store size prefilter).
+            try:
+                image_stat = image_path.stat()
+                mtime_ns = image_stat.st_mtime_ns
+                file_size = image_stat.st_size
+            except OSError:
+                mtime_ns = None
+                file_size = None
+
+            # Dimensions — use cache if available, otherwise read from file.
+            if scan_cache.is_dimensions_cached(image_path, mtime_ns):
+                dimensions = scan_cache.get_dimensions(image_path, mtime_ns)
+            else:
+                dimensions = get_image_dimensions(image_path)
+                scan_cache.cache_dimensions(dim_updates, image_path,
+                                            mtime_ns, dimensions)
+
+            # Caption — use cache if available, otherwise read from disk.
+            txt_path = image_path.with_suffix('.txt')
+            txt_path_str = str(txt_path)
+            tags: list = []
+            nl: str = ''
+            cap_mtime_ns = None
+
+            if txt_path_str in text_file_path_strings:
+                try:
+                    cap_mtime_ns = txt_path.stat().st_mtime_ns
+                except OSError:
+                    cap_mtime_ns = None
+
+                cached_cap = (
+                    scan_cache.get_caption(txt_path_str, cap_mtime_ns)
+                    if cap_mtime_ns is not None else None
+                )
+                if cached_cap is not None:
+                    tags, nl = cached_cap
+                else:
+                    try:
+                        caption = txt_path.read_text(encoding='utf-8',
+                                                     errors='replace')
+                        if caption:
+                            tags, nl = parse_caption_text(
+                                caption, self.tag_separator)
+                    except OSError:
+                        pass
+                    if cap_mtime_ns is not None:
+                        scan_cache.cache_caption(cap_updates, txt_path_str,
+                                                 cap_mtime_ns, tags, nl)
+
+            images.append(Image(image_path, dimensions, tags, nl,
+                                file_modified_time_ns=mtime_ns,
+                                caption_file_modified_time_ns=cap_mtime_ns,
+                                is_complete=completion_store.is_complete(
+                                    image_path)))
+            scanned_for_completion.append({
+                'path': image_path,
+                'size': file_size,
+                'mtime_ns': mtime_ns,
+                'cap_path': txt_path_str,
+                'cap_mtime_ns': cap_mtime_ns,
+            })
+
+        # Reconcile the completion store against this scan: refresh hashes for
+        # externally edited images and re-home "complete" flags for images that
+        # were moved or renamed outside the program. Then sync the flag onto the
+        # freshly built Image objects (re-homing can newly complete an image).
+        if completion_store.reconcile(scanned_for_completion):
+            completion_store.save()
+        for image in images:
+            image.is_complete = completion_store.is_complete(image.path)
+
+        live_dim_keys = {str(image_path) for image_path in image_paths}
+        scan_cache.save_async(dim_updates, cap_updates,
+                              directory_path=self.directory_path,
+                              live_dim_keys=live_dim_keys,
+                              live_cap_keys=text_file_path_strings)
+        images.sort(key=lambda img: img.path)
+        self.scan_complete.emit(images)
+
+
+@dataclass
+class RefreshResult:
+    """The outcome of a background directory refresh (see RefreshScanner)."""
+    directory_path: Path
+    added_images: list
+    removed_paths: set
+    # path -> {'file': (snapshot_mtime, new_mtime, dimensions),
+    #          'caption': (snapshot_mtime, new_mtime, tags, prompt)}
+    updates: dict
+
+
+class RefreshScanner(QObject, QRunnable):
+    """
+    Re-scans the current directory off the main thread to detect files that
+    changed while the window was in the background, then reports a diff.
+
+    All disk I/O (directory walk, stats, reading changed caption files) happens
+    here, in a worker thread, so re-focusing the window never freezes the UI.
+    The resulting diff is applied on the main thread by
+    ImageListModel.apply_refresh_result, which does only fast in-memory work.
+    """
+    refresh_complete = Signal(object)
+
+    def __init__(self, directory_path: Path, image_suffixes: list,
+                 tag_separator: str, snapshot: dict):
+        QObject.__init__(self)
+        QRunnable.__init__(self)
+        self.directory_path = directory_path
+        self.image_suffixes = image_suffixes
+        self.tag_separator = tag_separator
+        # snapshot: path -> (file_modified_time_ns, caption_file_modified_time_ns)
+        # for every image currently loaded, captured on the main thread.
+        self.snapshot = snapshot
+        self.setAutoDelete(False)
+
+    @Slot()
+    def run(self):
+        try:
+            result = self._scan()
+        except OSError:
+            # The directory may have been removed or become unreadable while
+            # scanning. Report an empty (no-op) diff so the UI simply skips
+            # this refresh; the next re-focus will try again.
+            result = RefreshResult(self.directory_path, [], set(), {})
+        self.refresh_complete.emit(result)
+
+    def _scan(self) -> 'RefreshResult':
+        completion_store = get_completion_store()
+        file_paths = get_file_paths(self.directory_path)
+        image_paths = {path for path in file_paths
+                       if path.suffix.lower() in self.image_suffixes}
+        text_file_path_strings = {str(path) for path in file_paths
+                                  if path.suffix == '.txt'}
+        existing_paths = set(self.snapshot.keys())
+        removed_paths = existing_paths - image_paths
+        added_paths = sorted(image_paths - existing_paths)
+
+        # Build full Image objects for newly added files (read-only work).
+        added_images = []
+        for image_path in added_paths:
+            dimensions = get_image_dimensions(image_path)
+            try:
+                file_modified_time_ns = image_path.stat().st_mtime_ns
+            except OSError:
+                file_modified_time_ns = None
+            tags: list = []
+            natural_language_prompt = ''
+            caption_file_modified_time_ns = None
+            text_file_path = image_path.with_suffix('.txt')
+            if str(text_file_path) in text_file_path_strings:
+                (tags, natural_language_prompt,
+                 caption_file_modified_time_ns) = read_caption_file(
+                     text_file_path, self.tag_separator)
+            added_images.append(Image(
+                image_path, dimensions, tags, natural_language_prompt,
+                file_modified_time_ns=file_modified_time_ns,
+                caption_file_modified_time_ns=caption_file_modified_time_ns,
+                is_complete=completion_store.is_complete(image_path)))
+        added_images.sort(key=lambda img: img.path)
+
+        # Detect changes to images that already existed at snapshot time.
+        updates: dict = {}
+        for image_path, (snapshot_file_mtime,
+                         snapshot_caption_mtime) in self.snapshot.items():
+            if image_path in removed_paths:
+                continue
+            entry: dict = {}
+
+            # Image file: only read dimensions if the modified time changed.
+            try:
+                new_file_mtime = image_path.stat().st_mtime_ns
+            except OSError:
+                new_file_mtime = snapshot_file_mtime
+            if new_file_mtime != snapshot_file_mtime:
+                entry['file'] = (snapshot_file_mtime, new_file_mtime,
+                                 get_image_dimensions(image_path))
+
+            # Caption file: stat first; only read + parse when it changed.
+            text_file_path = image_path.with_suffix('.txt')
+            try:
+                new_caption_mtime = text_file_path.stat().st_mtime_ns
+            except OSError:
+                new_caption_mtime = None
+            if new_caption_mtime != snapshot_caption_mtime:
+                if new_caption_mtime is None:
+                    entry['caption'] = (snapshot_caption_mtime, None, [], '')
+                else:
+                    tags, natural_language_prompt, _ = read_caption_file(
+                        text_file_path, self.tag_separator)
+                    entry['caption'] = (snapshot_caption_mtime,
+                                        new_caption_mtime, tags,
+                                        natural_language_prompt)
+
+            if entry:
+                updates[image_path] = entry
+
+        return RefreshResult(self.directory_path, added_images, removed_paths,
+                             updates)
+
+
+class ThumbnailLoader(QObject, QRunnable):
+    thumbnail_loaded = Signal(object, QImage, int, object)
+
+    def __init__(self, image_path: Path, image_width: int,
+                 file_modified_time_ns: int | None):
+        QObject.__init__(self)
+        QRunnable.__init__(self)
+        self.image_path = image_path
+        self.image_width = image_width
+        self.file_modified_time_ns = file_modified_time_ns
+        self.setAutoDelete(False)
+
+    @Slot()
+    def run(self):
+        cache_path = get_cache_path(
+            self.image_path, self.file_modified_time_ns, self.image_width)
+        if cache_path is not None and cache_path.exists():
+            cached_image = QImage(str(cache_path))
+            if not cached_image.isNull():
+                self.thumbnail_loaded.emit(
+                    self.image_path, cached_image,
+                    self.image_width, self.file_modified_time_ns)
+                return
+        image_reader = QImageReader(str(self.image_path))
+        # Rotate the image based on the orientation tag.
+        image_reader.setAutoTransform(True)
+        image = image_reader.read()
+        if image.isNull():
+            thumbnail_image = QImage()
+        else:
+            thumbnail_image = image.scaledToWidth(
+                self.image_width, Qt.TransformationMode.SmoothTransformation)
+        if not thumbnail_image.isNull() and cache_path is not None:
+            thumbnail_image.save(str(cache_path))
+        self.thumbnail_loaded.emit(self.image_path, thumbnail_image,
+                                   self.image_width,
+                                   self.file_modified_time_ns)
+
+
 class ImageListModel(QAbstractListModel):
     update_undo_and_redo_actions_requested = Signal()
+    directory_loaded = Signal()
 
     def __init__(self, image_list_image_width: int, tag_separator: str):
         super().__init__()
         self.image_list_image_width = image_list_image_width
         self.tag_separator = tag_separator
+        self.tokenizer = None
         self.images: list[Image] = []
         self.undo_stack = deque(maxlen=UNDO_STACK_SIZE)
         self.redo_stack = []
         self.proxy_image_list_model = None
         self.image_list_selection_model = None
+        self.thumbnail_loaders = set()
+        self._current_scanner = None
+        self._pending_images: list = []
+        # Dedicated pool for all thumbnail work (both on-demand and bulk
+        # preloading); capped so thumbnails can't starve the global pool, which
+        # is reserved for the interactive image load, the directory scanner, and
+        # startup tasks.
+        self._preload_pool = QThreadPool()
+        self._preload_pool.setMaxThreadCount(4)
+        # Bumped whenever the directory or thumbnail size changes so any
+        # in-flight background warming knows to stop.
+        self._preload_generation = 0
+        self._start_cache_eviction()
 
     def rowCount(self, parent=None) -> int:
         return len(self.images)
+
+    def set_tokenizer(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def _start_cache_eviction(self):
+        """Evict over-limit cache entries in a background thread at startup."""
+        settings = get_settings()
+        max_mb = settings.value(
+            'thumbnail_cache_max_size_mb',
+            defaultValue=DEFAULT_SETTINGS['thumbnail_cache_max_size_mb'],
+            type=int)
+        runner = _CacheEvictionRunner(max(1, max_mb) * 1024 * 1024)
+        QThreadPool.globalInstance().start(runner)
+
+    def _start_background_warm(self):
+        """
+        Start (or restart) background caching of thumbnails that aren't on disk
+        yet. Runs one worker on the capped preload pool at a lower priority than
+        on-demand loads, so scrolling always takes precedence and there's no
+        noticeable slowdown. Controlled by the 'background_thumbnail_caching'
+        setting.
+        """
+        settings = get_settings()
+        enabled = settings.value(
+            'background_thumbnail_caching',
+            defaultValue=DEFAULT_SETTINGS['background_thumbnail_caching'],
+            type=bool)
+        if not enabled or not self.images:
+            return
+        # Snapshot the paths/mod-times now so the worker never touches the live
+        # image list (which the main thread may mutate during a refresh).
+        entries = [(image.path, image.file_modified_time_ns)
+                   for image in self.images]
+        generation = self._preload_generation
+        warmer = BackgroundThumbnailWarmer(
+            entries, self.image_list_image_width, generation,
+            lambda gen: self._preload_generation == gen)
+        self._preload_pool.start(warmer, BACKGROUND_THUMBNAIL_PRIORITY)
+
+    def set_image_width(self, image_width: int):
+        normalized_width = max(image_width, 16)
+        if normalized_width == self.image_list_image_width:
+            return
+        self._preload_pool.clear()
+        self._preload_generation += 1
+        self.image_list_image_width = normalized_width
+        for image in self.images:
+            image.thumbnail = None
+            image.thumbnail_loading = False
+        row_count = self.rowCount()
+        if row_count == 0:
+            return
+        self.dataChanged.emit(
+            self.index(0, 0), self.index(row_count - 1, 0),
+            [Qt.ItemDataRole.DecorationRole, Qt.ItemDataRole.SizeHintRole])
+        # Thumbnails are keyed by width, so the new size needs its own cache.
+        self._start_background_warm()
+
+    def load_thumbnail(self, image: Image):
+        if image.thumbnail or image.thumbnail_loading:
+            return
+        image.thumbnail_loading = True
+        thumbnail_loader = ThumbnailLoader(
+            image.path, self.image_list_image_width, image.file_modified_time_ns)
+        thumbnail_loader.thumbnail_loaded.connect(self.on_thumbnail_loaded)
+        self.thumbnail_loaders.add(thumbnail_loader)
+        # On-demand loads are for items scrolling into view: run them on the
+        # capped thumbnail pool ahead of speculative preloads, and keep them off
+        # the global pool so they don't delay the interactive image load.
+        self._preload_pool.start(thumbnail_loader,
+                                 ON_DEMAND_THUMBNAIL_PRIORITY)
+
+    @Slot(object, QImage, int, object)
+    def on_thumbnail_loaded(self, image_path: Path, thumbnail_image: QImage,
+                            image_width: int,
+                            file_modified_time_ns: int | None):
+        thumbnail_loader = self.sender()
+        if thumbnail_loader in self.thumbnail_loaders:
+            self.thumbnail_loaders.remove(thumbnail_loader)
+            thumbnail_loader.deleteLater()
+        for row, image in enumerate(self.images):
+            if image.path != image_path:
+                continue
+            if image_width != self.image_list_image_width:
+                return
+            if file_modified_time_ns != image.file_modified_time_ns:
+                return
+            image.thumbnail_loading = False
+            # Skip if already loaded synchronously by data().
+            if image.thumbnail:
+                return
+            if thumbnail_image.isNull():
+                return
+            pixmap = QPixmap.fromImage(thumbnail_image)
+            image.thumbnail = QIcon(pixmap)
+            image_index = self.index(row, 0)
+            self.dataChanged.emit(
+                image_index, image_index,
+                [Qt.ItemDataRole.DecorationRole, Qt.ItemDataRole.SizeHintRole])
+            return
 
     def data(self, index, role=None) -> Image | str | QIcon | QSize:
         image = self.images[index.row()]
@@ -70,24 +578,44 @@ class ImageListModel(QAbstractListModel):
         if role == Qt.ItemDataRole.DisplayRole:
             # The text shown next to the thumbnail in the image list.
             text = image.path.name
-            if image.tags:
-                caption = self.tag_separator.join(image.tags)
+            if image.natural_language_prompt:
+                text += ' [NL]'
+            caption = build_caption_text(image.tags,
+                                         image.natural_language_prompt,
+                                         self.tag_separator)
+            if caption:
+                text += f'\n{caption}'
+            return text
+        if role == Qt.ItemDataRole.ToolTipRole:
+            text = image.path.name
+            if image.natural_language_prompt:
+                text += ' [NL]'
+            caption = build_caption_text(image.tags,
+                                         image.natural_language_prompt,
+                                         self.tag_separator)
+            if caption:
                 text += f'\n{caption}'
             return text
         if role == Qt.ItemDataRole.DecorationRole:
-            # The thumbnail. If the image already has a thumbnail stored, use
-            # it. Otherwise, generate a thumbnail and save it to the image.
+            # Return a cached thumbnail if already loaded in this session.
             if image.thumbnail:
                 return image.thumbnail
-            image_reader = QImageReader(str(image.path))
-            # Rotate the image based on the orientation tag.
-            image_reader.setAutoTransform(True)
-            pixmap = QPixmap.fromImageReader(image_reader).scaledToWidth(
-                self.image_list_image_width,
-                Qt.TransformationMode.SmoothTransformation)
-            thumbnail = QIcon(pixmap)
-            image.thumbnail = thumbnail
-            return thumbnail
+            # Check the persistent disk cache — much faster than a full decode.
+            cache_path = get_cache_path(
+                image.path, image.file_modified_time_ns,
+                self.image_list_image_width)
+            if cache_path is not None and cache_path.exists():
+                cached_image = QImage(str(cache_path))
+                if not cached_image.isNull():
+                    pixmap = QPixmap.fromImage(cached_image)
+                    thumbnail = QIcon(pixmap)
+                    image.thumbnail = thumbnail
+                    image.thumbnail_loading = False
+                    return thumbnail
+            # Cache miss — start async loader, don't block main thread.
+            if not image.thumbnail_loading:
+                self.load_thumbnail(image)
+            return None
         if role == Qt.ItemDataRole.SizeHintRole:
             if image.thumbnail:
                 return image.thumbnail.availableSizes()[0]
@@ -100,12 +628,94 @@ class ImageListModel(QAbstractListModel):
             return QSize(self.image_list_image_width,
                          int(self.image_list_image_width * height / width))
 
-    def load_directory(self, directory_path: Path):
-        self.images.clear()
-        self.undo_stack.clear()
-        self.redo_stack.clear()
-        self.update_undo_and_redo_actions_requested.emit()
-        file_paths = get_file_paths(directory_path)
+    def _build_sort_key(self, sort_by: str, sort_order: str):
+        """Return (key_func, reverse) for sorting a list of Image objects."""
+        reverse = (sort_order == SortOrder.DESCENDING)
+        file_stat_by_path = {}
+        token_count_by_path = {}
+
+        def get_token_count(image: Image):
+            if self.tokenizer is None:
+                return 0
+            token_count = token_count_by_path.get(image.path)
+            if token_count is not None:
+                return token_count
+            caption = build_caption_text(image.tags,
+                                         image.natural_language_prompt,
+                                         self.tag_separator)
+            # Subtract 2 for the `<|startoftext|>` and `<|endoftext|>` tokens.
+            token_count = len(self.tokenizer(caption).input_ids) - 2
+            token_count_by_path[image.path] = token_count
+            return token_count
+
+        def get_file_stat(image: Image):
+            file_stat = file_stat_by_path.get(image.path)
+            if file_stat is not None:
+                return file_stat
+            try:
+                file_stat = image.path.stat()
+            except OSError:
+                file_stat = None
+            file_stat_by_path[image.path] = file_stat
+            return file_stat
+
+        def get_sort_key(image: Image):
+            if sort_by == ImageListSortBy.PATH:
+                primary_sort = str(image.path).casefold()
+            elif sort_by == ImageListSortBy.NAME:
+                primary_sort = image.path.name.casefold()
+            elif sort_by == ImageListSortBy.MODIFIED_TIME:
+                file_stat = get_file_stat(image)
+                primary_sort = file_stat.st_mtime if file_stat else 0.0
+            elif sort_by == ImageListSortBy.CREATED_TIME:
+                file_stat = get_file_stat(image)
+                primary_sort = file_stat.st_ctime if file_stat else 0.0
+            elif sort_by == ImageListSortBy.FILE_SIZE:
+                file_stat = get_file_stat(image)
+                primary_sort = file_stat.st_size if file_stat else 0
+            elif sort_by == ImageListSortBy.RESOLUTION:
+                if image.dimensions:
+                    width, height = image.dimensions
+                    primary_sort = width * height
+                else:
+                    primary_sort = 0
+            elif sort_by == ImageListSortBy.TAG_COUNT:
+                primary_sort = len(image.tags)
+            elif sort_by == ImageListSortBy.TOKEN_COUNT:
+                primary_sort = get_token_count(image)
+            elif sort_by == ImageListSortBy.NATURAL_LANGUAGE_PROMPT_LENGTH:
+                primary_sort = len(image.natural_language_prompt)
+            else:
+                primary_sort = str(image.path).casefold()
+            return primary_sort, str(image.path).casefold()
+
+        return get_sort_key, reverse
+
+    def sort_images(self, sort_by: str, sort_order: str):
+        if len(self.images) <= 1:
+            return
+        get_sort_key, reverse = self._build_sort_key(sort_by, sort_order)
+        sorted_images = sorted(self.images, key=get_sort_key, reverse=reverse)
+        if sorted_images == self.images:
+            return
+        self.beginResetModel()
+        self.images = sorted_images
+        self.endResetModel()
+
+    def apply_pending_images(self, sort_by: str, sort_order: str):
+        """Sort pending scanned images and commit them in a single model reset."""
+        images = self._pending_images
+        self._pending_images = []
+        if len(images) > 1:
+            get_sort_key, reverse = self._build_sort_key(sort_by, sort_order)
+            images.sort(key=get_sort_key, reverse=reverse)
+        self.beginResetModel()
+        self.images = images
+        self.endResetModel()
+        # Silently cache any thumbnails that have never been generated.
+        self._start_background_warm()
+
+    def get_image_suffixes(self) -> list[str]:
         settings = get_settings()
         image_suffixes_string = settings.value(
             'image_list_file_formats',
@@ -116,65 +726,154 @@ class ImageListModel(QAbstractListModel):
             if not suffix.startswith('.'):
                 suffix = '.' + suffix
             image_suffixes.append(suffix)
-        image_paths = {path for path in file_paths
-                       if path.suffix.lower() in image_suffixes}
-        # Comparing paths is slow on some systems, so convert the paths to
-        # strings.
-        text_file_path_strings = {str(path) for path in file_paths
-                                  if path.suffix == '.txt'}
-        for image_path in image_paths:
-            try:
-                dimensions = imagesize.get(image_path)
-                # Check the Exif orientation tag and rotate the dimensions if
-                # necessary.
-                with open(image_path, 'rb') as image_file:
-                    try:
-                        exif_tags = exifread.process_file(
-                            image_file, details=False,
-                            stop_tag='Image Orientation')
-                        if 'Image Orientation' in exif_tags:
-                            orientations = (exif_tags['Image Orientation']
-                                            .values)
-                            if any(value in orientations
-                                   for value in (5, 6, 7, 8)):
-                                dimensions = (dimensions[1], dimensions[0])
-                    except Exception as exception:
-                        print(f'Failed to get Exif tags for {image_path}: '
-                              f'{exception}', file=sys.stderr)
-            except (ValueError, OSError) as exception:
-                print(f'Failed to get dimensions for {image_path}: '
-                      f'{exception}', file=sys.stderr)
-                dimensions = None
-            tags = []
-            text_file_path = image_path.with_suffix('.txt')
-            if str(text_file_path) in text_file_path_strings:
-                # `errors='replace'` inserts a replacement marker such as '?'
-                # when there is malformed data.
-                caption = text_file_path.read_text(encoding='utf-8',
-                                                   errors='replace')
-                if caption:
-                    tags = caption.split(self.tag_separator)
-                    tags = [tag.strip() for tag in tags]
-                    tags = [tag for tag in tags if tag]
-            image = Image(image_path, dimensions, tags)
-            self.images.append(image)
-        self.images.sort(key=lambda image_: image_.path)
-        self.modelReset.emit()
+        return image_suffixes
+
+    def read_caption_for_image(self, image_path: Path
+                               ) -> tuple[list[str], str, int | None]:
+        text_file_path = image_path.with_suffix('.txt')
+        return read_caption_file(text_file_path, self.tag_separator)
+
+    def load_directory(self, directory_path: Path):
+        # Cancel any pending preload workers from the previous directory.
+        self._preload_pool.clear()
+        self._preload_generation += 1
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.update_undo_and_redo_actions_requested.emit()
+        # Scan in a background thread; the old list stays visible until done.
+        image_suffixes = self.get_image_suffixes()
+        scanner = DirectoryScanner(directory_path, image_suffixes,
+                                   self.tag_separator)
+        scanner.scan_complete.connect(
+            lambda images, s=scanner: self._on_directory_scanned(images, s))
+        self._current_scanner = scanner
+        QThreadPool.globalInstance().start(scanner)
+
+    @Slot(list)
+    def _on_directory_scanned(self, images: list, scanner=None):
+        # Ignore results from a superseded scan: if the user switched
+        # directories before this scan finished, a newer scanner is now
+        # current and this stale result must not overwrite its images.
+        if scanner is not None and scanner is not self._current_scanner:
+            return
+        # Store images for main_window._on_directory_loaded to sort and commit
+        # in a single model reset (avoids the double-reset from sort + load).
+        self._pending_images = images
+        self.directory_loaded.emit()
+
+    def apply_refresh_result(self, result) -> tuple[bool, set[int]]:
+        """
+        Apply a diff produced by RefreshScanner on the main thread.
+
+        Only fast in-memory work happens here (no disk I/O). Returns
+        (structure_changed, changed_rows) so the caller can re-sort / re-count
+        and reload the current image if needed, matching the old synchronous
+        refresh behavior. Per-image updates are guarded by the snapshot
+        modified-times so a value the user changed while the scan was running is
+        never overwritten with stale data.
+        """
+        structure_changed = False
+
+        # Removals: files that disappeared from the directory.
+        if result.removed_paths:
+            rows_to_remove = [row for row, image in enumerate(self.images)
+                              if image.path in result.removed_paths]
+            for row in sorted(rows_to_remove, reverse=True):
+                self.beginRemoveRows(QModelIndex(), row, row)
+                del self.images[row]
+                self.endRemoveRows()
+            if rows_to_remove:
+                structure_changed = True
+
+        # Additions: files that newly appeared. Skip any that already exist in
+        # the model (e.g. if the directory was reloaded meanwhile).
+        if result.added_images:
+            existing_paths = {image.path for image in self.images}
+            new_images = [image for image in result.added_images
+                          if image.path not in existing_paths]
+            if new_images:
+                start_row = len(self.images)
+                end_row = start_row + len(new_images) - 1
+                self.beginInsertRows(QModelIndex(), start_row, end_row)
+                self.images.extend(new_images)
+                self.endInsertRows()
+                structure_changed = True
+
+        # Updates: images whose file and/or caption changed on disk.
+        changed_rows = []
+        if result.updates:
+            path_to_row = {image.path: row
+                           for row, image in enumerate(self.images)}
+            for image_path, entry in result.updates.items():
+                row = path_to_row.get(image_path)
+                if row is None:
+                    continue
+                image = self.images[row]
+                did_change = False
+                if 'file' in entry:
+                    snapshot_mtime, new_mtime, dimensions = entry['file']
+                    # Only apply if the model still matches what the scan saw,
+                    # so a change the user made meanwhile is not clobbered.
+                    if image.file_modified_time_ns == snapshot_mtime:
+                        image.file_modified_time_ns = new_mtime
+                        image.dimensions = dimensions
+                        image.thumbnail = None
+                        image.thumbnail_loading = False
+                        did_change = True
+                if 'caption' in entry:
+                    (snapshot_mtime, new_mtime, tags,
+                     natural_language_prompt) = entry['caption']
+                    if image.caption_file_modified_time_ns == snapshot_mtime:
+                        image.caption_file_modified_time_ns = new_mtime
+                        image.tags = tags
+                        image.natural_language_prompt = natural_language_prompt
+                        did_change = True
+                if did_change:
+                    changed_rows.append(row)
+            for row in changed_rows:
+                image_index = self.index(row, 0)
+                self.dataChanged.emit(
+                    image_index, image_index,
+                    [Qt.ItemDataRole.DecorationRole,
+                     Qt.ItemDataRole.SizeHintRole,
+                     Qt.ItemDataRole.DisplayRole,
+                     Qt.ItemDataRole.ToolTipRole,
+                     Qt.ItemDataRole.UserRole])
+        # Newly added files (and updated ones whose thumbnails were reset) may
+        # not be cached yet — warm them silently in the background. Bump the
+        # generation first so any warmer still running from the initial load
+        # stops and this one restarts from the up-to-date image list.
+        if structure_changed or changed_rows:
+            self._preload_generation += 1
+            self._start_background_warm()
+        return structure_changed, set(changed_rows)
 
     def add_to_undo_stack(self, action_name: str,
                           should_ask_for_confirmation: bool):
         """Add the current state of the image tags to the undo stack."""
         tags = [image.tags.copy() for image in self.images]
+        natural_language_prompts = [
+            image.natural_language_prompt for image in self.images
+        ]
         self.undo_stack.append(HistoryItem(action_name, tags,
+                                           natural_language_prompts,
                                            should_ask_for_confirmation))
         self.redo_stack.clear()
         self.update_undo_and_redo_actions_requested.emit()
 
     def write_image_tags_to_disk(self, image: Image):
+        text_file_path = image.path.with_suffix('.txt')
         try:
-            image.path.with_suffix('.txt').write_text(
-                self.tag_separator.join(image.tags), encoding='utf-8',
-                errors='replace')
+            text_file_path.write_text(
+                build_caption_text(image.tags, image.natural_language_prompt,
+                                   self.tag_separator),
+                encoding='utf-8', errors='replace')
+            image.caption_file_modified_time_ns = text_file_path.stat().st_mtime_ns
+            # Keep the completion store's caption hash current for complete
+            # images so an external move/rename still confirms as the same
+            # finished work. In-memory only; flushed on scan/toggle/close.
+            if image.is_complete:
+                get_completion_store().refresh_caption(image.path)
         except OSError:
             error_message_box = QMessageBox()
             error_message_box.setWindowTitle('Error')
@@ -203,16 +902,24 @@ class ImageListModel(QAbstractListModel):
                 return
         source_stack.pop()
         tags = [image.tags for image in self.images]
+        natural_language_prompts = [
+            image.natural_language_prompt for image in self.images
+        ]
         destination_stack.append(HistoryItem(
-            history_item.action_name, tags,
+            history_item.action_name, tags, natural_language_prompts,
             history_item.should_ask_for_confirmation))
         changed_image_indices = []
-        for image_index, (image, history_image_tags) in enumerate(
-                zip(self.images, history_item.tags)):
-            if image.tags == history_image_tags:
+        for image_index, (image, history_image_tags,
+                          history_natural_language_prompt) in enumerate(
+                zip(self.images, history_item.tags,
+                    history_item.natural_language_prompts)):
+            if (image.tags == history_image_tags
+                    and image.natural_language_prompt
+                    == history_natural_language_prompt):
                 continue
             changed_image_indices.append(image_index)
             image.tags = history_image_tags
+            image.natural_language_prompt = history_natural_language_prompt
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
@@ -290,7 +997,9 @@ class ImageListModel(QAbstractListModel):
                     continue
                 caption = caption.replace(find_text, replace_text)
             changed_image_indices.append(image_index)
-            image.tags = caption.split(self.tag_separator)
+            image.tags = list(dict.fromkeys(
+                t.strip() for t in caption.split(self.tag_separator)
+                if t.strip()))
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
@@ -409,58 +1118,101 @@ class ImageListModel(QAbstractListModel):
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
 
-    def remove_duplicate_tags(self) -> int:
+    def sort_tags_by_category(self, get_category_for_tag,
+                              category_order_map: dict[str, int],
+                              do_not_reorder_first_tag: bool):
         """
-        Remove duplicate tags for each image. Return the number of removed
-        tags.
+        Move categorized tags to the front using the configured category order,
+        while preserving the relative order of tags within each category and for
+        uncategorized tags.
         """
-        self.add_to_undo_stack(action_name='Remove Duplicate Tags',
+        self.add_to_undo_stack(action_name='Sort Tags',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
-        removed_tag_count = 0
+        uncategorized_sort_index = len(category_order_map)
         for image_index, image in enumerate(self.images):
-            tag_count = len(image.tags)
-            unique_tag_count = len(set(image.tags))
-            if tag_count == unique_tag_count:
+            if len(image.tags) < 2:
                 continue
-            changed_image_indices.append(image_index)
-            removed_tag_count += tag_count - unique_tag_count
-            # Use a dictionary instead of a set to preserve the order.
-            image.tags = list(dict.fromkeys(image.tags))
-            self.write_image_tags_to_disk(image)
+            old_caption = self.tag_separator.join(image.tags)
+            if do_not_reorder_first_tag:
+                first_tag = image.tags[0]
+                sortable_tags = image.tags[1:]
+            else:
+                first_tag = None
+                sortable_tags = image.tags
+            tag_groups = [[] for _ in range(uncategorized_sort_index + 1)]
+            for tag in sortable_tags:
+                category = get_category_for_tag(tag)
+                if category is None:
+                    sort_index = uncategorized_sort_index
+                else:
+                    sort_index = category_order_map.get(
+                        category['id'], uncategorized_sort_index)
+                tag_groups[sort_index].append(tag)
+            sorted_tags = []
+            for group in tag_groups:
+                sorted_tags.extend(group)
+            if first_tag is not None:
+                image.tags = [first_tag] + sorted_tags
+            else:
+                image.tags = sorted_tags
+            new_caption = self.tag_separator.join(image.tags)
+            if new_caption != old_caption:
+                changed_image_indices.append(image_index)
+                self.write_image_tags_to_disk(image)
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
-        return removed_tag_count
 
-    def remove_empty_tags(self) -> int:
-        """
-        Remove empty tags (tags that are empty strings or only contain
-        whitespace) for each image. Return the number of removed tags.
-        """
-        self.add_to_undo_stack(action_name='Remove Empty Tags',
-                               should_ask_for_confirmation=True)
-        changed_image_indices = []
-        removed_tag_count = 0
-        for image_index, image in enumerate(self.images):
-            old_tag_count = len(image.tags)
-            image.tags = [tag for tag in image.tags if tag.strip()]
-            new_tag_count = len(image.tags)
-            if old_tag_count == new_tag_count:
+    def set_images_complete(self, image_indices: list[QModelIndex],
+                            is_complete: bool):
+        """Mark the given images as complete or incomplete and persist the
+        change to the completion store. Emits dataChanged so the completion
+        icon repaints."""
+        completion_store = get_completion_store()
+        changed_rows = []
+        for image_index in image_indices:
+            image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
+            if image.is_complete == is_complete:
                 continue
-            changed_image_indices.append(image_index)
-            removed_tag_count += old_tag_count - new_tag_count
-            self.write_image_tags_to_disk(image)
-        if changed_image_indices:
-            self.dataChanged.emit(self.index(changed_image_indices[0]),
-                                  self.index(changed_image_indices[-1]))
-        return removed_tag_count
+            image.is_complete = is_complete
+            completion_store.set_complete(image.path, is_complete)
+            changed_rows.append(image_index.row())
+        if not changed_rows:
+            return
+        completion_store.save()
+        for row in changed_rows:
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index,
+                                  [Qt.ItemDataRole.DecorationRole,
+                                   Qt.ItemDataRole.UserRole])
 
     def update_image_tags(self, image_index: QModelIndex, tags: list[str]):
         image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
         if image.tags == tags:
             return
         image.tags = tags
+        self.dataChanged.emit(image_index, image_index)
+        self.write_image_tags_to_disk(image)
+
+    def update_image_caption(self, image_index: QModelIndex, tags: list[str],
+                             natural_language_prompt: str):
+        image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
+        tags = list(dict.fromkeys(tags))
+        if (image.tags == tags
+                and image.natural_language_prompt == natural_language_prompt):
+            return
+        image.tags = tags
+        image.natural_language_prompt = natural_language_prompt
+        self.dataChanged.emit(image_index, image_index)
+        self.write_image_tags_to_disk(image)
+
+    def update_image_natural_language_prompt(self, image_index: QModelIndex,
+                                             natural_language_prompt: str):
+        image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
+        if image.natural_language_prompt == natural_language_prompt:
+            return
+        image.natural_language_prompt = natural_language_prompt
         self.dataChanged.emit(image_index, image_index)
         self.write_image_tags_to_disk(image)
 
@@ -474,7 +1226,9 @@ class ImageListModel(QAbstractListModel):
         self.add_to_undo_stack(action_name, should_ask_for_confirmation)
         for image_index in image_indices:
             image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-            image.tags.extend(tags)
+            existing = set(image.tags)
+            new_tags = [t for t in tags if t not in existing]
+            image.tags.extend(new_tags)
             self.write_image_tags_to_disk(image)
         min_image_index = min(image_indices, key=lambda index: index.row())
         max_image_index = max(image_indices, key=lambda index: index.row())
@@ -496,14 +1250,15 @@ class ImageListModel(QAbstractListModel):
                 if not any(re.fullmatch(pattern=pattern, string=image_tag)
                            for image_tag in image.tags):
                     continue
-                image.tags = [new_tag if re.fullmatch(pattern=pattern,
-                                                      string=image_tag)
-                              else image_tag for image_tag in image.tags]
+                image.tags = list(dict.fromkeys(
+                    new_tag if re.fullmatch(pattern=pattern, string=image_tag)
+                    else image_tag for image_tag in image.tags))
             else:
                 if not any(old_tag in image.tags for old_tag in old_tags):
                     continue
-                image.tags = [new_tag if image_tag in old_tags else image_tag
-                              for image_tag in image.tags]
+                image.tags = list(dict.fromkeys(
+                    new_tag if image_tag in old_tags else image_tag
+                    for image_tag in image.tags))
             changed_image_indices.append(image_index)
             self.write_image_tags_to_disk(image)
         if changed_image_indices:

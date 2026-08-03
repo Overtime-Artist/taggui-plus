@@ -1,6 +1,6 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QLineEdit,
-                               QPlainTextEdit, QSpinBox)
+                               QPlainTextEdit, QSizePolicy, QSpinBox)
 
 from utils.big_widgets import BigCheckBox
 from utils.focused_scroll_mixin import FocusedScrollMixin
@@ -23,6 +23,11 @@ class SettingsComboBox(QComboBox):
         self.key = key
         self.default = default
         self.settings = get_settings()
+        self.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
 
     def addItems(self, texts: list[str]):
         setting: str = self.settings.value(self.key, self.default, type=str)

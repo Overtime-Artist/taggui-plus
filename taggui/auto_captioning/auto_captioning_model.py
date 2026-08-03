@@ -2,18 +2,24 @@ import gc
 import re
 from contextlib import nullcontext
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from PIL import Image as PilImage
 from PIL.ImageOps import exif_transpose
 from transformers import (AutoModelForVision2Seq, AutoProcessor,
-                          BatchFeature, BitsAndBytesConfig)
+                          BatchFeature, BitsAndBytesConfig, StoppingCriteria,
+                          StoppingCriteriaList)
 from transformers.utils.import_utils import is_torch_bf16_gpu_available
 
-import auto_captioning.captioning_thread as captioning_thread
-from utils.enums import CaptionDevice
+from utils.enums import CaptionDestination, CaptionDevice
 from utils.image import Image
+
+if TYPE_CHECKING:
+    # Imported only for type hints to avoid a circular import at runtime
+    # (captioning_thread imports AutoCaptioningModel from this module).
+    import auto_captioning.captioning_thread as captioning_thread
 
 
 def replace_template_variable(match: re.Match, image: Image) -> str:
@@ -35,6 +41,43 @@ def replace_template_variables(text: str, image: Image) -> str:
     return text
 
 
+def release_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        # The cuBLAS/cuDNN workspace allocated during generation is a small
+        # (~8 MB) buffer, but it sits inside the large reserved memory block and
+        # pins the entire multi-gigabyte block, preventing `empty_cache()` from
+        # returning that memory to the operating system (so tools like Task
+        # Manager keep showing the VRAM as in use). Clearing the workspace first
+        # lets `empty_cache()` actually free the memory. It is recreated
+        # automatically the next time the GPU is used. This is a private torch
+        # API that may not exist in every version, so guard it.
+        try:
+            torch._C._cuda_clearCublasWorkspaces()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+
+
+class CancelStoppingCriteria(StoppingCriteria):
+    """Stops text generation as soon as the user cancels captioning.
+
+    Hugging Face's `generate()` checks the stopping criteria after every
+    generated token, so this lets a cancel request take effect almost
+    immediately instead of waiting for the current image's caption to finish
+    generating (which can be very slow when generation spills over from
+    dedicated VRAM into shared memory).
+    """
+
+    def __init__(self,
+                 captioning_thread_: 'captioning_thread.CaptioningThread'):
+        super().__init__()
+        self.thread = captioning_thread_
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        return self.thread.is_canceled
+
+
 class AutoCaptioningModel:
     dtype = torch.float16
     # When loading a model, if the `use_safetensors` argument is not set and
@@ -45,6 +88,10 @@ class AutoCaptioningModel:
     model_load_context_manager = nullcontext()
     transformers_model_class = AutoModelForVision2Seq
     image_mode = 'RGB'
+    # Whether this model supports the "Max image tokens" advanced setting, which
+    # caps the number of image patches sent to the model. Only image models
+    # whose processor accepts a pixel cap (e.g. Qwen2-VL/Qwen2.5-VL) set this.
+    supports_image_token_limit = False
 
     def __init__(self,
                  captioning_thread_: 'captioning_thread.CaptioningThread',
@@ -55,6 +102,7 @@ class AutoCaptioningModel:
         self.model_id = caption_settings['model_id']
         self.prompt = caption_settings['prompt']
         self.caption_start = caption_settings['caption_start']
+        self.caption_destination = caption_settings['caption_destination']
         self.device_setting: CaptionDevice = caption_settings['device']
         self.device: torch.device = self.get_device()
         if self.dtype == torch.bfloat16:
@@ -93,6 +141,14 @@ class AutoCaptioningModel:
     def get_processor(self):
         return AutoProcessor.from_pretrained(self.model_id,
                                              trust_remote_code=True)
+
+    def get_processor_cache_key(self):
+        # Subclasses whose processor depends on a user setting (e.g. Qwen's
+        # "Max image tokens", which changes the processor's pixel cap) override
+        # this. When the returned value changes, the cached processor is rebuilt
+        # for the next job even though the model weights can be reused. The
+        # default `None` means the processor never needs rebuilding on its own.
+        return None
 
     def get_model_load_arguments(self) -> dict:
         arguments = {'device_map': self.device, 'trust_remote_code': True,
@@ -142,13 +198,28 @@ class AutoCaptioningModel:
         model = self.thread_parent.model
         # Only GPUs support 4-bit quantization.
         self.load_in_4_bit = self.load_in_4_bit and self.device.type == 'cuda'
-        if (model and self.thread_parent.model_id == self.model_id
-                and (self.thread_parent.model_device_type
-                     == self.device.type)
-                and (self.thread_parent.is_model_loaded_in_4_bit
-                     == self.load_in_4_bit)):
+        model_is_reusable = (
+            model and self.thread_parent.model_id == self.model_id
+            and (self.thread_parent.model_device_type == self.device.type)
+            and (self.thread_parent.is_model_loaded_in_4_bit
+                 == self.load_in_4_bit))
+        processor_cache_key = self.get_processor_cache_key()
+        if (model_is_reusable and self.thread_parent.processor_cache_key
+                == processor_cache_key):
+            # Both the model and the processor can be reused as-is.
             self.processor = processor
             self.model = model
+            return
+        if model_is_reusable:
+            # The model weights can be reused, but a processor-only setting
+            # (e.g. "Max image tokens") changed, so rebuild just the processor
+            # instead of reloading the whole model.
+            self.thread.clear_console_text_edit_requested.emit()
+            print('Settings changed. Reloading the processor...')
+            self.processor = self.get_processor()
+            self.thread_parent.processor = self.processor
+            self.model = model
+            self.thread_parent.processor_cache_key = processor_cache_key
             return
         # Load the new processor and model.
         if model:
@@ -158,7 +229,7 @@ class AutoCaptioningModel:
             self.thread_parent.model = None
             del processor
             del model
-            gc.collect()
+            release_memory()
         self.thread.clear_console_text_edit_requested.emit()
         print(f'Loading {self.model_id}...')
         self.processor = self.get_processor()
@@ -168,6 +239,7 @@ class AutoCaptioningModel:
         self.thread_parent.model_id = self.model_id
         self.thread_parent.model_device_type = self.device.type
         self.thread_parent.is_model_loaded_in_4_bit = self.load_in_4_bit
+        self.thread_parent.processor_cache_key = processor_cache_key
 
     def monkey_patch_after_loading(self):
         return
@@ -293,7 +365,8 @@ class AutoCaptioningModel:
         else:
             caption = f'{self.caption_start.strip()} {generated_text.strip()}'
         caption = caption.strip()
-        if self.remove_tag_separators:
+        if (self.remove_tag_separators
+                and self.caption_destination == CaptionDestination.TAGS):
             caption = caption.replace(self.thread.tag_separator, ' ')
         return caption
 
@@ -305,10 +378,18 @@ class AutoCaptioningModel:
         forced_words_ids = self.get_forced_words_ids()
         additional_generation_parameters = (
             self.get_additional_generation_parameters())
+        # Add a stopping criterion so that canceling captioning interrupts the
+        # generation of the current image's caption almost immediately, instead
+        # of only being checked between images. Preserve any stopping criteria a
+        # specific model may already provide.
+        stopping_criteria = StoppingCriteriaList(
+            additional_generation_parameters.pop('stopping_criteria', []))
+        stopping_criteria.append(CancelStoppingCriteria(self.thread))
         with torch.inference_mode():
             generated_token_ids = generation_model.generate(
                 **model_inputs, bad_words_ids=bad_words_ids,
                 force_words_ids=forced_words_ids, **self.generation_parameters,
+                stopping_criteria=stopping_criteria,
                 **additional_generation_parameters)
         caption = self.get_caption_from_generated_tokens(generated_token_ids,
                                                          image_prompt)
