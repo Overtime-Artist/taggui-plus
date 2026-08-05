@@ -409,6 +409,9 @@ class SettingsDialog(QDialog):
             default=DEFAULT_SETTINGS['autocomplete_tags'])
         self.autocomplete_tags_check_box.stateChanged.connect(
             lambda _: self.autocomplete_changed.emit())
+        self.disable_new_tag_auto_select_check_box = SettingsBigCheckBox(
+            key='disable_new_tag_auto_select',
+            default=DEFAULT_SETTINGS['disable_new_tag_auto_select'])
         
         grid_layout.addWidget(QLabel('Tag separator'), row, 0,
                               Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
@@ -423,6 +426,12 @@ class SettingsDialog(QDialog):
         grid_layout.addWidget(QLabel('Show tag autocomplete suggestions'), row, 0,
                               Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
         grid_layout.addWidget(self.autocomplete_tags_check_box, row, 1,
+                              Qt.AlignmentFlag.AlignLeft)
+        row += 1
+        grid_layout.addWidget(
+            QLabel('Do not auto-select newly added tags'), row, 0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        grid_layout.addWidget(self.disable_new_tag_auto_select_check_box, row, 1,
                               Qt.AlignmentFlag.AlignLeft)
         row += 1
         
@@ -695,6 +704,7 @@ class SettingsDialog(QDialog):
     def refresh_theme_sensitive_controls(self):
         for check_box in (self.insert_space_after_tag_separator_check_box,
                           self.autocomplete_tags_check_box,
+                          self.disable_new_tag_auto_select_check_box,
                           self.ask_before_removing_tag_library_tags_check_box,
                           self.ask_before_assigning_new_tag_category_check_box):
             check_box.style().unpolish(check_box)

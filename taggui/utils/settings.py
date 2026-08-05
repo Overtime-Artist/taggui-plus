@@ -77,6 +77,9 @@ DEFAULT_SETTINGS = {
     'tag_separator': ',',
     'insert_space_after_tag_separator': True,
     'autocomplete_tags': True,
+    # When enabled, newly added tags from the Add Tag box are not
+    # auto-selected; the Add Tag box briefly flashes green instead.
+    'disable_new_tag_auto_select': False,
     'models_directory_path': '',
     'image_editor_executable_path': '',
     'caption_destination': 'Tags',

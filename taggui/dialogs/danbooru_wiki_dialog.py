@@ -245,8 +245,6 @@ class DanbooruWikiFetchThread(QThread):
             asset_id = asset_match.group(1)
             if asset_id not in asset_ids:
                 asset_ids.append(asset_id)
-        post_details_by_id = {}
-        asset_details_by_id = {}
         capped_post_ids = post_ids[:MAX_PREVIEW_POSTS]
         capped_asset_ids = asset_ids[:MAX_PREVIEW_POSTS]
         if self.isInterruptionRequested():
@@ -257,14 +255,16 @@ class DanbooruWikiFetchThread(QThread):
         # browser does) makes loading dramatically faster on pages that
         # reference several posts or assets.
         with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
-            post_futures = {
-                post_id: executor.submit(self.fetch_post_details, post_id)
-                for post_id in capped_post_ids
-            }
-            asset_futures = {
-                asset_id: executor.submit(self.fetch_asset_details, asset_id)
-                for asset_id in capped_asset_ids
-            }
+            # Fetch the referenced posts' and assets' metadata in batched
+            # requests (one request per ~200 ids) instead of one request per
+            # post/asset. Danbooru rate-limits (HTTP 429) a burst of dozens of
+            # individual post lookups, which previously left many thumbnails
+            # missing on image-heavy wiki pages; a single batched query for all
+            # ids avoids the rate limit entirely.
+            posts_future = executor.submit(
+                self.fetch_posts_details_batched, capped_post_ids)
+            assets_future = executor.submit(
+                self.fetch_assets_details_batched, capped_asset_ids)
             relations_future = executor.submit(
                 self.fetch_tag_relations, resolved_title)
             # Fetch whether the tag itself is deprecated. This flag lives on the
@@ -276,10 +276,8 @@ class DanbooruWikiFetchThread(QThread):
             # bottom of the wiki page in the same parallel batch.
             preview_posts_future = executor.submit(
                 self.fetch_preview_posts, resolved_title)
-            for post_id, future in post_futures.items():
-                post_details_by_id[post_id] = future.result()
-            for asset_id, future in asset_futures.items():
-                asset_details_by_id[asset_id] = future.result()
+            post_details_by_id = posts_future.result()
+            asset_details_by_id = assets_future.result()
             relations = relations_future.result()
             is_deprecated = is_deprecated_future.result()
             wiki_posts = preview_posts_future.result()
@@ -378,56 +376,126 @@ class DanbooruWikiFetchThread(QThread):
             return False
         return bool(tags[0].get('is_deprecated'))
 
-    def fetch_post_details(self, post_id: str):
-        if self.isInterruptionRequested():
-            return None
-        post_url = f'{DANBOORU_BASE_URL}/posts/{post_id}.json'
-        try:
-            with urlopen(post_url, timeout=10) as response:
-                if response.status != 200:
-                    return None
-                post_data = json.loads(response.read().decode('utf-8', errors='replace'))
-        except Exception:
-            return None
-        preview_url = str(post_data.get('preview_file_url') or post_data.get('large_file_url')
-                          or post_data.get('file_url') or '')
-        thumbnail_data_url = self.fetch_thumbnail_data_url(preview_url)
-        return {
-            'post': post_data,
-            'thumbnail_data_url': thumbnail_data_url
-        }
+    @staticmethod
+    def _post_preview_url(post_data: dict) -> str:
+        return str(post_data.get('preview_file_url')
+                   or post_data.get('large_file_url')
+                   or post_data.get('file_url') or '')
 
-    def fetch_asset_details(self, asset_id: str):
-        if self.isInterruptionRequested():
-            return None
-        asset_url = f'{DANBOORU_BASE_URL}/media_assets/{asset_id}.json'
-        try:
-            with urlopen(asset_url, timeout=10) as response:
-                if response.status != 200:
-                    return None
-                asset_data = json.loads(response.read().decode(
-                    'utf-8', errors='replace'))
-        except Exception:
-            return None
-        preview_url = ''
+    @staticmethod
+    def _asset_preview_url(asset_data: dict) -> str:
         variants = asset_data.get('variants')
-        if isinstance(variants, list):
-            preferred_variant = None
-            for variant in variants:
-                if not isinstance(variant, dict):
-                    continue
-                if str(variant.get('type') or '') == '180x180':
-                    preferred_variant = variant
-                    break
-            if preferred_variant is None and variants:
-                preferred_variant = variants[0]
-            if isinstance(preferred_variant, dict):
-                preview_url = str(preferred_variant.get('url') or '')
-        thumbnail_data_url = self.fetch_thumbnail_data_url(preview_url)
-        return {
-            'asset': asset_data,
-            'thumbnail_data_url': thumbnail_data_url
-        }
+        if not isinstance(variants, list):
+            return ''
+        preferred_variant = None
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            if str(variant.get('type') or '') == '180x180':
+                preferred_variant = variant
+                break
+        if preferred_variant is None and variants:
+            preferred_variant = variants[0]
+        if isinstance(preferred_variant, dict):
+            return str(preferred_variant.get('url') or '')
+        return ''
+
+    def fetch_posts_details_batched(self, post_ids: list) -> dict:
+        """Fetch metadata + thumbnails for many posts using batched requests.
+
+        Danbooru rate-limits (HTTP 429) a burst of individual ``/posts/{id}``
+        lookups, so instead we ask for all ids at once via ``id:1,2,3`` (which
+        counts as a single tag), at most ~200 ids per request, then download the
+        thumbnail images concurrently (the image CDN is not rate-limited)."""
+        details_by_id = {}
+        if not post_ids or self.isInterruptionRequested():
+            return details_by_id
+        posts_by_id = {}
+        batch_size = 200
+        for start in range(0, len(post_ids), batch_size):
+            if self.isInterruptionRequested():
+                return details_by_id
+            chunk = post_ids[start:start + batch_size]
+            query = urlencode({'tags': 'id:' + ','.join(chunk),
+                               'limit': batch_size})
+            posts_url = f'{DANBOORU_BASE_URL}/posts.json?{query}'
+            try:
+                with urlopen(posts_url, timeout=15) as response:
+                    if response.status != 200:
+                        continue
+                    posts = json.loads(
+                        response.read().decode('utf-8', errors='replace'))
+            except Exception:
+                continue
+            if isinstance(posts, list):
+                for post in posts:
+                    if isinstance(post, dict) and post.get('id') is not None:
+                        posts_by_id[str(post.get('id'))] = post
+
+        def build(post_id: str):
+            post_data = posts_by_id.get(post_id)
+            if not isinstance(post_data, dict):
+                return None
+            return {
+                'post': post_data,
+                'thumbnail_data_url': self.fetch_thumbnail_data_url(
+                    self._post_preview_url(post_data))
+            }
+        with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
+            futures = {post_id: executor.submit(build, post_id)
+                       for post_id in posts_by_id}
+            for post_id, future in futures.items():
+                data = future.result()
+                if data is not None:
+                    details_by_id[post_id] = data
+        return details_by_id
+
+    def fetch_assets_details_batched(self, asset_ids: list) -> dict:
+        """Fetch metadata + thumbnails for many media assets in batched
+        requests, for the same rate-limit reasons as
+        ``fetch_posts_details_batched``."""
+        details_by_id = {}
+        if not asset_ids or self.isInterruptionRequested():
+            return details_by_id
+        assets_by_id = {}
+        batch_size = 200
+        for start in range(0, len(asset_ids), batch_size):
+            if self.isInterruptionRequested():
+                return details_by_id
+            chunk = asset_ids[start:start + batch_size]
+            query = urlencode({'search[id]': ','.join(chunk),
+                               'limit': batch_size})
+            assets_url = f'{DANBOORU_BASE_URL}/media_assets.json?{query}'
+            try:
+                with urlopen(assets_url, timeout=15) as response:
+                    if response.status != 200:
+                        continue
+                    assets = json.loads(
+                        response.read().decode('utf-8', errors='replace'))
+            except Exception:
+                continue
+            if isinstance(assets, list):
+                for asset in assets:
+                    if isinstance(asset, dict) and asset.get('id') is not None:
+                        assets_by_id[str(asset.get('id'))] = asset
+
+        def build(asset_id: str):
+            asset_data = assets_by_id.get(asset_id)
+            if not isinstance(asset_data, dict):
+                return None
+            return {
+                'asset': asset_data,
+                'thumbnail_data_url': self.fetch_thumbnail_data_url(
+                    self._asset_preview_url(asset_data))
+            }
+        with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
+            futures = {asset_id: executor.submit(build, asset_id)
+                       for asset_id in assets_by_id}
+            for asset_id, future in futures.items():
+                data = future.result()
+                if data is not None:
+                    details_by_id[asset_id] = data
+        return details_by_id
 
     def fetch_thumbnail_data_url(self, image_url: str):
         return image_url_to_data_url(image_url, self.isInterruptionRequested)
@@ -564,7 +632,46 @@ class DanbooruTagAutocompleteThread(QThread):
                 'name': tag_name,
                 'post_count': tag_count
             })
+        # The 'tag_query' autocomplete only returns tags that currently have
+        # posts, so wiki-only entries (e.g. deprecated tags like "meme_attire"
+        # with a post_count of 0) never show up. Fetch the 'wiki_page'
+        # autocomplete as well and merge in any entries not already present so
+        # those wikis become discoverable.
+        existing_names = {suggestion['name'].casefold()
+                          for suggestion in suggestions}
+        for wiki_suggestion in self.fetch_wiki_page_suggestions(query_text):
+            if wiki_suggestion['name'].casefold() in existing_names:
+                continue
+            existing_names.add(wiki_suggestion['name'].casefold())
+            suggestions.append(wiki_suggestion)
         self.suggestions_ready.emit(self.query_text, suggestions)
+
+    def fetch_wiki_page_suggestions(self, query_text: str) -> list:
+        query = urlencode({
+            'search[query]': query_text,
+            'search[type]': 'wiki_page',
+            'limit': 15
+        })
+        wiki_url = f'{DANBOORU_BASE_URL}/autocomplete.json?{query}'
+        try:
+            with urlopen(wiki_url, timeout=8) as response:
+                if response.status != 200:
+                    return []
+                entries = json.loads(
+                    response.read().decode('utf-8', errors='replace'))
+        except Exception:
+            return []
+        wiki_suggestions = []
+        for entry in entries:
+            name = str(entry.get('value') or entry.get('label') or '').strip()
+            if not name:
+                continue
+            wiki_suggestions.append({
+                'name': name,
+                'post_count': 0,
+                'is_wiki_only': True
+            })
+        return wiki_suggestions
 
     def fetch_tag_group_suggestions(self, normalized_query_text: str):
         query_text = normalized_query_text
@@ -1547,6 +1654,39 @@ class DanbooruWikiDialog(BaseWikiDialog):
                     f'color: #000000;">{inner}</span>')
         return SPOILER_PATTERN.sub(replace_spoiler, text_html)
 
+    def _wrap_quote_html(self, inner_html: str,
+                         collapse_top: bool = False) -> str:
+        """Wrap already-rendered quote content in a left-bar block.
+
+        Danbooru renders ``[quote]`` blocks as indented content with a thin
+        vertical bar down the left. Qt's rich text renders table-cell borders
+        reliably (block-level borders are flaky), so a single-cell table with a
+        left border gives both the bar and the indentation. The trailing
+        paragraph's bottom margin is trimmed so the bar hugs its content rather
+        than leaving an extra blank line inside the quote.
+
+        The outer top/bottom margins (0.8em / 1.1em) are tuned so the gap before
+        and after a quote matches the gap between normal paragraphs. Qt does not
+        collapse the margins of adjacent tables the way CSS collapses paragraph
+        margins, so two back-to-back quotes would otherwise get a doubled gap;
+        ``collapse_top`` drops this quote's top margin when it directly follows
+        another quote, keeping consecutive quotes evenly spaced.
+        """
+        bottom_margin_marker = 'margin: 0 0 0.9em 0;'
+        last_marker_index = inner_html.rfind(bottom_margin_marker)
+        if last_marker_index != -1:
+            inner_html = (
+                inner_html[:last_marker_index] + 'margin: 0;'
+                + inner_html[last_marker_index + len(bottom_margin_marker):])
+        top_margin = '0' if collapse_top else '0.8em'
+        return (
+            f'<table style="border-collapse: collapse; '
+            f'margin: {top_margin} 0 1.1em 0;">'
+            '<tr><td style="border-left: 3px solid palette(mid); '
+            'padding: 0 0 0 10px;">'
+            f'{inner_html}</td></tr></table>'
+        )
+
     def build_post_thumbnail_html(self, post_id: str) -> str:
         post_data = self.post_details_by_id.get(post_id)
         post_url = f'{DANBOORU_BASE_URL}/posts/{quote(post_id)}'
@@ -1585,6 +1725,9 @@ class DanbooruWikiDialog(BaseWikiDialog):
         thumbnail_buffer = []  # list of (thumb_html, caption_html)
         previous_line_was_blank = False
         in_expand_block = False
+        # Index up to which lines have already been consumed by a block handler
+        # (e.g. the body of a [quote]...[/quote]); the loop skips past them.
+        skip_until = 0
 
         def flush_thumbnails():
             if not thumbnail_buffer:
@@ -1614,7 +1757,9 @@ class DanbooruWikiDialog(BaseWikiDialog):
                 f'{"".join(rows)}</table>')
             del thumbnail_buffer[:]
 
-        for line in lines:
+        for index, line in enumerate(lines):
+            if index < skip_until:
+                continue
             stripped_line = line.strip()
             if not stripped_line:
                 previous_line_was_blank = True
@@ -1622,7 +1767,46 @@ class DanbooruWikiDialog(BaseWikiDialog):
 
             previous_line_was_blank = False
 
-            if stripped_line.casefold().startswith('[expand=') and stripped_line.endswith(']'):
+            casefolded_line = stripped_line.casefold()
+            # DText block quotes: [quote] and [/quote] each sit on their own
+            # line. Collect the inner lines (honouring nested quotes) and render
+            # them recursively so paragraph/blank-line spacing matches the rest
+            # of the body, then wrap the result in a left-bar block.
+            if casefolded_line == '[quote]':
+                flush_thumbnails()
+                while html_lines and html_lines[-1] == '<br>':
+                    html_lines.pop()
+                depth = 1
+                inner_lines = []
+                scan_index = index + 1
+                while scan_index < len(lines):
+                    inner_casefolded = lines[scan_index].strip().casefold()
+                    if inner_casefolded == '[quote]':
+                        depth += 1
+                    elif inner_casefolded == '[/quote]':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    inner_lines.append(lines[scan_index])
+                    scan_index += 1
+                # Skip past the consumed inner lines and the closing [/quote].
+                skip_until = scan_index + 1
+                inner_html = self.convert_dtext_to_html('\n'.join(inner_lines))
+                # Collapse this quote's top margin when it directly follows
+                # another quote (the previous emitted block is a quote table,
+                # identified by its unique left-bar style) so back-to-back
+                # quotes keep the same gap as a single quote.
+                previous_block_was_quote = bool(html_lines) and (
+                    'border-left: 3px solid palette(mid)' in html_lines[-1])
+                html_lines.append(self._wrap_quote_html(
+                    inner_html, collapse_top=previous_block_was_quote))
+                continue
+            # A stray closing tag with no matching opener: drop it silently
+            # rather than printing the literal marker.
+            if casefolded_line == '[/quote]':
+                continue
+
+            if casefolded_line.startswith('[expand=') and stripped_line.endswith(']'):
                 flush_thumbnails()
                 expand_title = stripped_line[len('[expand='):-1].strip()
                 if not expand_title:
