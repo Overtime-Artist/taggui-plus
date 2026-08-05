@@ -539,6 +539,9 @@ class ImageTagsList(ElidedToolTipListView):
         super().__init__()
         self.image_tag_list_model = image_tag_list_model
         self.tag_library_model = tag_library_model
+        # Set by ImageTagsEditor once the Add Tag box exists. Used to redirect
+        # typing in the tag list to the Add Tag box (see keyPressEvent).
+        self.tag_input_box = None
         self.setModel(self.image_tag_list_model)
         self.setItemDelegate(TextEditItemDelegate(self))
         self.setSelectionMode(
@@ -624,8 +627,15 @@ class ImageTagsList(ElidedToolTipListView):
 
     def keyPressEvent(self, event: QKeyEvent):
         """
-        Delete selected tags when the delete key or backspace key is pressed.
+        Redirect typing to the Add Tag box, otherwise delete selected tags when
+        the delete key or backspace key is pressed.
         """
+        if self._should_redirect_typing_to_tag_input(event):
+            tag_input_box = self.tag_input_box
+            tag_input_box.raise_()
+            tag_input_box.setFocus()
+            tag_input_box.insert(event.text())
+            return
         if event.key() not in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             super().keyPressEvent(event)
             return
@@ -643,6 +653,38 @@ class ImageTagsList(ElidedToolTipListView):
         elif remaining_row_count:
             # Select the last tag.
             self.select_tag(remaining_row_count - 1)
+
+    def _should_redirect_typing_to_tag_input(self, event: QKeyEvent) -> bool:
+        """Whether a keystroke in the tag list should start a new tag.
+
+        Typing a printable character while the tag list has keyboard focus
+        jumps to the Add Tag box in the Image Tags pane, so the user can start
+        a new tag without clicking the box first. This is unrelated to the
+        "Auto-focus Add Tag box when typing in Images pane" setting, which only
+        governs typing in the thumbnails (Images) pane.
+
+        Editing a tag in place (by double-clicking it) routes keys to the
+        item's own editor instead of this list, so this is never reached while
+        editing a tag.
+        """
+        tag_input_box = self.tag_input_box
+        # The Add Tag box is hidden in natural language mode; leave the default
+        # behavior alone when there's nowhere to redirect to.
+        if tag_input_box is None or tag_input_box.isHidden():
+            return False
+        # Don't hijack keyboard shortcuts such as Ctrl+C or Alt+... .
+        blocking_modifiers = (Qt.KeyboardModifier.ControlModifier
+                              | Qt.KeyboardModifier.AltModifier
+                              | Qt.KeyboardModifier.MetaModifier)
+        if ((event.modifiers() & blocking_modifiers)
+                != Qt.KeyboardModifier.NoModifier):
+            return False
+        text = event.text()
+        # Only redirect single printable characters (letters, numbers, and
+        # basic special characters). Keys like Enter, Tab, the arrows, Delete
+        # and Backspace have an empty or control-character `text()` and are
+        # excluded, so tag deletion and navigation keep working.
+        return len(text) == 1 and text.isprintable()
 
     def select_tag(self, row: int):
         # If the current index is not set, using the arrow keys to navigate
@@ -717,6 +759,8 @@ class ImageTagsEditor(QDockWidget):
         self._update_nl_button_style()
         self.image_tags_list = ImageTagsList(self.image_tag_list_model,
                                              tag_library_model)
+        # Let the tag list redirect typing to the Add Tag box.
+        self.image_tags_list.tag_input_box = self.tag_input_box
         self.image_tags_list.danbooru_wiki_requested.connect(
             self.danbooru_wiki_requested.emit)
         self.image_tags_list.gelbooru_wiki_requested.connect(
