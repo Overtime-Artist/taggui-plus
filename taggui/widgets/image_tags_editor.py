@@ -1,6 +1,7 @@
 from typing import Optional
 from PySide6.QtCore import (QEvent, QItemSelectionModel, QModelIndex, QPoint,
-                            QStringListModel, Qt, Signal, Slot)
+                            QPropertyAnimation, QStringListModel, Qt, QTimer,
+                            Signal, Slot)
 from PySide6.QtGui import QColor, QKeyEvent, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                                QCompleter, QDockWidget,
@@ -231,6 +232,9 @@ class CompleterModel(QStringListModel):
 
 
 class TagInputBox(QLineEdit):
+    # Duration in milliseconds of the border flash / shake feedback.
+    FLASH_DURATION_MS = 350
+
     tags_addition_requested = Signal(list, list)
     # Emitted with the tags that were genuinely new to the Tag Library when
     # they were added here (i.e. added to an image via the Image Tags pane).
@@ -252,6 +256,9 @@ class TagInputBox(QLineEdit):
         self.setTextMargins(8, 0, 8, 0)
         self.completer_model = None
         self.completer = None
+        # State for the border-flash / shake feedback animations.
+        self._shake_animation: Optional[QPropertyAnimation] = None
+        self._flash_timer: Optional[QTimer] = None
         # Connect the library-change signals once. The refresh handler is a
         # no-op while autocomplete is disabled (guarded by `completer_model`),
         # so it is safe to keep connected even when the completer is torn down.
@@ -324,6 +331,10 @@ class TagInputBox(QLineEdit):
         if len(tags) == 1 and selected_image_count == 1:
             resolved_tag = tags[0]
             if resolved_tag in self.image_tag_list_model.stringList():
+                # The tag is already on the image: reject it and give the user
+                # visual feedback instead of silently doing nothing.
+                self._flash_duplicate()
+                self.clear()
                 return
             self.add_new_tags_to_library([resolved_tag])
             # Add an empty tag and set it to the new tag.
@@ -346,6 +357,7 @@ class TagInputBox(QLineEdit):
                     current = self.image_tag_list_model.stringList()
                     self.image_tag_list_model.setStringList(current + new_implied)
                     self.add_new_tags_to_library(new_implied)
+            self.flash_added_feedback()
             return
         if selected_image_count > 1:
             if len(tags) > 1:
@@ -370,6 +382,14 @@ class TagInputBox(QLineEdit):
             tags_to_add = tags + [t for t in implied if t not in tags]
         self.add_new_tags_to_library(tags_to_add)
         self.tags_addition_requested.emit(tags_to_add, selected_image_indices)
+        self.flash_added_feedback()
+
+    def _new_tag_auto_select_disabled(self) -> bool:
+        """Whether the "Do not auto-select newly added tags" setting is on."""
+        return get_settings().value(
+            'disable_new_tag_auto_select',
+            defaultValue=DEFAULT_SETTINGS['disable_new_tag_auto_select'],
+            type=bool)
 
     def add_new_tags_to_library(self, tags: list[str]):
         new_library_tags = [tag for tag in tags
@@ -408,6 +428,74 @@ class TagInputBox(QLineEdit):
             color = QApplication.palette(self).color(QPalette.ColorRole.Text)
         palette.setColor(QPalette.ColorRole.Text, color)
         self.setPalette(palette)
+
+    def _flash_duplicate(self):
+        """Signal a rejected duplicate tag by briefly turning the input box
+        border red and shaking it, then restoring the normal border.
+        """
+        # A red border for the duration of the shake gives clear "rejected"
+        # feedback. Restoring an empty stylesheet brings back the native focus
+        # (blue) border afterwards.
+        self._flash_border('#e03c3c')
+        self._start_shake()
+
+    def _flash_success(self):
+        """Signal a successfully added tag by briefly turning the input box
+        border green (no shake), then restoring the normal border. Used when
+        newly added tags are not auto-selected, so the user still gets
+        feedback that the tag was added.
+        """
+        self._flash_border('#3cc23c')
+
+    def flash_added_feedback(self):
+        """Public hook for external tag-adding flows (e.g. the All Tags pane
+        and the wiki dialogs). Flashes the Add Tag box green when the user has
+        disabled auto-selecting newly added tags, so every add path gives the
+        same feedback.
+        """
+        if self._new_tag_auto_select_disabled():
+            self._flash_success()
+
+    def _flash_border(self, color: str):
+        """Turn the input box border `color` for `FLASH_DURATION_MS`, then
+        restore the normal border.
+        """
+        self.setStyleSheet(f'QLineEdit {{ border: 1px solid {color}; }}')
+        if self._flash_timer is not None:
+            self._flash_timer.stop()
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._restore_border)
+        self._flash_timer.start(self.FLASH_DURATION_MS)
+
+    def _restore_border(self):
+        """Remove the temporary colored border and force the widget's style to
+        repaint, so the native (Fusion) border returns immediately.
+        """
+        self.setStyleSheet('')
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def _start_shake(self):
+        """Nudge the input box left and right a few times to draw attention."""
+        if self._shake_animation is not None:
+            self._shake_animation.stop()
+        original_pos = self.pos()
+        animation = QPropertyAnimation(self, b'pos', self)
+        animation.setDuration(self.FLASH_DURATION_MS)
+        amplitude = 6
+        offsets = [0, amplitude, -amplitude, amplitude, -amplitude,
+                   amplitude // 2, -amplitude // 2, 0]
+        last_index = len(offsets) - 1
+        for index, offset in enumerate(offsets):
+            animation.setKeyValueAt(index / last_index,
+                                    original_pos + QPoint(offset, 0))
+        # Ensure the box ends up exactly where it started even if the layout
+        # shifted it mid-animation.
+        animation.finished.connect(lambda: self.move(original_pos))
+        self._shake_animation = animation
+        animation.start()
 
     def _completion_to_tag(self, completion: str) -> str:
         return get_completion_tag(completion)
@@ -459,6 +547,31 @@ class ImageTagsList(ElidedToolTipListView):
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
+        # Show the selected tag with the active (blue) highlight color even when
+        # keyboard focus is elsewhere (e.g. still in the Add Tag box). Without
+        # this, Qt paints the selection with the muted "inactive" color, so a
+        # newly added tag would not appear highlighted.
+        self._sync_inactive_selection_colors()
+
+    def _sync_inactive_selection_colors(self):
+        palette = self.palette()
+        for role in (QPalette.ColorRole.Highlight,
+                     QPalette.ColorRole.HighlightedText):
+            active_color = palette.color(QPalette.ColorGroup.Active, role)
+            palette.setColor(QPalette.ColorGroup.Inactive, role, active_color)
+        self.setPalette(palette)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # Reapply after a theme/palette change, but guard against the recursion
+        # that our own setPalette() call would otherwise trigger.
+        if (event.type() == QEvent.Type.PaletteChange
+                and not getattr(self, '_syncing_selection_colors', False)):
+            self._syncing_selection_colors = True
+            try:
+                self._sync_inactive_selection_colors()
+            finally:
+                self._syncing_selection_colors = False
 
     @Slot(QPoint)
     def show_context_menu(self, position: QPoint):
@@ -632,14 +745,9 @@ class ImageTagsEditor(QDockWidget):
         layout.addLayout(token_count_layout)
         self.setWidget(container)
 
-        # When a tag is added, select it and scroll to the bottom of the list.
-        self.image_tag_list_model.rowsInserted.connect(
-            lambda _, __, last_index:
-            self.image_tags_list.selectionModel().select(
-                self.image_tag_list_model.index(last_index),
-                QItemSelectionModel.SelectionFlag.ClearAndSelect))
-        self.image_tag_list_model.rowsInserted.connect(
-            self.image_tags_list.scrollToBottom)
+        # When a tag is added, select it and scroll to the bottom of the list,
+        # unless the user disabled auto-selecting newly added tags.
+        self.image_tag_list_model.rowsInserted.connect(self._on_tags_inserted)
         # `rowsInserted` does not have to be connected because `dataChanged`
         # is emitted when a tag is added.
         self.image_tag_list_model.modelReset.connect(self.count_tokens)
@@ -722,6 +830,30 @@ class ImageTagsEditor(QDockWidget):
             return
         self.image_tags_list.select_tag(tag_count - 1)
 
+    def select_last_tag_or_flash(self):
+        """Called by external add-tag flows (All Tags pane, wiki dialogs) after
+        a tag is added. Selects the new (last) tag by default, or, when the
+        user disabled auto-selecting new tags, flashes the Add Tag box green
+        instead so the feedback matches the Add Tag box behavior.
+        """
+        if self.tag_input_box._new_tag_auto_select_disabled():
+            self.tag_input_box.flash_added_feedback()
+        else:
+            self.select_last_tag()
+
+    def _on_tags_inserted(self, parent: QModelIndex, first: int, last: int):
+        """Select the newly added tag and scroll it into view, unless the user
+        turned on "Do not auto-select newly added tags".
+        """
+        disable_auto_select = get_settings().value(
+            'disable_new_tag_auto_select',
+            defaultValue=DEFAULT_SETTINGS['disable_new_tag_auto_select'],
+            type=bool)
+        if disable_auto_select:
+            return
+        self.image_tags_list.select_tag(last)
+        self.image_tags_list.scrollToBottom()
+
     def load_image_tags(self, proxy_image_index: QModelIndex,
                         save_current_prompt: bool = True):
         if save_current_prompt:
@@ -791,6 +923,32 @@ class ImageTagsEditor(QDockWidget):
             return
         if (first_changed_index.row() <= self.image_index.row()
                 <= last_changed_index.row()):
+            # Preserve the user's current selection across in-place tag edits
+            # such as undo/redo, instead of resetting to the first tag. When
+            # auto-select is on and the edit re-added a tag (e.g. redoing an add
+            # or undoing a delete), select that re-added tag instead, mirroring
+            # the behavior of adding a new tag.
+            previous_row = self.image_tags_list.currentIndex().row()
+            had_focus = self.image_tags_list.hasFocus()
+            old_tags = self.image_tag_list_model.stringList()
             proxy_image_index = self.proxy_image_list_model.mapFromSource(
                 self.image_index)
             self.load_image_tags(proxy_image_index, save_current_prompt=False)
+            new_tags = self.image_tag_list_model.stringList()
+            new_row_count = len(new_tags)
+            if new_row_count == 0:
+                return
+            row_to_select = None
+            if not self.tag_input_box._new_tag_auto_select_disabled():
+                old_tag_set = set(old_tags)
+                added_rows = [row for row, tag in enumerate(new_tags)
+                              if tag not in old_tag_set]
+                if added_rows:
+                    # Select the last re-added tag.
+                    row_to_select = added_rows[-1]
+            if row_to_select is None and previous_row >= 0:
+                row_to_select = min(previous_row, new_row_count - 1)
+            if row_to_select is not None:
+                self.image_tags_list.select_tag(row_to_select)
+                if had_focus:
+                    self.image_tags_list.setFocus()

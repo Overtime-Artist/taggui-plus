@@ -124,6 +124,10 @@ class MainWindow(QMainWindow):
         # not rewrite any of the data that was just deleted.
         self.is_removing_app_data = False
         self._pending_directory_select_index = 0
+        # Image filter text to reapply once the next directory finishes loading
+        # (used to restore the active filter on startup). Empty means "no
+        # filter"; every load_directory call sets this explicitly.
+        self._pending_directory_filter = ''
         self.tag_counter_model = TagCounterModel(self.tag_library_model)
         self.image_tag_list_model = ImageTagListModel(self.tag_library_model)
 
@@ -335,6 +339,11 @@ class MainWindow(QMainWindow):
         if not self.should_skip_save_state_on_close:
             self.settings.setValue('geometry', self.saveGeometry())
             self.settings.setValue('window_state', self.saveState())
+            # Persist the active image filter so the same filtered view (and
+            # position within it) is restored on the next launch.
+            self.settings.setValue(
+                'image_list_filter',
+                self.image_list.filter_line_edit.text())
             self.settings.sync()
         super().closeEvent(event)
 
@@ -538,7 +547,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
     def load_directory(self, path: Path, select_index: int = 0,
-                       save_path_to_settings: bool = False):
+                       save_path_to_settings: bool = False,
+                       restore_filter: str = ''):
         # Loading a directory can replace the entire tag universe; treat the
         # next tag-count update as a new baseline, not a user-driven deletion.
         self.skip_next_all_tags_removal_prompt = True
@@ -549,6 +559,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(path.name)
         # Store select_index for _on_directory_loaded; scanning is async.
         self._pending_directory_select_index = select_index
+        # Filter to reapply once loading completes (empty clears the filter, as
+        # every normal directory load does).
+        self._pending_directory_filter = restore_filter
         self.image_list_model.load_directory(path)
 
     @Slot(object)
@@ -572,14 +585,27 @@ class MainWindow(QMainWindow):
         self.image_list_model.apply_pending_images(sort_by, sort_order)
         self.tag_counter_model.count_tags(self.image_list_model.images)
         self.is_syncing_tag_library_from_directory = False
-        self.image_list.filter_line_edit.clear()
         self.all_tags_editor.filter_line_edit.clear()
         # Clear the current index first to make sure that the `currentChanged`
         # signal is emitted even if the image at the index is already selected.
         self.image_list_selection_model.clearCurrentIndex()
+        pending_filter = self._pending_directory_filter
+        # Consume the pending filter so later reloads (refresh, settings import,
+        # opening a new directory) clear the filter as before.
+        self._pending_directory_filter = ''
+        if pending_filter:
+            # Reapplying the filter text triggers `set_image_list_filter`, which
+            # filters the list and selects its first image; we then restore the
+            # saved position within the filtered results below.
+            self.image_list.filter_line_edit.setText(pending_filter)
+        else:
+            self.image_list.filter_line_edit.clear()
+        select_index = self._pending_directory_select_index
+        row_count = self.proxy_image_list_model.rowCount()
+        if row_count:
+            select_index = max(0, min(select_index, row_count - 1))
         self.image_list.list_view.setCurrentIndex(
-            self.proxy_image_list_model.index(
-                self._pending_directory_select_index, 0))
+            self.proxy_image_list_model.index(select_index, 0))
         self.centralWidget().setCurrentWidget(self.image_viewer)
         self.reload_directory_action.setDisabled(False)
         self.image_tags_editor.tag_input_box.setDisabled(False)
@@ -1536,7 +1562,7 @@ class MainWindow(QMainWindow):
     def add_tag_to_selected_images(self, tag: str):
         selected_image_indices = self.image_list.get_selected_image_indices()
         self.image_list_model.add_tags([tag], selected_image_indices)
-        self.image_tags_editor.select_last_tag()
+        self.image_tags_editor.select_last_tag_or_flash()
 
     def prompt_category_for_new_library_tags(self, tags: list[str],
                                              prompt_parent=None):
@@ -1601,7 +1627,7 @@ class MainWindow(QMainWindow):
         if is_new_library_tag:
             self.tag_library_model.add_tags([tag])
         self.image_list_model.add_tags([tag], selected_image_indices)
-        self.image_tags_editor.select_last_tag()
+        self.image_tags_editor.select_last_tag_or_flash()
         if is_new_library_tag:
             self.prompt_category_for_new_library_tags([tag], prompt_parent)
 
@@ -1982,8 +2008,15 @@ class MainWindow(QMainWindow):
         if window_state_data:
             self.restoreState(window_state_data)
         
-        # Get the last index of the last selected image.
-        if self.settings.contains('image_index'):
+        # Get the last index of the last selected image. When a filter was
+        # active on exit, the saved position refers to the filtered list, so
+        # use that index and reapply the filter below.
+        saved_filter = self.settings.value(
+            'image_list_filter', defaultValue='', type=str)
+        if saved_filter:
+            image_index = self.settings.value(
+                'filtered_image_index', type=int) or 0
+        elif self.settings.contains('image_index'):
             image_index = self.settings.value('image_index', type=int)
         else:
             image_index = 0
@@ -1992,7 +2025,8 @@ class MainWindow(QMainWindow):
             directory_path = Path(self.settings.value('directory_path',
                                                       type=str))
             if directory_path.is_dir():
-                self.load_directory(directory_path, select_index=image_index)
+                self.load_directory(directory_path, select_index=image_index,
+                                    restore_filter=saved_filter)
                 return
         # No valid saved directory - show immediately (nothing to wait for).
         QTimer.singleShot(0, self._show_window)

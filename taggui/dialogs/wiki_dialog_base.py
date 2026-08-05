@@ -154,6 +154,10 @@ class BaseWikiDialog(QDialog):
         self.autocomplete_display_to_tag = {}
         self.pending_history_update = False
         self.pending_history_append_on_load = False
+        # One-shot flag: when set, the next silent search-box text update also
+        # re-selects the whole text. Used so a wiki opened pre-filled with a tag
+        # keeps its text highlighted after the async page load rewrites the box.
+        self._select_all_on_next_silent_set = False
 
     def _build_wiki_ui(self):
         self.setWindowTitle(self.WINDOW_TITLE)
@@ -292,6 +296,18 @@ class BaseWikiDialog(QDialog):
                 '</div>')
             self.show_status_message('Ready.')
         self.search_line_edit.setFocus()
+        # When the wiki opens pre-filled with a tag, highlight the whole search
+        # text so the user can immediately type over it to start a new search.
+        # The synchronous text set inside `load_tag` has already run above; the
+        # asynchronous fetch completion will later rewrite the search box with
+        # the resolved tag title (via `set_search_text_silently`), which would
+        # clear any selection we make now. So we both select immediately (covers
+        # instant/cached loads) and arm a one-shot flag so the text is
+        # re-selected once that async rewrite lands. This runs only on the
+        # initial open; later searches are unaffected.
+        if tag.strip():
+            self.search_line_edit.selectAll()
+            self._select_all_on_next_silent_set = True
 
     def _apply_loading_bar_theme(self):
         """Colour the loading bar from the active palette (theme-aware)."""
@@ -570,6 +586,12 @@ class BaseWikiDialog(QDialog):
         never launches a search, so no signal juggling is required.
         """
         self.search_line_edit.setText(text)
+        # If a pre-filled wiki open armed the one-shot selection flag, re-apply
+        # the full-text selection here (the async page load lands via this
+        # method and would otherwise drop the initial selection) and disarm it.
+        if self._select_all_on_next_silent_set:
+            self._select_all_on_next_silent_set = False
+            self.search_line_edit.selectAll()
         self.current_autocomplete_query = ''
         self.search_autocomplete_timer.stop()
         popup = self.search_completer.popup()
@@ -702,11 +724,14 @@ class BaseWikiDialog(QDialog):
             if not tag_name:
                 continue
             is_tag_group = bool(suggestion.get('is_tag_group'))
+            is_wiki_only = bool(suggestion.get('is_wiki_only'))
             tag_count = int(suggestion.get('post_count') or 0)
             human_readable_tag = tag_name.replace('_', ' ')
             if (is_tag_group
                     and human_readable_tag.casefold().startswith('tag group:')):
                 display_text = f'{human_readable_tag} (Tag Group)'
+            elif is_wiki_only:
+                display_text = f'{human_readable_tag} (Wiki)'
             else:
                 display_text = (f'{human_readable_tag} '
                                 f'({self.format_post_count(tag_count)})')
