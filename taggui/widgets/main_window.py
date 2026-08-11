@@ -1627,6 +1627,7 @@ class MainWindow(QMainWindow):
         if is_new_library_tag:
             self.tag_library_model.add_tags([tag])
         self.image_list_model.add_tags([tag], selected_image_indices)
+        self.image_tags_editor.clear_add_tag_box_if_matches(tag)
         self.image_tags_editor.select_last_tag_or_flash()
         if is_new_library_tag:
             self.prompt_category_for_new_library_tags([tag], prompt_parent)

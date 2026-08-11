@@ -439,6 +439,12 @@ class ImageListView(ElidedToolTipListView):
             lambda: self.set_selected_images_complete(False))
         self.select_all_images_action = self.addAction('Select All Images')
         self.select_all_images_action.setShortcut('Ctrl+A')
+        # Scope Ctrl+A to the Images pane so it doesn't fire window-wide. Without
+        # this (the default WindowShortcut context), pressing Ctrl+A while the
+        # Image Tags list has focus would select all images instead of letting
+        # the tags list select all tags.
+        self.select_all_images_action.setShortcutContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.select_all_images_action.triggered.connect(self.selectAll)
 
         self.context_menu = QMenu(self)
