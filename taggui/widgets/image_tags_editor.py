@@ -2,7 +2,7 @@ from typing import Optional
 from PySide6.QtCore import (QEvent, QItemSelectionModel, QModelIndex, QPoint,
                             QPropertyAnimation, QStringListModel, Qt, QTimer,
                             Signal, Slot)
-from PySide6.QtGui import QColor, QKeyEvent, QPalette
+from PySide6.QtGui import QColor, QFocusEvent, QKeyEvent, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                                QCompleter, QDockWidget,
                                QDialog, QGridLayout, QHBoxLayout, QLabel,
@@ -259,6 +259,14 @@ class TagInputBox(QLineEdit):
         # State for the border-flash / shake feedback animations.
         self._shake_animation: Optional[QPropertyAnimation] = None
         self._flash_timer: Optional[QTimer] = None
+        # Set by ImageTagsEditor once the tags list exists. Used to return
+        # focus to the tags list after a tag is added.
+        self.image_tags_list = None
+        # True when this box was auto-focused by typing in the tags list (see
+        # ImageTagsList.keyPressEvent). When set, focus returns to the tags list
+        # after the tag is added. Cleared once focus leaves the box for any
+        # other reason, so a later manual edit doesn't wrongly jump focus.
+        self._return_focus_to_tags_list_after_add = False
         # Connect the library-change signals once. The refresh handler is a
         # no-op while autocomplete is disabled (guarded by `completer_model`),
         # so it is safe to keep connected even when the completer is torn down.
@@ -292,7 +300,7 @@ class TagInputBox(QLineEdit):
             self.setCompleter(self.completer)
             self._refresh_completer_candidates()
             self.completer.activated[str].connect(
-                lambda text: self.add_tag(self._completion_to_tag(text)))
+                self._on_completion_activated)
         else:
             if self.completer is None:
                 return
@@ -320,6 +328,31 @@ class TagInputBox(QLineEdit):
         self.clear()
         if self.completer is not None:
             self.completer.popup().hide()
+        self._return_focus_to_tags_list_if_needed()
+
+    def _on_completion_activated(self, text: str):
+        """Handle the user picking an autocomplete suggestion (e.g. by clicking
+        it or pressing Enter while the popup is highlighted)."""
+        self.add_tag(self._completion_to_tag(text))
+        self._return_focus_to_tags_list_if_needed()
+
+    def _return_focus_to_tags_list_if_needed(self):
+        """Return keyboard focus to the tags list when this box was auto-focused
+        by typing there. The flag is read and cleared before moving focus."""
+        should_return = self._return_focus_to_tags_list_after_add
+        self._return_focus_to_tags_list_after_add = False
+        if should_return and self.image_tags_list is not None:
+            self.image_tags_list.setFocus()
+
+    def focusOutEvent(self, event: QFocusEvent):
+        super().focusOutEvent(event)
+        # Drop the auto-focus flag whenever focus genuinely leaves the box, so a
+        # later manual edit won't jump focus back to the tags list. The
+        # autocomplete popup does not count: it steals focus with
+        # PopupFocusReason, and we still want the flag when a suggestion there
+        # is what adds the tag.
+        if event.reason() != Qt.FocusReason.PopupFocusReason:
+            self._return_focus_to_tags_list_after_add = False
 
     def add_tag(self, tag: str):
         tag = tag.strip()
@@ -632,6 +665,9 @@ class ImageTagsList(ElidedToolTipListView):
         """
         if self._should_redirect_typing_to_tag_input(event):
             tag_input_box = self.tag_input_box
+            # Remember to return focus here after the tag is added, since the
+            # box is being auto-focused only because the user typed in this list.
+            tag_input_box._return_focus_to_tags_list_after_add = True
             tag_input_box.raise_()
             tag_input_box.setFocus()
             tag_input_box.insert(event.text())
@@ -761,6 +797,9 @@ class ImageTagsEditor(QDockWidget):
                                              tag_library_model)
         # Let the tag list redirect typing to the Add Tag box.
         self.image_tags_list.tag_input_box = self.tag_input_box
+        # Let the Add Tag box return focus to the tag list after an auto-focused
+        # add (see TagInputBox / ImageTagsList).
+        self.tag_input_box.image_tags_list = self.image_tags_list
         self.image_tags_list.danbooru_wiki_requested.connect(
             self.danbooru_wiki_requested.emit)
         self.image_tags_list.gelbooru_wiki_requested.connect(
@@ -884,6 +923,16 @@ class ImageTagsEditor(QDockWidget):
             self.tag_input_box.flash_added_feedback()
         else:
             self.select_last_tag()
+
+    def clear_add_tag_box_if_matches(self, tag: str):
+        """Clear the Add Tag box if its current text matches ``tag`` (ignoring
+        surrounding whitespace and case). Used by external add-tag flows (e.g.
+        the wiki dialogs) so that adding a tag the user had already typed into
+        the box also empties the box, matching the normal Enter-to-add behavior.
+        """
+        current_text = self.tag_input_box.text().strip()
+        if current_text and current_text.casefold() == tag.strip().casefold():
+            self.tag_input_box.clear()
 
     def _on_tags_inserted(self, parent: QModelIndex, first: int, last: int):
         """Select the newly added tag and scroll it into view, unless the user
