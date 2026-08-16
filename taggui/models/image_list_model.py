@@ -2,7 +2,7 @@ import random
 import re
 import sys
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -290,6 +290,10 @@ class RefreshResult:
     # path -> {'file': (snapshot_mtime, new_mtime, dimensions),
     #          'caption': (snapshot_mtime, new_mtime, tags, prompt)}
     updates: dict
+    # path -> new is_complete value, for images already in the model whose
+    # "complete" flag changed during reconciliation (e.g. a completed image
+    # that was moved into a subfolder and re-homed onto its new path).
+    completion_changes: dict = field(default_factory=dict)
 
 
 class RefreshScanner(QObject, QRunnable):
@@ -338,27 +342,46 @@ class RefreshScanner(QObject, QRunnable):
         removed_paths = existing_paths - image_paths
         added_paths = sorted(image_paths - existing_paths)
 
+        # Per-image info handed to the completion store so it can refresh hashes
+        # and re-home "complete" flags after external moves/renames, exactly as
+        # the full directory scan does. Gathered for every image on disk (both
+        # newly added and already loaded) while we stat them below.
+        scanned_for_completion: list = []
+
         # Build full Image objects for newly added files (read-only work).
         added_images = []
         for image_path in added_paths:
             dimensions = get_image_dimensions(image_path)
             try:
-                file_modified_time_ns = image_path.stat().st_mtime_ns
+                image_stat = image_path.stat()
+                file_modified_time_ns = image_stat.st_mtime_ns
+                file_size = image_stat.st_size
             except OSError:
                 file_modified_time_ns = None
+                file_size = None
             tags: list = []
             natural_language_prompt = ''
             caption_file_modified_time_ns = None
             text_file_path = image_path.with_suffix('.txt')
-            if str(text_file_path) in text_file_path_strings:
+            text_file_path_str = str(text_file_path)
+            if text_file_path_str in text_file_path_strings:
                 (tags, natural_language_prompt,
                  caption_file_modified_time_ns) = read_caption_file(
                      text_file_path, self.tag_separator)
+            # is_complete is filled in after reconcile() below, since re-homing
+            # can newly complete a moved-in image.
             added_images.append(Image(
                 image_path, dimensions, tags, natural_language_prompt,
                 file_modified_time_ns=file_modified_time_ns,
                 caption_file_modified_time_ns=caption_file_modified_time_ns,
-                is_complete=completion_store.is_complete(image_path)))
+                is_complete=False))
+            scanned_for_completion.append({
+                'path': image_path,
+                'size': file_size,
+                'mtime_ns': file_modified_time_ns,
+                'cap_path': text_file_path_str,
+                'cap_mtime_ns': caption_file_modified_time_ns,
+            })
         added_images.sort(key=lambda img: img.path)
 
         # Detect changes to images that already existed at snapshot time.
@@ -369,17 +392,22 @@ class RefreshScanner(QObject, QRunnable):
                 continue
             entry: dict = {}
 
-            # Image file: only read dimensions if the modified time changed.
+            # Image file: single stat for mtime (change detection) and size
+            # (completion-store re-home prefilter).
             try:
-                new_file_mtime = image_path.stat().st_mtime_ns
+                image_stat = image_path.stat()
+                new_file_mtime = image_stat.st_mtime_ns
+                file_size = image_stat.st_size
             except OSError:
                 new_file_mtime = snapshot_file_mtime
+                file_size = None
             if new_file_mtime != snapshot_file_mtime:
                 entry['file'] = (snapshot_file_mtime, new_file_mtime,
                                  get_image_dimensions(image_path))
 
             # Caption file: stat first; only read + parse when it changed.
             text_file_path = image_path.with_suffix('.txt')
+            text_file_path_str = str(text_file_path)
             try:
                 new_caption_mtime = text_file_path.stat().st_mtime_ns
             except OSError:
@@ -396,9 +424,37 @@ class RefreshScanner(QObject, QRunnable):
 
             if entry:
                 updates[image_path] = entry
+            scanned_for_completion.append({
+                'path': image_path,
+                'size': file_size,
+                'mtime_ns': new_file_mtime,
+                'cap_path': text_file_path_str,
+                'cap_mtime_ns': new_caption_mtime,
+            })
+
+        # Reconcile the completion store against everything currently on disk so
+        # that "complete" flags follow images moved or renamed while the window
+        # was in the background — mirroring the full directory scan.
+        if completion_store.reconcile(scanned_for_completion):
+            completion_store.save()
+
+        # Apply the (possibly re-homed) flags to the newly added images.
+        for image in added_images:
+            image.is_complete = completion_store.is_complete(image.path)
+
+        # Report "complete" flags for already-loaded images. Reconciliation can
+        # only newly complete an existing image (it never clears a flag whose
+        # image is still present), so reporting the complete ones is enough;
+        # apply_refresh_result diffs these against the model.
+        completion_changes: dict = {}
+        for image_path in self.snapshot:
+            if image_path in removed_paths:
+                continue
+            if completion_store.is_complete(image_path):
+                completion_changes[image_path] = True
 
         return RefreshResult(self.directory_path, added_images, removed_paths,
-                             updates)
+                             updates, completion_changes)
 
 
 class ThumbnailLoader(QObject, QRunnable):
@@ -839,6 +895,34 @@ class ImageListModel(QAbstractListModel):
                      Qt.ItemDataRole.DisplayRole,
                      Qt.ItemDataRole.ToolTipRole,
                      Qt.ItemDataRole.UserRole])
+        # Completion flags that changed during reconciliation (e.g. a completed
+        # image moved into a subfolder was re-homed onto its new path). Update
+        # the affected rows so their "complete" badge refreshes immediately,
+        # without waiting for a full reload/restart. The authoritative value is
+        # re-read from the store here (on the main thread) so a completion toggle
+        # the user made while the background scan was running is never clobbered.
+        if result.completion_changes:
+            completion_store = get_completion_store()
+            path_to_row = {image.path: row
+                           for row, image in enumerate(self.images)}
+            for image_path in result.completion_changes:
+                row = path_to_row.get(image_path)
+                if row is None:
+                    continue
+                image = self.images[row]
+                is_complete = completion_store.is_complete(image_path)
+                if image.is_complete == is_complete:
+                    continue
+                image.is_complete = is_complete
+                if row not in changed_rows:
+                    changed_rows.append(row)
+                image_index = self.index(row, 0)
+                self.dataChanged.emit(
+                    image_index, image_index,
+                    [Qt.ItemDataRole.DecorationRole,
+                     Qt.ItemDataRole.ToolTipRole,
+                     Qt.ItemDataRole.UserRole])
+
         # Newly added files (and updated ones whose thumbnails were reset) may
         # not be cached yet — warm them silently in the background. Bump the
         # generation first so any warmer still running from the initial load
