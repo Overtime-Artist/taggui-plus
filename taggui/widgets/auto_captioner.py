@@ -834,6 +834,37 @@ class AutoCaptioner(QDockWidget):
         self.captioning_finished.emit()
 
     @Slot()
+    def finalize_captioning(self):
+        """Run end-of-captioning steps in a safe order.
+
+        The completion alert is shown first and blocks (modal ``exec()``) until
+        the user closes it. ``is_captioning`` is kept True across the alert so
+        that any new-tag category-assignment prompts queued during the run stay
+        queued (rather than firing inside the alert's nested event loop and
+        appearing on top of it). Only after the alert closes is the captioning
+        state cleared and ``captioning_finished`` emitted, which drains those
+        queued tags as a single prompt.
+        """
+        if getattr(self, '_show_alert_when_finished', False):
+            self.show_alert()
+        self.set_is_captioning(False)
+        self.forward_captioning_finished()
+
+    @Slot()
+    def _current_source_index(self) -> QModelIndex | None:
+        """The source-model index of the current (highlighted) image.
+
+        Used when the user chooses to caption only the current image from a
+        multi-image selection. Falls back to ``None`` if there is no valid
+        current index.
+        """
+        list_view = self.image_list.list_view
+        current_proxy_index = list_view.selectionModel().currentIndex()
+        if not current_proxy_index.isValid():
+            return None
+        return self.image_list.proxy_image_list_model.mapToSource(
+            current_proxy_index)
+
     def generate_captions(self):
         selected_image_indices = self.image_list.get_selected_image_indices()
         selected_image_count = len(selected_image_indices)
@@ -844,8 +875,19 @@ class AutoCaptioner(QDockWidget):
             reply = confirmation_dialog.exec()
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            show_alert_when_finished = (confirmation_dialog
-                                        .show_alert_check_box.isChecked())
+            if confirmation_dialog.caption_current_image_only():
+                # Reduce to a single-image run targeting the current image.
+                # This mirrors captioning one image directly: no progress bar,
+                # no multi-image undo confirmation, and no finish alert.
+                current_index = self._current_source_index()
+                if current_index is not None and current_index.isValid():
+                    selected_image_indices = [current_index]
+                else:
+                    selected_image_indices = selected_image_indices[:1]
+                selected_image_count = 1
+            else:
+                show_alert_when_finished = (confirmation_dialog
+                                            .show_alert_check_box.isChecked())
         self.set_is_captioning(True)
         self.captioning_started.emit()
         caption_settings = self.caption_settings_form.get_caption_settings()
@@ -884,15 +926,19 @@ class AutoCaptioner(QDockWidget):
             self.forward_caption_generated)
         self.captioning_thread.progress_bar_update_requested.connect(
             self.progress_bar.setValue)
-        self.captioning_thread.finished.connect(
-            lambda: self.set_is_captioning(False))
         self.captioning_thread.finished.connect(restore_stdout_and_stderr)
         self.captioning_thread.finished.connect(self.progress_bar.hide)
         self.captioning_thread.finished.connect(
             lambda: self.set_start_cancel_button_enabled(True))
-        self.captioning_thread.finished.connect(self.forward_captioning_finished)
-        if show_alert_when_finished:
-            self.captioning_thread.finished.connect(self.show_alert)
+        # Show the completion alert (if the user enabled it), then clear the
+        # captioning state and emit ``captioning_finished`` from a single
+        # finalizer, in that order. The alert is modal (``exec()`` runs a nested
+        # event loop), so keeping ``is_captioning`` True until the alert closes
+        # ensures any category-assignment prompts still queued for the run stay
+        # queued (not shown on top of the alert) and are drained afterwards as a
+        # single prompt via ``captioning_finished``.
+        self._show_alert_when_finished = show_alert_when_finished
+        self.captioning_thread.finished.connect(self.finalize_captioning)
         # Redirect `stdout` and `stderr` so that the outputs are displayed in
         # the console text edit.
         sys.stdout = self.captioning_thread

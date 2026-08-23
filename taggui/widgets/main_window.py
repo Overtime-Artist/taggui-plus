@@ -255,11 +255,7 @@ class MainWindow(QMainWindow):
         self.focus_image_tags_list_shortcut = QShortcut(
             QKeySequence('Alt+I'), self)
         self.focus_image_tags_list_shortcut.activated.connect(
-            self.image_tags_editor.raise_)
-        self.focus_image_tags_list_shortcut.activated.connect(
-            self.image_tags_editor.image_tags_list.setFocus)
-        self.focus_image_tags_list_shortcut.activated.connect(
-            self.image_tags_editor.select_first_tag)
+            self.image_tags_editor.focus_tags_list)
         self.focus_search_tags_box_shortcut = QShortcut(
             QKeySequence('Alt+S'), self)
         self.focus_search_tags_box_shortcut.activated.connect(
@@ -672,6 +668,16 @@ class MainWindow(QMainWindow):
             self.tag_counter_model.count_tags(self.image_list_model.images)
         if not changed_rows:
             return
+        if self.image_viewer.is_grid_mode():
+            # In grid mode a single-image reload is a no-op, so refresh the
+            # affected grid cells directly. This keeps the synchronized grid
+            # consistent with externally-changed files picked up on re-focus.
+            images = self.image_list_model.images
+            changed_paths = {
+                str(images[row].path)
+                for row in changed_rows if 0 <= row < len(images)}
+            self.image_viewer.refresh_grid_paths(changed_paths)
+            return
         current_proxy_index = self.image_list.list_view.currentIndex()
         if not current_proxy_index.isValid():
             return
@@ -984,9 +990,7 @@ class MainWindow(QMainWindow):
                 self.image_tags_editor.raise_,
                 self.image_tags_editor.tag_input_box.setFocus],
             'focus_image_tags_list': [
-                self.image_tags_editor.raise_,
-                self.image_tags_editor.image_tags_list.setFocus,
-                self.image_tags_editor.select_first_tag],
+                self.image_tags_editor.focus_tags_list],
             'focus_all_tags_search': [
                 self.all_tags_editor.raise_,
                 self.all_tags_editor.filter_line_edit.setFocus],
@@ -1227,26 +1231,29 @@ class MainWindow(QMainWindow):
         3. Otherwise return '' so the wiki opens without a preset tag (e.g. when
            the shortcut is used from the Tools menu)."""
         # (input box, tag pane the box belongs to)
-        input_box_panes = (
-            (self.image_tags_editor.tag_input_box,
-             self.image_tags_editor.image_tags_list),
-            (self.all_tags_editor.filter_line_edit,
-             self.all_tags_editor.all_tags_list))
-        for input_box, tag_list in input_box_panes:
-            if input_box.hasFocus():
-                text = input_box.text().strip()
-                if text:
-                    return text
-                return tag_list.selected_tag_for_wiki()
-        pane_lists = (self.image_tags_editor.image_tags_list,
-                      self.all_tags_editor.all_tags_list)
-        for tag_list in pane_lists:
-            if tag_list.hasFocus():
-                return tag_list.selected_tag_for_wiki()
+        editor = self.image_tags_editor
+        # The Image Tags Add Tag box shares the pane with the grouped view, so
+        # when it is empty fall back to the mode-aware selected tag (normal list
+        # or Common/Differences panel).
+        if editor.tag_input_box.hasFocus():
+            text = editor.tag_input_box.text().strip()
+            if text:
+                return text
+            return editor.selected_tag_for_wiki()
+        if self.all_tags_editor.filter_line_edit.hasFocus():
+            text = self.all_tags_editor.filter_line_edit.text().strip()
+            if text:
+                return text
+            return self.all_tags_editor.all_tags_list.selected_tag_for_wiki()
+        if editor.tag_pane_has_focus():
+            return editor.selected_tag_for_wiki()
+        if self.all_tags_editor.all_tags_list.hasFocus():
+            return self.all_tags_editor.all_tags_list.selected_tag_for_wiki()
         return ''
 
     @Slot(str)
     def show_danbooru_wiki_dialog(self, tag: str = ''):
+        in_group_mode = self.image_tags_editor.is_group_mode()
         danbooru_wiki_dialog = DanbooruWikiDialog(
             self, tag if tag.strip() else '',
             tag_library_model=self.tag_library_model,
@@ -1254,7 +1261,11 @@ class MainWindow(QMainWindow):
             add_to_selected_images_callback=(
                 self.add_wiki_tag_to_selected_images),
             selected_images_have_tag_callback=(
-                self.wiki_selected_images_have_tag))
+                self.wiki_selected_images_have_tag),
+            add_to_current_image_callback=(
+                self.add_wiki_tag_to_current_image if in_group_mode else None),
+            current_image_has_tag_callback=(
+                self.wiki_current_image_has_tag if in_group_mode else None))
         # Destroy the dialog (and its timers/threads) deterministically on the
         # GUI thread when it closes, instead of leaking one live dialog per
         # open.
@@ -1264,6 +1275,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def show_gelbooru_wiki_dialog(self, tag: str = ''):
+        in_group_mode = self.image_tags_editor.is_group_mode()
         gelbooru_wiki_dialog = GelbooruWikiDialog(
             self, tag if tag.strip() else '',
             tag_library_model=self.tag_library_model,
@@ -1271,7 +1283,11 @@ class MainWindow(QMainWindow):
             add_to_selected_images_callback=(
                 self.add_wiki_tag_to_selected_images),
             selected_images_have_tag_callback=(
-                self.wiki_selected_images_have_tag))
+                self.wiki_selected_images_have_tag),
+            add_to_current_image_callback=(
+                self.add_wiki_tag_to_current_image if in_group_mode else None),
+            current_image_has_tag_callback=(
+                self.wiki_current_image_has_tag if in_group_mode else None))
         gelbooru_wiki_dialog.setAttribute(
             Qt.WidgetAttribute.WA_DeleteOnClose, True)
         gelbooru_wiki_dialog.exec()
@@ -1429,6 +1445,13 @@ class MainWindow(QMainWindow):
             self.image_viewer.load_image)
         self.image_list_selection_model.currentChanged.connect(
             self.image_tags_editor.load_image_tags)
+        # Keep the grouped tag view and synchronized grid preview in sync with
+        # the selection. Reconciled on both a changed selection and a moved
+        # current image (arrow keys), after the single-image handlers above.
+        self.image_list_selection_model.selectionChanged.connect(
+            self._sync_variant_group_view)
+        self.image_list_selection_model.currentChanged.connect(
+            self._sync_variant_group_view)
         self.image_list_model.dataChanged.connect(
             lambda: self.tag_counter_model.count_tags(
                 self.image_list_model.images))
@@ -1462,6 +1485,68 @@ class MainWindow(QMainWindow):
         self.image_list.visibilityChanged.connect(
             lambda: self.toggle_image_list_action.setChecked(
                 self.image_list.isVisible()))
+
+    @Slot()
+    def _sync_variant_group_view(self, *args):
+        """Reconcile the grouped tag view and grid preview with the selection.
+
+        When the variant grid setting is on and two or more images are
+        selected, the Image Tags pane shows the grouped Common/Differences view
+        and the center preview shows a synchronized grid of the selection.
+        Otherwise the panes fall back to the normal single-image view. This is
+        safe to call repeatedly; it fully derives the desired state from the
+        current selection each time.
+        """
+        grid_enabled = get_settings().value(
+            'variant_grid_view_enabled',
+            defaultValue=DEFAULT_SETTINGS['variant_grid_view_enabled'],
+            type=bool)
+        list_view = self.image_list.list_view
+        selected_proxy_indices = sorted(list_view.selectedIndexes(),
+                                        key=lambda index: index.row())
+        if grid_enabled and len(selected_proxy_indices) >= 2:
+            current_proxy_index = self.image_list_selection_model.currentIndex()
+            selected_rows = [index.row() for index in selected_proxy_indices]
+            current_row = current_proxy_index.row()
+            current_position = (selected_rows.index(current_row)
+                                if current_row in selected_rows else 0)
+            source_indices = [
+                self.proxy_image_list_model.mapToSource(index)
+                for index in selected_proxy_indices]
+            current_source_index = source_indices[current_position]
+            cell_cap = get_settings().value(
+                'variant_grid_cell_cap',
+                defaultValue=DEFAULT_SETTINGS['variant_grid_cell_cap'],
+                type=int)
+            if self.image_tags_editor.is_group_mode():
+                self.image_tags_editor.update_group_selection(
+                    source_indices, current_source_index)
+                self.image_viewer.update_grid_current(
+                    selected_proxy_indices, current_position, cell_cap)
+            else:
+                self.image_tags_editor.enter_group_mode(
+                    source_indices, current_source_index)
+                self.image_viewer.show_grid(
+                    selected_proxy_indices, current_position, cell_cap)
+            return
+        # Single-image (or disabled) view.
+        was_grid = self.image_viewer.is_grid_mode()
+        was_group = self.image_tags_editor.is_group_mode()
+        self.image_tags_editor.exit_group_mode()
+        if was_group:
+            # currentChanged fires before selectionChanged, so load_image_tags
+            # already ran once while group mode was still active and early
+            # returned without refreshing the single-image tag list or the
+            # green "Complete" indicator. Now that group mode is off, reload the
+            # current image so both reflect its real state.
+            current_proxy_index = self.image_list_selection_model.currentIndex()
+            if current_proxy_index.isValid():
+                self.image_tags_editor.load_image_tags(current_proxy_index)
+        if was_grid:
+            self.image_viewer.exit_grid()
+            current_proxy_index = self.image_list_selection_model.currentIndex()
+            if current_proxy_index.isValid():
+                self.image_viewer.load_image(current_proxy_index)
 
     @Slot()
     def _focus_image_list_on_preview_click(self):
@@ -1535,6 +1620,8 @@ class MainWindow(QMainWindow):
             self.image_list_model.add_tags)
         self.image_tags_editor.tag_input_box.new_library_tags_added.connect(
             self.record_newly_added_library_tags)
+        self.image_tags_editor.grid_mark_paths_changed.connect(
+            self.image_viewer.set_marked_paths)
         self.image_tags_editor.danbooru_wiki_requested.connect(
             self.show_danbooru_wiki_dialog)
         self.image_tags_editor.gelbooru_wiki_requested.connect(
@@ -1654,6 +1741,48 @@ class MainWindow(QMainWindow):
             if tag not in image.tags:
                 return False
         return True
+
+    def add_wiki_tag_to_current_image(self, tag: str, prompt_parent=None):
+        """Add a wiki tag (lowercased) to just the current image in the grouped
+        (grid) view, prompting for its category if it is new to the Tag
+        Library."""
+        tag = tag.strip().lower()
+        if not tag:
+            return
+        current_index = self.image_tags_editor.current_group_image_index()
+        if current_index is None:
+            QMessageBox.information(
+                prompt_parent or self, 'No Current Image',
+                'There is no current image to add the tag to.')
+            return
+        is_new_library_tag = not self.tag_library_model.has_tag(tag)
+        # Add to the Tag Library first so the automatic tag-tracking machinery
+        # does not also queue its own (main-window-parented) category prompt;
+        # a dialog-parented prompt is shown below instead.
+        if is_new_library_tag:
+            self.tag_library_model.add_tags([tag])
+        self.image_list_model.add_tags([tag], [current_index])
+        self.image_tags_editor.clear_add_tag_box_if_matches(tag)
+        self.image_tags_editor.select_last_tag_or_flash()
+        if is_new_library_tag:
+            self.prompt_category_for_new_library_tags([tag], prompt_parent)
+
+    def wiki_current_image_has_tag(self, tag: str):
+        """Report whether the current grouped-view image already has the wiki
+        tag, for the wiki dialog's "Add to Current Image" button.
+
+        Returns None when there is no current image, True when it already has
+        the tag, and False otherwise.
+        """
+        tag = tag.strip().lower()
+        if not tag:
+            return None
+        current_index = self.image_tags_editor.current_group_image_index()
+        if current_index is None:
+            return None
+        image: Image = self.image_list_model.data(
+            current_index, Qt.ItemDataRole.UserRole)
+        return tag in image.tags
 
     def prompt_remove_tags_from_tag_library(self, tags: list[str]):
         tag_library_tags = [tag for tag in tags if self.tag_library_model.has_tag(tag)]

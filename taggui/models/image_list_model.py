@@ -1318,6 +1318,68 @@ class ImageListModel(QAbstractListModel):
         max_image_index = max(image_indices, key=lambda index: index.row())
         self.dataChanged.emit(min_image_index, max_image_index)
 
+    @Slot(list, list)
+    def remove_tags_from_images(self, tags: list[str],
+                                image_indices: list[QModelIndex]):
+        """Remove one or more tags from an explicit set of images.
+
+        Unlike ``delete_tags`` (which works by scope across the whole model),
+        this targets exactly the given image indices, as needed by the grouped
+        multi-image tags view ("remove from all selected" / "remove from the
+        current image"). Only images that actually contain one of the tags are
+        modified and written to disk.
+        """
+        if not image_indices or not tags:
+            return
+        tags_to_remove = set(tags)
+        action_name = f'Remove {pluralize("Tag", len(tags))}'
+        should_ask_for_confirmation = len(image_indices) > 1
+        self.add_to_undo_stack(action_name, should_ask_for_confirmation)
+        changed_indices = []
+        for image_index in image_indices:
+            image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
+            if not any(tag in tags_to_remove for tag in image.tags):
+                continue
+            image.tags = [tag for tag in image.tags
+                          if tag not in tags_to_remove]
+            self.write_image_tags_to_disk(image)
+            changed_indices.append(image_index)
+        if not changed_indices:
+            return
+        min_image_index = min(changed_indices, key=lambda index: index.row())
+        max_image_index = max(changed_indices, key=lambda index: index.row())
+        self.dataChanged.emit(min_image_index, max_image_index)
+
+    @Slot(str, str, list)
+    def rename_tag_in_images(self, old_tag: str, new_tag: str,
+                             image_indices: list[QModelIndex]):
+        """Rename a tag on an explicit set of images (grouped view in-place edit).
+
+        Mirrors ``remove_tags_from_images`` but for an in-place rename: only the
+        given images that actually contain ``old_tag`` are modified, the new tag
+        takes the old tag's position, and duplicates are collapsed. No-op when
+        the new tag is empty or unchanged.
+        """
+        new_tag = new_tag.strip()
+        if not image_indices or not old_tag or not new_tag or old_tag == new_tag:
+            return
+        targets = [index for index in image_indices
+                   if old_tag in self.data(index,
+                                           Qt.ItemDataRole.UserRole).tags]
+        if not targets:
+            return
+        self.add_to_undo_stack(
+            action_name='Rename Tag',
+            should_ask_for_confirmation=len(targets) > 1)
+        for image_index in targets:
+            image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
+            image.tags = list(dict.fromkeys(
+                new_tag if tag == old_tag else tag for tag in image.tags))
+            self.write_image_tags_to_disk(image)
+        min_image_index = min(targets, key=lambda index: index.row())
+        max_image_index = max(targets, key=lambda index: index.row())
+        self.dataChanged.emit(min_image_index, max_image_index)
+
     @Slot(list, str)
     def rename_tags(self, old_tags: list[str], new_tag: str,
                     scope: Scope | str = Scope.ALL_IMAGES,

@@ -506,13 +506,30 @@ class ImageListView(ElidedToolTipListView):
         self.viewport().update()
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Left:
-            if self.switch_between_selected_images(-1):
+        key = event.key()
+        modifiers = event.modifiers()
+        arrow_keys = (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                      Qt.Key.Key_Up, Qt.Key.Key_Down)
+        # With a multi-image selection, keep the arrow keys "inside" the
+        # selection so it can't be lost by accident. Plain Left/Right/Up/Down
+        # cycle the current image among the selected ones (stopping at the
+        # ends); Ctrl+Up/Down is the deliberate way to select a new image
+        # outside the selection. Other combinations (Shift+arrow to extend,
+        # etc.) keep their default behavior.
+        if len(self.selectedIndexes()) >= 2 and key in arrow_keys:
+            control_pressed = bool(
+                modifiers & Qt.KeyboardModifier.ControlModifier)
+            shift_pressed = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+            if (control_pressed and not shift_pressed
+                    and key in (Qt.Key.Key_Up, Qt.Key.Key_Down)):
+                self.move_selection_beyond(
+                    -1 if key == Qt.Key.Key_Up else 1)
                 return
-        elif event.key() == Qt.Key.Key_Right:
-            if self.switch_between_selected_images(1):
+            if modifiers == Qt.KeyboardModifier.NoModifier:
+                self.switch_between_selected_images(
+                    -1 if key in (Qt.Key.Key_Left, Qt.Key.Key_Up) else 1)
                 return
-        elif self._should_redirect_typing_to_tag_input(event):
+        if self._should_redirect_typing_to_tag_input(event):
             editor = self.image_tags_editor
             editor.raise_()
             editor.tag_input_box.setFocus()
@@ -575,6 +592,28 @@ class ImageListView(ElidedToolTipListView):
                       QAbstractItemView.ScrollHint.EnsureVisible)
         return True
 
+    def move_selection_beyond(self, direction: int) -> bool:
+        """Select a single image just outside the current multi-selection.
+
+        Used by Ctrl+Up/Down so the arrow keys can deliberately leave a
+        multi-image selection, while plain arrows stay within it. Ctrl+Down
+        moves to the image after the last selected one, Ctrl+Up to the image
+        before the first selected one.
+        """
+        selected_rows = sorted(index.row() for index in self.selectedIndexes())
+        if not selected_rows:
+            return False
+        target_row = (selected_rows[0] - 1 if direction < 0
+                      else selected_rows[-1] + 1)
+        if target_row < 0 or target_row >= self.model().rowCount():
+            return False
+        target_index = self.model().index(target_row, 0)
+        self.selectionModel().setCurrentIndex(
+            target_index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        self.scrollTo(target_index,
+                      QAbstractItemView.ScrollHint.EnsureVisible)
+        return True
+
     @Slot()
     def invert_selection(self):
         selected_proxy_rows = {index.row() for index in self.selectedIndexes()}
@@ -594,6 +633,25 @@ class ImageListView(ElidedToolTipListView):
         selected_images = [index.data(Qt.ItemDataRole.UserRole)
                            for index in selected_image_proxy_indices]
         return selected_images
+
+    def get_current_image(self) -> Image | None:
+        """Return the current (focused) image among the selection.
+
+        When several images are selected, the "current" one is the image with
+        the focus rectangle that the user navigates with the arrow keys. It is
+        not necessarily the first item returned by `selectedIndexes()`, so
+        actions that operate on a single image (e.g. opening it externally)
+        should target this instead of `get_selected_images()[0]`.
+        """
+        current_index = self.selectionModel().currentIndex()
+        if current_index.isValid():
+            selected_rows = {index.row() for index in self.selectedIndexes()}
+            if not selected_rows or current_index.row() in selected_rows:
+                current_image = current_index.data(Qt.ItemDataRole.UserRole)
+                if current_image is not None:
+                    return current_image
+        selected_images = self.get_selected_images()
+        return selected_images[0] if selected_images else None
 
     @Slot()
     def copy_selected_image_tags(self):
@@ -770,14 +828,18 @@ class ImageListView(ElidedToolTipListView):
 
     @Slot()
     def open_image(self):
-        selected_images = self.get_selected_images()
-        image_path = selected_images[0].path
+        current_image = self.get_current_image()
+        if current_image is None:
+            return
+        image_path = current_image.path
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(image_path)))
 
     @Slot()
     def open_image_in_editor(self):
-        selected_images = self.get_selected_images()
-        image_path = selected_images[0].path
+        current_image = self.get_current_image()
+        if current_image is None:
+            return
+        image_path = current_image.path
         settings = get_settings()
         editor_executable_path = settings.value(
             'image_editor_executable_path',
@@ -851,12 +913,14 @@ class ImageListView(ElidedToolTipListView):
 
     @Slot()
     def open_caption_file(self):
-        selected_images = self.get_selected_images()
-        caption_file_path = selected_images[0].path.with_suffix('.txt')
+        current_image = self.get_current_image()
+        if current_image is None:
+            return
+        caption_file_path = current_image.path.with_suffix('.txt')
         if not caption_file_path.exists():
             QMessageBox.critical(
                 self, 'Error',
-                f'Caption file does not exist for {selected_images[0].path}.')
+                f'Caption file does not exist for {current_image.path}.')
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(caption_file_path)))
 
@@ -879,12 +943,13 @@ class ImageListView(ElidedToolTipListView):
         self.copy_images_action.setText(copy_images_action_name)
         self.delete_images_action.setText(delete_images_action_name)
         has_caption_file = False
-        if selected_image_count == 1:
-            caption_file_path = self.get_selected_images()[0].path.with_suffix(
-                '.txt')
-            has_caption_file = caption_file_path.exists()
-        self.open_image_action.setVisible(selected_image_count == 1)
-        self.open_image_editor_action.setVisible(selected_image_count == 1)
+        if selected_image_count > 0:
+            current_image = self.get_current_image()
+            if current_image is not None:
+                has_caption_file = current_image.path.with_suffix(
+                    '.txt').exists()
+        self.open_image_action.setVisible(selected_image_count > 0)
+        self.open_image_editor_action.setVisible(selected_image_count > 0)
         self.rename_image_action.setVisible(selected_image_count == 1)
         self.open_caption_file_action.setVisible(has_caption_file)
         mark_complete_action_name = (
