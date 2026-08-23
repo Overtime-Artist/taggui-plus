@@ -165,6 +165,8 @@ _GENERAL_PREFERENCES_VALIDATORS = {
     'tag_library_new_tag_default_category_id': _validate_str,
     'ask_before_assigning_new_tag_category': _validate_bool,
     'auto_apply_implications': _validate_auto_apply_implications,
+    'variant_grid_view_enabled': _validate_bool,
+    'variant_grid_cell_cap': _make_int_validator(minimum=4, maximum=64),
 }
 
 
@@ -319,7 +321,8 @@ EXPORT_CATEGORIES = {
             'image_tags_token_limit',
             'tag_library_keep_or_remove_default_choice', 'tag_library_ask_keep_or_remove',
             'tag_library_new_tag_default_category_id', 'ask_before_assigning_new_tag_category',
-            'auto_apply_implications', 'hidden_model_ids'
+            'auto_apply_implications', 'hidden_model_ids',
+            'variant_grid_view_enabled', 'variant_grid_cell_cap'
         ]
     },
     'keyboard_shortcuts': {

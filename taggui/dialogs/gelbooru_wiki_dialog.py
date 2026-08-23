@@ -373,11 +373,15 @@ class GelbooruWikiDialog(BaseWikiDialog):
                  tag_library_model: TagLibraryModel | None = None,
                  add_to_library_callback=None,
                  add_to_selected_images_callback=None,
-                 selected_images_have_tag_callback=None):
+                 selected_images_have_tag_callback=None,
+                 add_to_current_image_callback=None,
+                 current_image_has_tag_callback=None):
         super().__init__(parent)
         self._init_wiki_state(tag_library_model, add_to_library_callback,
                               add_to_selected_images_callback,
-                              selected_images_have_tag_callback)
+                              selected_images_have_tag_callback,
+                              add_to_current_image_callback,
+                              current_image_has_tag_callback)
         self.current_wiki_id = ''
         self._torn_down = False
         self._build_wiki_ui()

@@ -20,6 +20,7 @@ from utils.settings_widgets import SettingsComboBox
 from utils.text_edit_item_delegate import TextEditItemDelegate
 from utils.utils import get_confirmation_dialog_reply
 from widgets.image_list import ImageList
+from widgets.group_tags_panel import GroupTagsPanel
 
 
 class CompleterPopupList(QListView):
@@ -267,6 +268,16 @@ class TagInputBox(QLineEdit):
         # after the tag is added. Cleared once focus leaves the box for any
         # other reason, so a later manual edit doesn't wrongly jump focus.
         self._return_focus_to_tags_list_after_add = False
+        # When set, focus (and its selection) returns to this specific list view
+        # after a tag is added, instead of the default `image_tags_list`. Used
+        # by the grouped Common/Differences lists.
+        self._return_focus_target = None
+        # Set by ImageTagsEditor when the grouped multi-image view is active.
+        # When active, added tags go to `target_indices_provider()` (which
+        # honors the "All selected / Current image" scope selector) and the
+        # single-image fast path and per-add confirmation are skipped.
+        self.group_mode_active = False
+        self.target_indices_provider = None
         # Connect the library-change signals once. The refresh handler is a
         # no-op while autocomplete is disabled (guarded by `completer_model`),
         # so it is safe to keep connected even when the completer is torn down.
@@ -340,8 +351,14 @@ class TagInputBox(QLineEdit):
         """Return keyboard focus to the tags list when this box was auto-focused
         by typing there. The flag is read and cleared before moving focus."""
         should_return = self._return_focus_to_tags_list_after_add
+        target = self._return_focus_target
         self._return_focus_to_tags_list_after_add = False
-        if should_return and self.image_tags_list is not None:
+        self._return_focus_target = None
+        if not should_return:
+            return
+        if target is not None:
+            target.setFocus()
+        elif self.image_tags_list is not None:
             self.image_tags_list.setFocus()
 
     def focusOutEvent(self, event: QFocusEvent):
@@ -353,15 +370,20 @@ class TagInputBox(QLineEdit):
         # is what adds the tag.
         if event.reason() != Qt.FocusReason.PopupFocusReason:
             self._return_focus_to_tags_list_after_add = False
+            self._return_focus_target = None
 
     def add_tag(self, tag: str):
         tag = tag.strip()
         if not tag:
             return
         tags = [t.strip() for t in tag.split(self.tag_separator) if t.strip()]
-        selected_image_indices = self.image_list.get_selected_image_indices()
+        if self.target_indices_provider is not None:
+            selected_image_indices = self.target_indices_provider()
+        else:
+            selected_image_indices = self.image_list.get_selected_image_indices()
         selected_image_count = len(selected_image_indices)
-        if len(tags) == 1 and selected_image_count == 1:
+        if (not self.group_mode_active and len(tags) == 1
+                and selected_image_count == 1):
             resolved_tag = tags[0]
             if resolved_tag in self.image_tag_list_model.stringList():
                 # The tag is already on the image: reject it and give the user
@@ -392,7 +414,16 @@ class TagInputBox(QLineEdit):
                     self.add_new_tags_to_library(new_implied)
             self.flash_added_feedback()
             return
-        if selected_image_count > 1:
+        # Reject a no-op add (every target image already contains every tag)
+        # with the same red-border shake as the single-image path, instead of
+        # silently doing nothing or asking to confirm adding nothing. Covers
+        # both the grouped view and a plain multi-image selection.
+        if tags and self._all_target_images_have_tags(tags,
+                                                      selected_image_indices):
+            self._flash_duplicate()
+            self.clear()
+            return
+        if selected_image_count > 1 and not self.group_mode_active:
             if len(tags) > 1:
                 question = (f'Add tags to {selected_image_count} selected '
                             f'images?')
@@ -416,6 +447,22 @@ class TagInputBox(QLineEdit):
         self.add_new_tags_to_library(tags_to_add)
         self.tags_addition_requested.emit(tags_to_add, selected_image_indices)
         self.flash_added_feedback()
+
+    def _all_target_images_have_tags(self, tags: list[str],
+                                     image_indices: list) -> bool:
+        """Whether every target image already contains every tag, making the
+        add a no-op. Used to reject duplicate adds with shake feedback in the
+        multi-image and grouped views, mirroring the single-image path."""
+        if not image_indices:
+            return False
+        wanted = set(tags)
+        for index in image_indices:
+            image = index.model().data(index, Qt.ItemDataRole.UserRole)
+            if image is None:
+                return False
+            if not wanted.issubset(image.tags):
+                return False
+        return True
 
     def _new_tag_auto_select_disabled(self) -> bool:
         """Whether the "Do not auto-select newly added tags" setting is on."""
@@ -575,6 +622,9 @@ class ImageTagsList(ElidedToolTipListView):
         # Set by ImageTagsEditor once the Add Tag box exists. Used to redirect
         # typing in the tag list to the Add Tag box (see keyPressEvent).
         self.tag_input_box = None
+        # Set by ImageTagsEditor. The Images pane view, so Up/Down at the ends
+        # of the tag list can cycle the selected images (see keyPressEvent).
+        self.image_list_view = None
         self.setModel(self.image_tag_list_model)
         self.setItemDelegate(TextEditItemDelegate(self))
         self.setSelectionMode(
@@ -672,6 +722,9 @@ class ImageTagsList(ElidedToolTipListView):
             tag_input_box.setFocus()
             tag_input_box.insert(event.text())
             return
+        if (event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down)
+                and self._handle_multi_select_navigation(event)):
+            return
         if event.key() not in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             super().keyPressEvent(event)
             return
@@ -689,6 +742,35 @@ class ImageTagsList(ElidedToolTipListView):
         elif remaining_row_count:
             # Select the last tag.
             self.select_tag(remaining_row_count - 1)
+
+    def _handle_multi_select_navigation(self, event: QKeyEvent) -> bool:
+        """Cycle selected images with Up/Down when 2+ images are selected.
+
+        When multiple images are selected, plain Up/Down at the top/bottom of
+        the tag list cycle to the previous/next selected image (keeping the
+        selection intact), and Ctrl+Up/Down select a single image just outside
+        the selection. Between the ends, Up/Down navigate tags as usual. With a
+        single image selected this does nothing (returns False).
+        """
+        view = self.image_list_view
+        if view is None or len(view.selectedIndexes()) < 2:
+            return False
+        direction = -1 if event.key() == Qt.Key.Key_Up else 1
+        modifiers = event.modifiers()
+        if (modifiers & Qt.KeyboardModifier.ControlModifier
+                and not (modifiers & Qt.KeyboardModifier.ShiftModifier)):
+            view.move_selection_beyond(direction)
+            return True
+        if modifiers != Qt.KeyboardModifier.NoModifier:
+            return False
+        count = self.image_tag_list_model.rowCount()
+        row = self.currentIndex().row()
+        at_edge = (count == 0
+                   or (row <= 0 if direction < 0 else row >= count - 1))
+        if at_edge:
+            view.switch_between_selected_images(direction)
+            return True
+        return False
 
     def _should_redirect_typing_to_tag_input(self, event: QKeyEvent) -> bool:
         """Whether a keystroke in the tag list should start a new tag.
@@ -764,6 +846,9 @@ class ImageTagsList(ElidedToolTipListView):
 class ImageTagsEditor(QDockWidget):
     danbooru_wiki_requested = Signal(str)
     gelbooru_wiki_requested = Signal(str)
+    # The set of image file paths whose cells should be marked in the grid
+    # preview (the images containing the currently-focused Differences tag).
+    grid_mark_paths_changed = Signal(list)
 
     def __init__(self, image_list_model: ImageListModel,
                  proxy_image_list_model: ProxyImageListModel,
@@ -774,6 +859,7 @@ class ImageTagsEditor(QDockWidget):
         self.image_list_model = image_list_model
         self.proxy_image_list_model = proxy_image_list_model
         self.image_tag_list_model = image_tag_list_model
+        self.image_list = image_list
         self.tokenizer = tokenizer
         self.tag_separator = tag_separator
         self.image_index = None
@@ -797,6 +883,8 @@ class ImageTagsEditor(QDockWidget):
                                              tag_library_model)
         # Let the tag list redirect typing to the Add Tag box.
         self.image_tags_list.tag_input_box = self.tag_input_box
+        # Let the tag list cycle the selected images with Up/Down at its ends.
+        self.image_tags_list.image_list_view = self.image_list.list_view
         # Let the Add Tag box return focus to the tag list after an auto-focused
         # add (see TagInputBox / ImageTagsList).
         self.tag_input_box.image_tags_list = self.image_tags_list
@@ -804,6 +892,59 @@ class ImageTagsEditor(QDockWidget):
             self.danbooru_wiki_requested.emit)
         self.image_tags_list.gelbooru_wiki_requested.connect(
             self.gelbooru_wiki_requested.emit)
+
+        # Group (multi-image) mode: a scope selector for the Add Tag box and the
+        # Common/Differences panel. Both are hidden until group mode is entered.
+        self.scope_row = QWidget()
+        scope_layout = QHBoxLayout(self.scope_row)
+        scope_layout.setContentsMargins(0, 0, 0, 0)
+        scope_layout.addWidget(QLabel('Add to:'))
+        self.scope_selector = QComboBox()
+        self.scope_selector.addItems(['All selected images',
+                                      'Current image only'])
+        scope_layout.addWidget(self.scope_selector, 1)
+        self.scope_row.setVisible(False)
+        self.group_tags_panel = GroupTagsPanel(tag_library_model)
+        self.group_tags_panel.setVisible(False)
+        self.group_tags_panel.remove_from_all_requested.connect(
+            self._remove_group_tags_from_all)
+        self.group_tags_panel.add_to_all_requested.connect(
+            self._add_group_tags_to_all)
+        self.group_tags_panel.remove_from_current_requested.connect(
+            self._remove_group_tags_from_current)
+        self.group_tags_panel.add_to_current_requested.connect(
+            self._add_group_tags_to_current)
+        self.group_tags_panel.partial_focus_changed.connect(
+            self._on_partial_focus_changed)
+        self.group_tags_panel.cycle_image_requested.connect(
+            self._cycle_selected_image)
+        self.group_tags_panel.escape_selection_requested.connect(
+            self._escape_multi_selection)
+        self.group_tags_panel.danbooru_wiki_requested.connect(
+            self.danbooru_wiki_requested.emit)
+        self.group_tags_panel.gelbooru_wiki_requested.connect(
+            self.gelbooru_wiki_requested.emit)
+        self.group_tags_panel.rename_tag_requested.connect(
+            self._rename_group_tag)
+        # Group-mode state.
+        self._group_mode = False
+        self._group_source_indices: list[QModelIndex] = []
+        self._group_current_index: Optional[QModelIndex] = None
+        self.tag_input_box.target_indices_provider = \
+            self._group_add_target_indices
+        # Keep Left/Right variant cycling working while the user is interacting
+        # with the group-mode controls: intercept those arrows and forward them
+        # to the Images pane. Installed on the widgets that would otherwise
+        # swallow the arrows (the tag lists, the scope selector, the collapse
+        # header). The Add Tag box is included too, but only cycles when it is
+        # empty so typed text can still be edited with the arrows.
+        for group_widget in (self.scope_selector, self.group_tags_panel,
+                              self.group_tags_panel.common_list,
+                              self.group_tags_panel.partial_list,
+                              self.group_tags_panel.common_header,
+                              self.tag_input_box):
+            group_widget.installEventFilter(self)
+
         self.natural_language_text_edit = NaturalLanguageTextEdit()
         self.token_count_label = QLabel()
         self.token_count_default_palette = QPalette(self.token_count_label.palette())
@@ -813,7 +954,10 @@ class ImageTagsEditor(QDockWidget):
         self.complete_label = QLabel('Complete')
         self.complete_label.setStyleSheet('color: #3cc23c;')
         self.complete_label.setVisible(False)
-        token_count_layout = QHBoxLayout()
+        # Wrapped in a container widget so the whole row can be hidden in group
+        # mode (token counts are per-image and meaningless for a selection).
+        self.token_row = QWidget()
+        token_count_layout = QHBoxLayout(self.token_row)
         token_count_layout.setContentsMargins(0, 0, 0, 0)
         token_count_layout.addWidget(self.token_count_label)
         token_count_layout.addStretch()
@@ -822,10 +966,12 @@ class ImageTagsEditor(QDockWidget):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.addWidget(self.natural_language_mode_check_box)
+        layout.addWidget(self.scope_row)
         layout.addWidget(self.tag_input_box)
         layout.addWidget(self.image_tags_list)
+        layout.addWidget(self.group_tags_panel)
         layout.addWidget(self.natural_language_text_edit)
-        layout.addLayout(token_count_layout)
+        layout.addWidget(self.token_row)
         self.setWidget(container)
 
         # When a tag is added, select it and scroll to the bottom of the list,
@@ -902,6 +1048,43 @@ class ImageTagsEditor(QDockWidget):
         self.count_tokens()
 
     @Slot()
+    def tag_pane_has_focus(self) -> bool:
+        """Whether the Image Tags pane's active tag list has keyboard focus.
+
+        Accounts for group mode, where the normal list is hidden and the
+        Common/Differences lists are shown instead. Used by the wiki keyboard
+        shortcut to decide whether this pane should provide the search tag.
+        """
+        if self._group_mode:
+            return (self.group_tags_panel.common_list.hasFocus()
+                    or self.group_tags_panel.partial_list.hasFocus())
+        return self.image_tags_list.hasFocus()
+
+    def selected_tag_for_wiki(self) -> str:
+        """The single tag the wiki shortcut should look up from this pane.
+
+        Delegates to the grouped Common/Differences panel in group mode, or the
+        normal Image Tags list otherwise.
+        """
+        if self._group_mode:
+            return self.group_tags_panel.selected_tag_for_wiki()
+        return self.image_tags_list.selected_tag_for_wiki()
+
+    def focus_tags_list(self):
+        """Focus the tag list for the "Focus Image Tags List" shortcut.
+
+        In the normal single-image view this focuses the Image Tags list and
+        selects its first tag. In the grouped multi-image view that list is
+        hidden, so focus the Common/Differences panel instead (Common first,
+        falling back to Differences).
+        """
+        self.raise_()
+        if self._group_mode:
+            self.group_tags_panel.focus_first_tag()
+            return
+        self.image_tags_list.setFocus()
+        self.select_first_tag()
+
     def select_first_tag(self):
         if self.image_tag_list_model.rowCount() == 0:
             return
@@ -949,6 +1132,16 @@ class ImageTagsEditor(QDockWidget):
 
     def load_image_tags(self, proxy_image_index: QModelIndex,
                         save_current_prompt: bool = True):
+        if self._group_mode:
+            # In grouped multi-image mode the tag view reflects the whole
+            # selection, not a single image. Arrowing between the selected
+            # images only moves which one is "current" (the target of the
+            # "Current image only" scope); it must not reload a single-image
+            # view. Just track the current image and keep the group view.
+            self._group_current_index = self.proxy_image_list_model.mapToSource(
+                proxy_image_index)
+            self.image_index = self._group_current_index
+            return
         if save_current_prompt:
             self.save_natural_language_prompt()
         next_image_index = self.proxy_image_list_model.mapToSource(
@@ -981,12 +1174,219 @@ class ImageTagsEditor(QDockWidget):
 
     @Slot()
     def set_natural_language_mode(self):
+        if self._group_mode:
+            self._apply_group_visibility()
+            return
         is_natural_language_mode = (
             self.natural_language_mode_check_box.isChecked())
+        self.natural_language_mode_check_box.setVisible(True)
+        self.scope_row.setVisible(False)
+        self.group_tags_panel.setVisible(False)
+        self.token_row.setVisible(True)
         self.tag_input_box.setVisible(not is_natural_language_mode)
         self.image_tags_list.setVisible(not is_natural_language_mode)
         self.natural_language_text_edit.setVisible(is_natural_language_mode)
         self.count_tokens()
+
+    def _apply_group_visibility(self):
+        """Show the grouped multi-image controls and hide the per-image ones."""
+        # Hiding the per-image tag list while it holds keyboard focus makes Qt
+        # punt focus to an unrelated widget (the Images filter box), which
+        # silently breaks type-to-add-tag and arrow cycling. Remember whether it
+        # was focused so we can put focus somewhere sensible afterwards.
+        tag_list_had_focus = self.image_tags_list.hasFocus()
+        self.natural_language_mode_check_box.setVisible(False)
+        self.natural_language_text_edit.setVisible(False)
+        self.token_row.setVisible(False)
+        self.image_tags_list.setVisible(False)
+        self.scope_row.setVisible(True)
+        self.group_tags_panel.setVisible(True)
+        self.tag_input_box.setVisible(True)
+        if tag_list_had_focus:
+            # Keep focus on the thumbnails so arrow cycling and typing a new tag
+            # keep working after entering the grouped view.
+            self.image_list.list_view.setFocus()
+
+    def eventFilter(self, watched, event):
+        """Keep arrow cycling and type-to-add-tag working in the grouped view.
+
+        Clicking into the scope selector, the Common/Differences lists, or the
+        collapse header moves keyboard focus there. Without this filter the
+        arrow keys would stop cycling between the selected images, and typing a
+        printable character would be swallowed by that control instead of
+        starting a new tag in the Add Tag box (as it does from the Images pane).
+        """
+        if self._group_mode and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+                # In the Add Tag box, only cycle when there's no text to edit.
+                if watched is self.tag_input_box and self.tag_input_box.text():
+                    return super().eventFilter(watched, event)
+                direction = -1 if key == Qt.Key.Key_Left else 1
+                if self.image_list.list_view.switch_between_selected_images(
+                        direction):
+                    return True
+            elif watched is not self.tag_input_box:
+                # Typing a tag character on any grouped-view control jumps to the
+                # Add Tag box, mirroring the behavior in the Images pane.
+                list_view = self.image_list.list_view
+                if list_view._should_redirect_typing_to_tag_input(event):
+                    self.raise_()
+                    panel = self.group_tags_panel
+                    if watched is panel.partial_list \
+                            or watched is panel.common_list:
+                        # Match the normal Image Tags list: after the tag is
+                        # added, return focus to this list and reselect the tag
+                        # that was highlighted when typing began (the model
+                        # reset on refresh would otherwise clear the selection).
+                        panel.remember_anchor_for_add(watched)
+                        self.tag_input_box._return_focus_to_tags_list_after_add \
+                            = True
+                        self.tag_input_box._return_focus_target = watched
+                    self.tag_input_box.setFocus()
+                    self.tag_input_box.insert(event.text())
+                    return True
+        return super().eventFilter(watched, event)
+
+    def is_group_mode(self) -> bool:
+        return self._group_mode
+
+    def current_group_image_index(self) -> Optional[QModelIndex]:
+        """Source-model index of the current image in the grouped (grid) view.
+
+        Returns None when not in group mode or no current image is set. Used by
+        the wiki dialogs' "Add to Current Image" button.
+        """
+        if not self._group_mode:
+            return None
+        return self._group_current_index
+
+    def enter_group_mode(self, source_indices: list[QModelIndex],
+                         current_index: Optional[QModelIndex]):
+        """Switch the pane into the grouped Common/Differences view."""
+        self.save_natural_language_prompt()
+        self._group_mode = True
+        self._group_source_indices = list(source_indices)
+        self._group_current_index = current_index
+        self.image_index = current_index
+        self.tag_input_box.group_mode_active = True
+        self._refresh_group_panel()
+        self._apply_group_visibility()
+
+    def update_group_selection(self, source_indices: list[QModelIndex],
+                               current_index: Optional[QModelIndex]):
+        """Update the grouped view for a changed multi-image selection.
+
+        When only the current image moved (e.g. arrowing between the same
+        selected images), the Common/Differences contents are unchanged, so the
+        panel is left untouched — this keeps any selected tag highlighted
+        instead of resetting it on every arrow press.
+        """
+        same_selection = (
+            [index.row() for index in source_indices]
+            == [index.row() for index in self._group_source_indices])
+        self._group_source_indices = list(source_indices)
+        self._group_current_index = current_index
+        self.image_index = current_index
+        if not same_selection:
+            self._refresh_group_panel()
+
+    @Slot(list)
+    def _on_partial_focus_changed(self, tags: list[str]):
+        """Report which selected images contain the focused Differences tag(s).
+
+        Emits the file paths of the matching images so the grid preview can
+        mark them. Emits an empty list to clear the marks.
+        """
+        paths: list[str] = []
+        if tags and self._group_mode:
+            wanted = set(tags)
+            for index in self._group_source_indices:
+                image = self.image_list_model.data(index,
+                                                   Qt.ItemDataRole.UserRole)
+                if image is not None and any(tag in wanted
+                                             for tag in image.tags):
+                    paths.append(str(image.path))
+        self.grid_mark_paths_changed.emit(paths)
+
+    def exit_group_mode(self):
+        """Leave grouped mode and restore the single-image view."""
+        if not self._group_mode:
+            return
+        self._group_mode = False
+        self._group_source_indices = []
+        self._group_current_index = None
+        self.tag_input_box.group_mode_active = False
+        self.set_natural_language_mode()
+
+    def _refresh_group_panel(self):
+        images = []
+        for index in self._group_source_indices:
+            image = self.image_list_model.data(index, Qt.ItemDataRole.UserRole)
+            if image is not None:
+                images.append(image)
+        self.group_tags_panel.set_images(images)
+
+    def _group_add_target_indices(self) -> list[QModelIndex]:
+        """Target images for the Add Tag box, honoring the scope selector."""
+        if self._group_mode:
+            if self.scope_selector.currentIndex() == 1:
+                # "Current image only".
+                if self._group_current_index is not None:
+                    return [self._group_current_index]
+                return []
+            return list(self._group_source_indices)
+        return self.image_list.get_selected_image_indices()
+
+    @Slot(list)
+    def _remove_group_tags_from_all(self, tags: list[str]):
+        if not self._group_source_indices or not tags:
+            return
+        self.image_list_model.remove_tags_from_images(
+            tags, list(self._group_source_indices))
+
+    @Slot(list)
+    def _add_group_tags_to_all(self, tags: list[str]):
+        if not self._group_source_indices or not tags:
+            return
+        self.image_list_model.add_tags(tags, list(self._group_source_indices))
+
+    @Slot(list)
+    def _remove_group_tags_from_current(self, tags: list[str]):
+        if self._group_current_index is None or not tags:
+            return
+        self.image_list_model.remove_tags_from_images(
+            tags, [self._group_current_index])
+
+    @Slot(list)
+    def _add_group_tags_to_current(self, tags: list[str]):
+        if self._group_current_index is None or not tags:
+            return
+        self.image_list_model.add_tags(tags, [self._group_current_index])
+
+    @Slot(str, str)
+    def _rename_group_tag(self, old_tag: str, new_tag: str):
+        if not self._group_source_indices or not old_tag or not new_tag:
+            return
+        self.image_list_model.rename_tag_in_images(
+            old_tag, new_tag, list(self._group_source_indices))
+
+    @Slot(int)
+    def _cycle_selected_image(self, direction: int):
+        """Move the current image to the previous/next selected image.
+
+        Used when the user arrows past the top/bottom of a tag list, so the
+        selection is kept intact instead of navigating out of it.
+        """
+        self.image_list.list_view.switch_between_selected_images(direction)
+
+    @Slot(int)
+    def _escape_multi_selection(self, direction: int):
+        """Select a single image outside the current multi-selection.
+
+        Used for Ctrl+Up/Down from the grouped view.
+        """
+        self.image_list.list_view.move_selection_beyond(direction)
 
     @Slot()
     def save_natural_language_prompt(self):
@@ -1012,6 +1412,11 @@ class ImageTagsEditor(QDockWidget):
         Reload the tags for the current image if its index is in the range of
         changed indices.
         """
+        if self._group_mode:
+            # A group edit (or undo/redo) changed tags: recompute the
+            # Common/Differences view from the current selection.
+            self._refresh_group_panel()
+            return
         if self.image_index is None:
             return
         if (first_changed_index.row() <= self.image_index.row()

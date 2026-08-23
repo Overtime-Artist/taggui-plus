@@ -746,11 +746,15 @@ class DanbooruWikiDialog(BaseWikiDialog):
                  tag_library_model: TagLibraryModel | None = None,
                  add_to_library_callback=None,
                  add_to_selected_images_callback=None,
-                 selected_images_have_tag_callback=None):
+                 selected_images_have_tag_callback=None,
+                 add_to_current_image_callback=None,
+                 current_image_has_tag_callback=None):
         super().__init__(parent)
         self._init_wiki_state(tag_library_model, add_to_library_callback,
                               add_to_selected_images_callback,
-                              selected_images_have_tag_callback)
+                              selected_images_have_tag_callback,
+                              add_to_current_image_callback,
+                              current_image_has_tag_callback)
         self.post_details_by_id = {}
         self.asset_details_by_id = {}
         self._stored_wiki_body = ''
@@ -772,6 +776,11 @@ class DanbooruWikiDialog(BaseWikiDialog):
         self._grid_context = None
         self._posts_fetch_thread = None
         self._active_posts_threads = []
+        # Single tags confirmed to actually exist on Danbooru (their posts
+        # search returned at least one post). Only these wiki-less tags may be
+        # added to the Tag Library / images, so a typo like "heart on cheeks"
+        # -- which has no wiki page AND no posts -- stays non-addable.
+        self._valid_posts_tags: set[str] = set()
         self._torn_down = False
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -1196,6 +1205,24 @@ class DanbooruWikiDialog(BaseWikiDialog):
         # Safety net for any legacy string entries.
         return view if isinstance(view, str) else ''
 
+    def current_library_tag(self) -> str:
+        # A wiki page gives the tag directly (base implementation).
+        tag = super().current_library_tag()
+        if tag:
+            return tag
+        # Many legitimate Danbooru tags have posts but no wiki page. For those
+        # the dialog falls back to a single-tag posts view (see show_not_found),
+        # which the base class treats as "no tag". Recover the tag here so the
+        # "Add to Tag Library" / "Add to ... Images" buttons still work. Only a
+        # single tag qualifies -- a multi-tag "posts:a b" search is not one tag.
+        view = self.current_view()
+        if isinstance(view, dict) and view.get('type') == 'posts':
+            tags = str(view.get('tags', '')).strip()
+            if (tags and ' ' not in tags
+                    and tags in self._valid_posts_tags):
+                return tags.replace('_', ' ').lower()
+        return ''
+
     @Slot()
     def navigate_back(self):
         if self.history_index <= 0:
@@ -1265,6 +1292,13 @@ class DanbooruWikiDialog(BaseWikiDialog):
                              posts: list):
         if request_key != self.current_request_key:
             return
+        # A single tag whose posts search returned results is a real Danbooru
+        # tag, so it becomes eligible to add to the Tag Library / images even
+        # though it has no wiki page. (Recorded once; kept valid thereafter so
+        # paging to an empty later page doesn't disable the buttons.)
+        normalized_tags = str(tags or '').strip()
+        if posts and normalized_tags and ' ' not in normalized_tags:
+            self._valid_posts_tags.add(normalized_tags)
         self._posts_view_state = {'tags': tags, 'page': page, 'posts': posts}
         self._active_composer = self._compose_posts_html
         self._set_browser_html(self._compose_posts_html())

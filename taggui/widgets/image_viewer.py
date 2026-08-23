@@ -1,8 +1,11 @@
+import math
 from pathlib import Path
 
-from PySide6.QtCore import (QEvent, QModelIndex, QObject, QPoint, QRunnable,
-                             QSize, Qt, QThreadPool, QTimer, Signal, Slot)
-from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap
+from PySide6.QtCore import (QEvent, QModelIndex, QObject, QPoint, QRect,
+                             QRunnable, QSize, Qt, QThreadPool, QTimer, Signal,
+                             Slot)
+from PySide6.QtGui import (QColor, QIcon, QImage, QImageReader, QPainter,
+                           QPalette, QPen, QPixmap)
 from PySide6.QtWidgets import (QLabel, QScrollArea, QSizePolicy, QVBoxLayout,
                                QWidget)
 
@@ -24,6 +27,18 @@ IMAGE_LOAD_PRIORITY = 10
 # upscaled as an instant placeholder until the sharp decode arrives. Smaller
 # images decode fast enough that a placeholder would only cause a blur flash.
 PLACEHOLDER_MIN_PIXELS = 8_000_000
+# Synchronized grid preview (shown when multiple images are selected).
+# Each selected image is composited into one large pixmap that the normal
+# zoom/pan machinery then scales, so zooming into a cell shows real detail
+# rather than an upscaled thumbnail. The per-cell resolution adapts to how many
+# cells are shown so the whole composite stays within a fixed pixel budget:
+# small selections (the common "a few variants" case) get near-original detail,
+# while very large selections trade per-cell sharpness for bounded memory.
+GRID_COMPOSITE_BUDGET_PX = 16_000_000
+GRID_CELL_MAX_PX = 2048
+GRID_CELL_MIN_PX = 512
+GRID_GAP_PX = 12
+GRID_HIGHLIGHT_WIDTH_PX = 10
 
 
 class _ImageFileLoader(QObject, QRunnable):
@@ -49,6 +64,43 @@ class _ImageFileLoader(QObject, QRunnable):
         image_reader.setAutoTransform(True)
         image = image_reader.read()
         self.loaded.emit(image, str(self.image_path))
+
+
+class _GridCellsLoader(QObject, QRunnable):
+    """Decodes several grid-cell images (near-original size) off the GUI thread.
+
+    Used to upgrade the grid preview from instant thumbnails to sharp images
+    without blocking the UI. Images are decoded to QImages here; the QPixmaps
+    are built on the GUI thread in the receiving slot (see _ImageFileLoader).
+    """
+    loaded = Signal(dict, int)  # {path_str: QImage}, render token
+
+    def __init__(self, path_strings: list[str], target_px: int, token: int):
+        QObject.__init__(self)
+        QRunnable.__init__(self)
+        self.path_strings = path_strings
+        self.target_px = target_px
+        self.token = token
+        self.setAutoDelete(False)
+
+    @Slot()
+    def run(self):
+        results: dict[str, QImage] = {}
+        for path_string in self.path_strings:
+            reader = QImageReader(path_string)
+            reader.setAutoTransform(True)
+            size = reader.size()
+            target = self.target_px
+            if size.isValid() and (size.width() > target
+                                   or size.height() > target):
+                scale = min(target / size.width(), target / size.height())
+                reader.setScaledSize(
+                    QSize(max(1, round(size.width() * scale)),
+                          max(1, round(size.height() * scale))))
+            image = reader.read()
+            if not image.isNull():
+                results[path_string] = image
+        self.loaded.emit(results, self.token)
 
 
 class ImageLabel(QLabel):
@@ -96,6 +148,17 @@ class ImageLabel(QLabel):
     def set_scaled_pixmap(self, scaled_pixmap: QPixmap):
         self.setPixmap(scaled_pixmap)
         self.resize(scaled_pixmap.size())
+
+    def set_static_pixmap(self, pixmap: QPixmap):
+        """Display a ready-made pixmap (e.g. the composited grid) directly.
+
+        Cancels any in-flight async single-image load so a late decode can't
+        overwrite the pixmap we're showing.
+        """
+        self._pending_path = None
+        self._current_loader = None
+        self.image_path = None
+        self.original_pixmap = pixmap
 
 
 class ImageScrollArea(QScrollArea):
@@ -182,6 +245,23 @@ class ImageViewer(QWidget):
         self.scroll_area = ImageScrollArea(self.image_label)
         self.zoom_factor = 1.0
         self._first_render_done = False
+        # Grid-preview state. When _grid_mode is True the label shows a single
+        # composited pixmap of all selected images instead of one image.
+        self._grid_mode = False
+        self._grid_cell_cache: dict[str, QPixmap] = {}
+        self._grid_current_cell_rect: QRect | None = None
+        # Paths of images to mark in the grid (those containing the tag focused
+        # in the Differences list) and the inputs of the last grid render, so
+        # the grid can be rebuilt when only the marks change.
+        self._grid_marked_paths: set[str] = set()
+        self._grid_proxy_indices: list[QModelIndex] | None = None
+        self._grid_current_position = 0
+        self._grid_cell_cap = 0
+        # Progressive loading: a monotonically increasing token identifies the
+        # latest grid render so that a stale background decode can't overwrite a
+        # newer view, plus a reference to the running loader to keep it alive.
+        self._grid_render_token = 0
+        self._grid_loaders: set = set()
         self.scroll_area.clicked.connect(lambda: self.clicked.emit())
         self.scroll_area.reset_requested.connect(self.reset_view)
         self.scroll_area.zoom_requested.connect(self.zoom_image)
@@ -371,6 +451,10 @@ class ImageViewer(QWidget):
 
     @Slot()
     def load_image(self, proxy_image_index: QModelIndex):
+        if self._grid_mode:
+            # A grid is being shown for a multi-image selection; ignore
+            # single-image loads until the grid is torn down via exit_grid().
+            return
         if not proxy_image_index.isValid():
             return
         image: Image = self.proxy_image_list_model.data(
@@ -387,4 +471,292 @@ class ImageViewer(QWidget):
         self.image_label.load_image(image.path, placeholder)
         if placeholder is not None:
             self._update_scaled_image()
+
+    # ------------------------------------------------------------------
+    # Synchronized grid preview
+    # ------------------------------------------------------------------
+    def show_grid(self, proxy_indices: list[QModelIndex],
+                  current_position: int, cell_cap: int):
+        """Show all selected images as one zoomable grid.
+
+        `proxy_indices` are the selected rows in display order, `current_position`
+        is the index within that list of the current (highlighted) image, and
+        `cell_cap` limits how many cells are composited at once (a window
+        centered on the current image is used when the selection is larger).
+        Called on first entering grid mode; resets zoom to fit the whole grid.
+        """
+        self._grid_mode = True
+        self._render_grid(proxy_indices, current_position, cell_cap,
+                          preserve_view=False)
+        if not self._first_render_done:
+            self._first_render_done = True
+            self.first_image_rendered.emit()
+
+    def update_grid_current(self, proxy_indices: list[QModelIndex],
+                            current_position: int, cell_cap: int):
+        """Re-render the grid after the current image changed (arrow keys).
+
+        Keeps the user's current zoom level and, when zoomed in, scrolls so the
+        newly-current cell is centered in the viewport.
+        """
+        if not self._grid_mode:
+            self.show_grid(proxy_indices, current_position, cell_cap)
+            return
+        self._render_grid(proxy_indices, current_position, cell_cap,
+                          preserve_view=True)
+
+    def exit_grid(self):
+        """Leave grid mode. The caller should then load the single image."""
+        if not self._grid_mode:
+            return
+        self._grid_mode = False
+        self._grid_cell_cache.clear()
+        self._grid_current_cell_rect = None
+        self._grid_marked_paths = set()
+        self._grid_proxy_indices = None
+        # Invalidate any in-flight background decode so its result is ignored on
+        # arrival. The loader keeps its own reference until it finishes (it
+        # removes itself in _on_grid_cells_loaded), so we must not drop it here.
+        self._grid_render_token += 1
+
+    def set_marked_paths(self, paths: list[str]):
+        """Mark the grid cells whose image path is in ``paths``.
+
+        Used to show which selected images contain the tag focused in the
+        Differences list. Re-renders the grid in place (keeping zoom/scroll).
+        """
+        new_marks = set(paths)
+        if new_marks == self._grid_marked_paths:
+            return
+        self._grid_marked_paths = new_marks
+        if self._grid_mode and self._grid_proxy_indices is not None:
+            self._render_grid(self._grid_proxy_indices,
+                              self._grid_current_position,
+                              self._grid_cell_cap, preserve_view=True)
+
+    def is_grid_mode(self) -> bool:
+        return self._grid_mode
+
+    def refresh_grid_paths(self, changed_paths: set[str]):
+        """Re-decode grid cells whose image file changed on disk.
+
+        Called after the refresh-on-focus scan reports content changes. Any
+        changed path that is part of the current grid has its stale cached
+        pixmap dropped and the grid is re-rendered, which re-decodes the file
+        so the grid shows the up-to-date image instead of the old thumbnail.
+        """
+        if (not self._grid_mode or self._grid_proxy_indices is None
+                or not changed_paths):
+            return
+        grid_paths = set()
+        for index in self._grid_proxy_indices:
+            image: Image = self.proxy_image_list_model.data(
+                index, Qt.ItemDataRole.UserRole)
+            if image is not None:
+                grid_paths.add(str(image.path))
+        relevant = changed_paths & grid_paths
+        if not relevant:
+            return
+        for path in relevant:
+            self._grid_cell_cache.pop(path, None)
+        self._render_grid(self._grid_proxy_indices,
+                          self._grid_current_position,
+                          self._grid_cell_cap, preserve_view=True)
+
+    def _render_grid(self, proxy_indices: list[QModelIndex],
+                     current_position: int, cell_cap: int,
+                     preserve_view: bool):
+        self._grid_proxy_indices = list(proxy_indices)
+        self._grid_current_position = current_position
+        self._grid_cell_cap = cell_cap
+        self._grid_render_token += 1
+        token = self._grid_render_token
+        window_indices, highlight_position = self._grid_window(
+            proxy_indices, current_position, cell_cap)
+        # Build and show the composite immediately, using sharp cached images
+        # where available and the already-decoded list thumbnails elsewhere as
+        # instant placeholders.
+        pixmap = self._build_grid_pixmap(window_indices, highlight_position)
+        self._resize_debounce_timer.stop()
+        self._smooth_render_timer.stop()
+        if not preserve_view:
+            self.zoom_factor = 1.0
+            self.scroll_area.horizontalScrollBar().setValue(0)
+            self.scroll_area.verticalScrollBar().setValue(0)
+        self.image_label.set_static_pixmap(pixmap)
+        self._update_scaled_image()
+        if preserve_view and self.zoom_factor > 1.0:
+            self._center_on_current_cell()
+        # Decode any cells not yet cached at full quality in the background, then
+        # silently swap them in when ready (mirrors the single-image placeholder
+        # -> sharp-image transition).
+        self._schedule_grid_high_quality(window_indices, token)
+
+    def _schedule_grid_high_quality(self, window_indices: list[QModelIndex],
+                                    token: int):
+        missing: list[str] = []
+        seen: set[str] = set()
+        for proxy_index in window_indices:
+            image: Image = self.proxy_image_list_model.data(
+                proxy_index, Qt.ItemDataRole.UserRole)
+            path_string = str(image.path)
+            if path_string in seen:
+                continue
+            seen.add(path_string)
+            cached = self._grid_cell_cache.get(path_string)
+            if cached is None or cached.isNull():
+                missing.append(path_string)
+        if not missing:
+            return
+        loader = _GridCellsLoader(missing, GRID_CELL_MAX_PX, token)
+        loader.loaded.connect(self._on_grid_cells_loaded)
+        self._grid_loaders.add(loader)  # keep alive while it runs
+        QThreadPool.globalInstance().start(loader, IMAGE_LOAD_PRIORITY)
+
+    @Slot(dict, int)
+    def _on_grid_cells_loaded(self, images: dict, token: int):
+        self._grid_loaders.discard(self.sender())
+        # Build the QPixmaps on the GUI thread and cache them for reuse.
+        for path_string, image in images.items():
+            if not image.isNull():
+                self._grid_cell_cache[path_string] = QPixmap.fromImage(image)
+        # Ignore results from a superseded render (selection/current changed).
+        if not self._grid_mode or token != self._grid_render_token:
+            return
+        if self._grid_proxy_indices is None:
+            return
+        # Re-render in place with the now-cached sharp images, keeping the view.
+        self._render_grid(self._grid_proxy_indices,
+                          self._grid_current_position,
+                          self._grid_cell_cap, preserve_view=True)
+
+    @staticmethod
+    def _grid_window(proxy_indices: list[QModelIndex], current_position: int,
+                     cell_cap: int) -> tuple[list[QModelIndex], int]:
+        count = len(proxy_indices)
+        if count <= cell_cap:
+            return proxy_indices, current_position
+        half = cell_cap // 2
+        start = max(0, current_position - half)
+        end = start + cell_cap
+        if end > count:
+            end = count
+            start = end - cell_cap
+        return proxy_indices[start:end], current_position - start
+
+    @staticmethod
+    def _grid_cell_size(cell_count: int) -> int:
+        """Per-cell composite size (long edge) for a given number of cells.
+
+        Chosen so the whole grid stays near GRID_COMPOSITE_BUDGET_PX pixels:
+        fewer cells -> larger, sharper cells; more cells -> smaller cells.
+        """
+        target = math.sqrt(GRID_COMPOSITE_BUDGET_PX / max(1, cell_count))
+        return int(max(GRID_CELL_MIN_PX, min(GRID_CELL_MAX_PX, target)))
+
+    def _get_cell_thumbnail(self, proxy_index: QModelIndex) -> QPixmap:
+        """The already-decoded list thumbnail for a cell, used as a placeholder."""
+        icon = self.proxy_image_list_model.data(
+            proxy_index, Qt.ItemDataRole.DecorationRole)
+        if not isinstance(icon, QIcon):
+            return QPixmap()
+        available_sizes = icon.availableSizes()
+        if not available_sizes:
+            return QPixmap()
+        return icon.pixmap(available_sizes[0])
+
+    @staticmethod
+    def _cell_footprint(image: Image, source_pixmap: QPixmap,
+                        cell: int) -> QSize:
+        """Draw size for a cell image, based on the image's native size.
+
+        The footprint is the same whether a thumbnail placeholder or the sharp
+        image is being drawn, so the background upgrade sharpens the cell in
+        place without any change in size or position. Images are never upscaled
+        beyond their native resolution (that would bake blur into the composite
+        and hurt zoom quality); the long edge is capped at the cell size.
+        """
+        dimensions = getattr(image, 'dimensions', None)
+        if dimensions:
+            width, height = dimensions
+        elif not source_pixmap.isNull():
+            width, height = source_pixmap.width(), source_pixmap.height()
+        else:
+            return QSize(cell, cell)
+        long_edge = max(width, height)
+        if long_edge <= 0:
+            return QSize(cell, cell)
+        scale = min(cell / long_edge, 1.0)
+        return QSize(max(1, round(width * scale)), max(1, round(height * scale)))
+
+    def _build_grid_pixmap(self, window_indices: list[QModelIndex],
+                           highlight_position: int) -> QPixmap:
+        count = max(1, len(window_indices))
+        columns = max(1, math.ceil(math.sqrt(count)))
+        rows = math.ceil(count / columns)
+        cell = self._grid_cell_size(count)
+        gap = GRID_GAP_PX
+        total_width = columns * cell + (columns + 1) * gap
+        total_height = rows * cell + (rows + 1) * gap
+        canvas = QPixmap(total_width, total_height)
+        canvas.fill(self.palette().color(QPalette.ColorRole.Window))
+        painter = QPainter(canvas)
+        self._grid_current_cell_rect = None
+        for position, proxy_index in enumerate(window_indices):
+            row = position // columns
+            column = position % columns
+            x = gap + column * (cell + gap)
+            y = gap + row * (cell + gap)
+            image: Image = self.proxy_image_list_model.data(
+                proxy_index, Qt.ItemDataRole.UserRole)
+            # Prefer the sharp cached image; fall back to the list thumbnail as
+            # an instant placeholder until the background decode fills the cache.
+            source_pixmap = self._grid_cell_cache.get(str(image.path))
+            if source_pixmap is None or source_pixmap.isNull():
+                source_pixmap = self._get_cell_thumbnail(proxy_index)
+            if not source_pixmap.isNull():
+                footprint = self._cell_footprint(image, source_pixmap, cell)
+                fitted = source_pixmap.scaled(
+                    footprint, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)
+                offset_x = x + (cell - fitted.width()) // 2
+                offset_y = y + (cell - fitted.height()) // 2
+                painter.drawPixmap(offset_x, offset_y, fitted)
+            if str(image.path) in self._grid_marked_paths:
+                # Distinct (amber) inset border marks images that contain the
+                # tag focused in the Differences list. Drawn inside the cell so
+                # it stays visible even under the current-cell highlight.
+                mark_pen = QPen(QColor(255, 176, 0))
+                mark_pen.setWidth(GRID_HIGHLIGHT_WIDTH_PX)
+                painter.setPen(mark_pen)
+                m = GRID_HIGHLIGHT_WIDTH_PX
+                painter.drawRect(x + m, y + m, cell - 2 * m, cell - 2 * m)
+            if position == highlight_position:
+                pen = QPen(self.palette().color(QPalette.ColorRole.Highlight))
+                pen.setWidth(GRID_HIGHLIGHT_WIDTH_PX)
+                painter.setPen(pen)
+                inset = GRID_HIGHLIGHT_WIDTH_PX // 2
+                painter.drawRect(x - inset, y - inset,
+                                 cell + 2 * inset, cell + 2 * inset)
+                self._grid_current_cell_rect = QRect(x, y, cell, cell)
+        painter.end()
+        return canvas
+
+    def _center_on_current_cell(self):
+        rect = self._grid_current_cell_rect
+        if rect is None:
+            return
+        original_size = self.image_label.original_pixmap.size()
+        scaled_size = self.image_label.size()
+        if original_size.width() <= 0 or original_size.height() <= 0:
+            return
+        scale_x = scaled_size.width() / original_size.width()
+        scale_y = scaled_size.height() / original_size.height()
+        center_x = (rect.x() + rect.width() / 2) * scale_x
+        center_y = (rect.y() + rect.height() / 2) * scale_y
+        viewport_size = self.scroll_area.viewport().size()
+        self.scroll_area.horizontalScrollBar().setValue(
+            round(center_x - viewport_size.width() / 2))
+        self.scroll_area.verticalScrollBar().setValue(
+            round(center_y - viewport_size.height() / 2))
 

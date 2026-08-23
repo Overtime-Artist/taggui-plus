@@ -342,6 +342,26 @@ class SettingsDialog(QDialog):
                               Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
         grid_layout.addWidget(type_to_add_tag_check_box, row, 1,
                               Qt.AlignmentFlag.AlignLeft)
+        row += 1
+        variant_grid_view_check_box = SettingsBigCheckBox(
+            key='variant_grid_view_enabled',
+            default=DEFAULT_SETTINGS['variant_grid_view_enabled'])
+        variant_grid_view_label = QLabel(
+            'Group tags & show grid when multiple images are selected')
+        grid_layout.addWidget(variant_grid_view_label, row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        grid_layout.addWidget(variant_grid_view_check_box, row, 1,
+                              Qt.AlignmentFlag.AlignLeft)
+        row += 1
+        variant_grid_cell_cap_spin_box = FocusedScrollSettingsSpinBox(
+            key='variant_grid_cell_cap',
+            default=DEFAULT_SETTINGS['variant_grid_cell_cap'],
+            minimum=4, maximum=64)
+        grid_layout.addWidget(QLabel('Max grid cells for multi-image preview'),
+                              row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        grid_layout.addWidget(variant_grid_cell_cap_spin_box, row, 1,
+                              Qt.AlignmentFlag.AlignLeft)
 
         # Thumbnail Cache
         grid_layout = add_section('Thumbnail Cache')

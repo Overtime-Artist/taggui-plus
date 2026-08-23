@@ -111,6 +111,16 @@ DEFAULT_SETTINGS = {
     # (exact / byte-identical). This is the default; raise it in the dialog to
     # also catch visually similar near-duplicates.
     'duplicate_detection_strictness': 0,
+    # When enabled, selecting two or more images switches the Image Tags pane
+    # into a grouped Common/Partial view and the center preview into a
+    # synchronized grid of the selected images. Disable to keep the classic
+    # single-image behavior regardless of how many images are selected.
+    'variant_grid_view_enabled': True,
+    # Maximum number of cells shown at once in the multi-image grid preview.
+    # When more images than this are selected, the grid shows a sliding window
+    # of cells centered on the current image. Kept modest so compositing stays
+    # fast and cells stay large enough to be useful.
+    'variant_grid_cell_cap': 12,
 }
 
 

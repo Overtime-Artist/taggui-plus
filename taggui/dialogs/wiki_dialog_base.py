@@ -137,12 +137,17 @@ class BaseWikiDialog(QDialog):
     def _init_wiki_state(self, tag_library_model,
                          add_to_library_callback=None,
                          add_to_selected_images_callback=None,
-                         selected_images_have_tag_callback=None):
+                         selected_images_have_tag_callback=None,
+                         add_to_current_image_callback=None,
+                         current_image_has_tag_callback=None):
         self.tag_library_model = tag_library_model
         self.add_to_library_callback = add_to_library_callback
         self.add_to_selected_images_callback = add_to_selected_images_callback
         self.selected_images_have_tag_callback = (
             selected_images_have_tag_callback)
+        # Grouped (grid) view only: add the tag to just the current image.
+        self.add_to_current_image_callback = add_to_current_image_callback
+        self.current_image_has_tag_callback = current_image_has_tag_callback
         self.tag_history = []
         self.history_index = -1
         self.fetch_thread = None
@@ -222,9 +227,11 @@ class BaseWikiDialog(QDialog):
         self.search_button = QPushButton('Search')
         self.add_to_library_button = QPushButton('Add to Tag Library')
         self.add_to_images_button = QPushButton('Add to Selected Images')
+        self.add_to_current_image_button = QPushButton('Add to Current Image')
         for button in (self.back_button, self.forward_button,
                        self.search_button, self.add_to_library_button,
-                       self.add_to_images_button):
+                       self.add_to_images_button,
+                       self.add_to_current_image_button):
             button.setAutoDefault(False)
             button.setDefault(False)
         self.back_button.clicked.connect(self.navigate_back)
@@ -234,10 +241,16 @@ class BaseWikiDialog(QDialog):
             self.add_current_tag_to_library)
         self.add_to_images_button.clicked.connect(
             self.add_current_tag_to_selected_images)
+        self.add_to_current_image_button.clicked.connect(
+            self.add_current_tag_to_current_image)
         # The "Add to Selected Images" button is only useful when a callback
         # that knows how to reach the Images pane has been provided.
         self.add_to_images_button.setVisible(
             self.add_to_selected_images_callback is not None)
+        # The "Add to Current Image" button is only shown in the grouped (grid)
+        # view, signalled by the host passing this callback.
+        self.add_to_current_image_button.setVisible(
+            self.add_to_current_image_callback is not None)
         self.search_line_edit.returnPressed.connect(self.search_tag)
 
         nav_layout = QHBoxLayout()
@@ -262,6 +275,7 @@ class BaseWikiDialog(QDialog):
         footer_layout = QHBoxLayout()
         footer_layout.addWidget(self.add_to_library_button)
         footer_layout.addWidget(self.add_to_images_button)
+        footer_layout.addWidget(self.add_to_current_image_button)
         footer_layout.addStretch()
         footer_layout.addWidget(self.open_browser_button)
 
@@ -515,6 +529,25 @@ class BaseWikiDialog(QDialog):
         self.add_to_images_button.setStyleSheet(
             '' if can_add_to_images else disabled_style)
 
+        # Mirror the "Add to Selected Images" logic for the grouped-view
+        # "Add to Current Image" button: enabled when there is a tag and a
+        # callback, disabled and relabelled when the current image already has
+        # the tag.
+        self.add_to_current_image_button.setText('Add to Current Image')
+        can_add_to_current = (self.add_to_current_image_callback is not None
+                              and bool(display_tag))
+        if (can_add_to_current
+                and self.current_image_has_tag_callback is not None):
+            # None -> no current image (keep enabled); True -> the current
+            # image already has the tag, so there is nothing to add.
+            if self.current_image_has_tag_callback(display_tag) is True:
+                can_add_to_current = False
+                self.add_to_current_image_button.setText(
+                    'Already in Current Image')
+        self.add_to_current_image_button.setEnabled(can_add_to_current)
+        self.add_to_current_image_button.setStyleSheet(
+            '' if can_add_to_current else disabled_style)
+
         if self.tag_library_model is None or not display_tag:
             self.add_to_library_button.setEnabled(False)
             self.add_to_library_button.setText('Add to Tag Library')
@@ -555,6 +588,16 @@ class BaseWikiDialog(QDialog):
         if not display_tag:
             return
         self.add_to_selected_images_callback(display_tag, self)
+        self.update_add_to_library_button_state()
+
+    @Slot()
+    def add_current_tag_to_current_image(self):
+        if self.add_to_current_image_callback is None:
+            return
+        display_tag = self.current_library_tag()
+        if not display_tag:
+            return
+        self.add_to_current_image_callback(display_tag, self)
         self.update_add_to_library_button_state()
 
     @Slot()

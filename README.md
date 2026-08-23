@@ -28,6 +28,7 @@ captioning.
 - [Uninstalling / removing](#uninstalling--removing)
 - [Getting started](#getting-started)
 - [The panes](#the-panes)
+- [Tagging variant images](#tagging-variant-images)
 - [The tools](#the-tools)
 - [Automatic captioning](#automatic-captioning)
 - [Advanced syntax reference](#advanced-syntax-reference)
@@ -43,6 +44,9 @@ captioning.
   implications for consistent, structured tagging.
 - **Natural language mode** — store freeform prompt text alongside tags in the
   same caption file.
+- **Variant / group tagging** — select several near-identical images to preview
+  them in a **synchronized zoom grid** and edit their shared **Common** tags and
+  per-image **Differences** together.
 - **Automatic captioning and tagging** using a range of local vision models,
   including **Qwen3-VL** caption models and the **PixAI v0.9** tagger.
 - **Batch tag operations** — find and replace, sort, shuffle, reverse, and
@@ -319,6 +323,10 @@ The large view of the currently selected image.
 - **Zoom** with the mouse wheel or `Ctrl`+`+` / `Ctrl`+`-`.
 - **Pan** a zoomed image by dragging, or with `Alt`+arrow keys.
 - **Reset** the view by double-clicking or pressing `Ctrl`+`0`.
+- Select **multiple images** to switch the preview into a **synchronized grid**:
+  zooming, panning, and resetting apply to every cell at once. The current image
+  is outlined in blue; press `Left` / `Right` to move through the selection. See
+  [Tagging variant images](#tagging-variant-images).
 
 ### Image Tags pane
 
@@ -333,6 +341,9 @@ Where you edit the current image's caption.
 - A **token counter** shows the caption length and turns red when it passes the
   token limit. A green **`Complete`** label appears when the image is marked as
   complete.
+- With **multiple images selected**, the pane groups their tags into **`Common`**
+  and **`Differences`** lists and shows a **scope selector** for where new tags
+  go — see [Tagging variant images](#tagging-variant-images).
 
 <p align='center'>
   <img src='images/TagGUI_Tag_Mode.png' alt='TagGUI Plus Tag Mode' style='width: 42%; margin-right: 40px;'>
@@ -364,6 +375,47 @@ Configures and runs [automatic captioning](#automatic-captioning). It holds the
 model selector, prompt box, destination and position options, and the
 **`Start Auto-Captioning`** button, plus a progress bar and console output while
 it runs.
+
+## Tagging variant images
+
+Many datasets contain **sets of near-identical images** — the same base picture
+with small differences (a changed expression, color, or accessory). TagGUI Plus
+has a dedicated workflow for tagging these together instead of one at a time.
+
+When you **select two or more images** (with the feature enabled in
+**`Settings`**, which it is by default), two things change:
+
+- **Synchronized grid preview** — the center preview shows every selected image
+  in a grid that shares a single zoom and pan, so you can line up the same detail
+  across all of them at once. The **current** image has a **blue outline**; use
+  `Left` / `Right` to move the current image through the selection without
+  changing what is selected.
+- **Grouped Image Tags pane** — the tag list splits into two:
+  - **`Common`** — tags present on **every** selected image.
+  - **`Differences`** — tags on **some but not all** of them, each showing a
+    `k/N` badge (how many of the selected images have the tag). Selecting a
+    Differences tag outlines the images that contain it in **orange** in the
+    grid.
+
+A **scope selector** at the top of the pane controls where new tags and edits
+go:
+
+- **`All selected images`** (default) — the `Add Tag` box and tag edits apply to
+  the whole selection.
+- **`Current image only`** — they apply to just the current (blue-outlined)
+  image, so you can adjust one variant without touching the rest.
+
+Both the `Common` and `Differences` lists behave like the normal tag list:
+double-click to rename, `Delete` to remove, copy the selected tags, look a tag up
+on a wiki, or assign it to a category. Tags keep a **stable position** as you
+edit, so removing a tag from one image only updates its `k/N` count instead of
+reshuffling the list.
+
+> [!NOTE]
+> You can turn this off (and always keep the single-image view) with
+> **`Settings` → Images pane → `Group tags & show grid when multiple images are
+> selected`**. The **`Max grid cells for multi-image preview`** setting caps how
+> many images are drawn in the grid at once, for performance.
 
 ## The tools
 
@@ -455,8 +507,9 @@ exported to CSV or Markdown.
 **`Tools` → `Danbooru Wiki…`** (`Ctrl`+`D`) and
 **`Tools` → `Gelbooru Wiki…`** (`Ctrl`+`G`), also available by right-clicking a
 tag. These look up a tag's meaning on the Danbooru or Gelbooru wikis so you can
-learn what a tag means and see related tags, then add it to your Tag Library or
-to the selected images.
+learn what a tag means and see related tags, then add it to your Tag Library, to
+the selected images, or — in the [grid view](#tagging-variant-images) — to just
+the current image.
 
 The **Danbooru Wiki** in particular does more than a plain tag lookup:
 
@@ -484,6 +537,11 @@ prefixes:
 - Typing anything without a prefix does a normal wiki lookup for that tag.
 
 > [!NOTE]
+> You can add **any legitimate Danbooru tag** to your Tag Library or images, even
+> one that doesn't have a wiki page yet. Tags that aren't real Danbooru tags
+> (for example a misspelling) stay disabled so you don't accidentally add a typo.
+
+> [!NOTE]
 > These wiki tools depend on Danbooru's and Gelbooru's **external websites and
 > APIs**. If those sites change how their data is served (or restrict access),
 > the lookups may stop working until TagGUI Plus is updated to match. In other words,
@@ -506,7 +564,10 @@ prefixes:
   shortcuts.
 - **Images pane:** list text size, which file types to show, thumbnail width,
   the resolution badge (and its size/transparency), the completion check icon,
-  max preview zoom, and auto-focusing the Add Tag box when you type. **Note:**
+  max preview zoom, auto-focusing the Add Tag box when you type, and the
+  **variant grid view** (group tags and show a synchronized grid when multiple
+  images are selected, plus its max cell count — see
+  [Tagging variant images](#tagging-variant-images)). **Note:**
   setting the **max preview zoom** very high can cause performance issues when
   zoomed in on large images. TagGUI Plus mitigates this — for example it
   automatically switches to faster (lower-quality) rendering above 10x zoom and
@@ -554,6 +615,12 @@ later runs are much faster. If you keep previously downloaded models in a local
 folder, set that folder in **`Settings`** to include them in the model list.
 Generated output can go to the **tag list** or the **natural language** section
 of the caption.
+
+When you start captioning with **more than one image selected**, a dialog lets
+you choose to caption **all selected images** or **only the current image**
+(handy in the [grid view](#tagging-variant-images) when you only want to redo one
+variant), and whether to **show an alert when it finishes**. Captioning a single
+image runs immediately without this prompt.
 
 ### Supported models
 
@@ -765,6 +832,8 @@ shortcuts`**; the defaults are listed below.
 - **Right-click menu:** copy tags/caption/name/path, paste tags, open image or
   caption file, open in your configured editor, rename the image file, move or
   copy images to another folder, delete images, and mark complete/incomplete.
+  When several images are selected, the open/rename actions target the **current**
+  (highlighted) image.
 
 ### Image Tags pane
 
@@ -774,6 +843,10 @@ shortcuts`**; the defaults are listed below.
 - Rename a tag: double-click or `F2`; delete: `Delete`; reorder: drag and drop
 - **Right-click a tag:** copy it, view it on the Danbooru/Gelbooru wiki, or
   assign/clear its category.
+- With **multiple images selected**, tags are grouped into `Common` and
+  `Differences` lists, and the scope selector sends new tags to all selected
+  images or only the current one — see
+  [Tagging variant images](#tagging-variant-images).
 
 ### All Tags pane
 
