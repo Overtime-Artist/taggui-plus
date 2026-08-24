@@ -468,15 +468,19 @@ class GroupTagsPanel(QWidget):
         prev_partial_tags = (self.partial_list.selected_tags()
                              if preserve_partial else [])
         # A genuinely new tag (manual add or auto-caption) lands at the end of
-        # the list, matching the normal Image Tags list. Only when restoring
-        # from the undo/redo history do we place a re-added tag back at its
-        # natural first-appearance position so it returns to its original spot.
+        # the list, matching the normal Image Tags list. When restoring from
+        # the undo/redo history we instead keep the remembered order intact:
+        # vanished tags are not pruned and a reappearing tag reclaims its exact
+        # prior slot, so an add -> undo -> redo cycle returns the tag to where
+        # it was rather than to its natural first-appearance position.
         place_new_at_end = not restore_positions
+        prune_absent = not restore_positions
         common = self._apply_stable_order(common, self._common_order,
-                                          place_new_at_end)
+                                          place_new_at_end, prune_absent)
         partial_counts = dict(partial)
         partial_tags = self._apply_stable_order(
-            [tag for tag, _ in partial], self._partial_order, place_new_at_end)
+            [tag for tag, _ in partial], self._partial_order, place_new_at_end,
+            prune_absent)
         partial = [(tag, partial_counts[tag]) for tag in partial_tags]
         self._common_model.set_tags(common)
         self._partial_model.set_rows(partial, total)
@@ -504,25 +508,34 @@ class GroupTagsPanel(QWidget):
     @staticmethod
     def _apply_stable_order(current_tags: list[str],
                             remembered: list[str],
-                            place_new_at_end: bool = True) -> list[str]:
+                            place_new_at_end: bool = True,
+                            prune_absent: bool = True) -> list[str]:
         """Order ``current_tags`` by their remembered slots, updating in place.
 
-        Tags already in ``remembered`` keep their relative position, so an edit
-        that only changes a tag's ``k/N`` count doesn't reshuffle the list. A
-        tag not seen before is placed according to ``place_new_at_end``:
+        Returns the display order (present tags only). Tags already in
+        ``remembered`` keep their relative position, so an edit that only
+        changes a tag's ``k/N`` count doesn't reshuffle the list. A tag not seen
+        before is placed according to ``place_new_at_end``:
 
         - ``True`` (the default): appended at the end, so a freshly added tag
           (manual add or auto-caption) lands at the bottom of the list, exactly
           like the normal Image Tags list.
         - ``False``: inserted at the position it occupies in ``current_tags``
           (its natural first-appearance order) relative to the remembered tags.
-          This is used only when restoring from the undo/redo history, so an
-          undone/redone tag returns to its original spot. Because a rename keeps
-          the tag in ``remembered`` (the panel swaps the name in place), a
-          renamed tag also keeps its position under the ``True`` default.
 
-        Tags no longer present drop out. ``remembered`` is mutated to the
-        returned order so it persists across refreshes of the same selection.
+        ``prune_absent`` controls how ``remembered`` is updated:
+
+        - ``True`` (the default): ``remembered`` is replaced with the display
+          order, so tags no longer present drop out. Used for ordinary edits, so
+          re-adding a previously deleted tag treats it as new (goes to the end).
+        - ``False``: tags no longer present are kept in ``remembered`` at their
+          existing slots while present tags are reordered to the display order.
+          Used when restoring from the undo/redo history, so a tag that vanishes
+          on undo reclaims its exact prior slot on redo (an add -> undo -> redo
+          cycle returns the tag to where it was, not to its natural position).
+
+        Because a rename keeps the tag in ``remembered`` (the panel swaps the
+        name in place), a renamed tag also keeps its position.
         """
         current_set = set(current_tags)
         natural_index = {tag: position
@@ -544,7 +557,20 @@ class GroupTagsPanel(QWidget):
                         break
             ordered.insert(insert_at, tag)
             seen.add(tag)
-        remembered[:] = ordered
+        if prune_absent:
+            remembered[:] = ordered
+        else:
+            # Rebuild the memory keeping absent tags anchored at their slots and
+            # substituting present tags in their new display order.
+            display_iter = iter(ordered)
+            rebuilt = []
+            for tag in remembered:
+                if tag in current_set:
+                    rebuilt.append(next(display_iter))
+                else:
+                    rebuilt.append(tag)
+            rebuilt.extend(display_iter)
+            remembered[:] = rebuilt
         return ordered
 
     @staticmethod
