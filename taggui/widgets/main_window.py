@@ -109,6 +109,14 @@ class MainWindow(QMainWindow):
         self.image_list_model.proxy_image_list_model = (
             self.proxy_image_list_model)
         self.pending_auto_caption_category_tags = []
+        # True from the moment auto-captioning starts until the single
+        # end-of-run category-assignment prompt has been shown. New tags are
+        # collected into pending_auto_caption_category_tags while this is True.
+        # It stays True slightly longer than auto_captioner.is_captioning so
+        # that a tag-change dispatch queued for the final image (which can fire
+        # after is_captioning flips to False) still joins the batch instead of
+        # opening its own second prompt.
+        self.is_collecting_auto_caption_category_tags = False
         self.is_syncing_tag_library_from_directory = False
         self.previous_all_tags = set()
         self.removed_all_tags_pending = set()
@@ -2047,6 +2055,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def clear_pending_auto_caption_category_tags(self):
         self.pending_auto_caption_category_tags.clear()
+        self.is_collecting_auto_caption_category_tags = True
 
     def queue_category_assignment_for_new_tags(self, tags: list[str]):
         if not tags or self.is_syncing_tag_library_from_directory:
@@ -2071,7 +2080,8 @@ class MainWindow(QMainWindow):
             else:
                 self.tag_library_model.clear_category(tags)
             return
-        if self.auto_captioner.is_captioning:
+        if self.auto_captioner.is_captioning or (
+                self.is_collecting_auto_caption_category_tags):
             for tag in tags:
                 if tag not in self.pending_auto_caption_category_tags:
                     self.pending_auto_caption_category_tags.append(tag)
@@ -2084,6 +2094,14 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def prompt_for_pending_auto_caption_category_tags(self):
+        # Drain any tag-change dispatch still queued from the final image so its
+        # new tags join this single batch instead of triggering a second prompt.
+        # is_collecting_auto_caption_category_tags is still True here, so these
+        # tags are appended to pending_auto_caption_category_tags rather than
+        # prompted immediately.
+        if self.tag_change_prompt_dispatch_scheduled:
+            self.process_pending_tag_change_prompts()
+        self.is_collecting_auto_caption_category_tags = False
         if not self.pending_auto_caption_category_tags:
             return
         default_category_id = self.settings.value(
