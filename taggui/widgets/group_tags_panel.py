@@ -449,10 +449,24 @@ class GroupTagsPanel(QWidget):
         # When the selected image set changes, rebuild the order from the
         # natural first-appearance order returned above.
         order_key = frozenset(str(image.path) for image in images)
-        if order_key != self._order_key:
+        same_selection = order_key == self._order_key
+        if not same_selection:
             self._order_key = order_key
             self._common_order = []
             self._partial_order = []
+        # When an external edit (auto-captioning, undo/redo) changes the tags of
+        # the same selection without the panel setting an explicit row anchor,
+        # remember the selected tags by name so they stay selected across the
+        # model reset below, mirroring the normal Image Tags list. Panel edits
+        # (delete/rename/add) instead restore the cursor by row via the pending
+        # anchors, so skip name-based preservation for those.
+        preserve_common = same_selection and self._pending_common_anchor is None
+        preserve_partial = (same_selection
+                            and self._pending_partial_anchor is None)
+        prev_common_tags = (self.common_list.selected_tags()
+                            if preserve_common else [])
+        prev_partial_tags = (self.partial_list.selected_tags()
+                             if preserve_partial else [])
         common = self._apply_stable_order(common, self._common_order)
         partial_counts = dict(partial)
         partial_tags = self._apply_stable_order(
@@ -470,6 +484,13 @@ class GroupTagsPanel(QWidget):
         self._restore_anchor(self.partial_list, self._partial_model,
                              self._pending_partial_anchor)
         self._pending_partial_anchor = None
+        # For external edits, reselect the previously-selected tags by name so
+        # the user's selection is maintained (e.g. after auto-captioning).
+        if prev_common_tags:
+            self._reselect_tags(self.common_list, common, prev_common_tags)
+        if prev_partial_tags:
+            self._reselect_tags(self.partial_list, partial_tags,
+                                prev_partial_tags)
         # Report the (possibly restored) Differences selection so the grid
         # highlight stays in sync.
         self.partial_focus_changed.emit(self.partial_list.selected_tags())
@@ -479,18 +500,36 @@ class GroupTagsPanel(QWidget):
                             remembered: list[str]) -> list[str]:
         """Order ``current_tags`` by their remembered slots, updating in place.
 
-        Tags already in ``remembered`` keep their relative position; tags not
-        seen before are appended at the end in their given (first-appearance)
-        order. Tags no longer present drop out. ``remembered`` is mutated to the
-        returned order so it persists across refreshes of the same selection.
+        Tags already in ``remembered`` keep their relative position, so an edit
+        that only changes a tag's ``k/N`` count doesn't reshuffle the list. Tags
+        not seen before are inserted at the position they occupy in
+        ``current_tags`` (their natural first-appearance order) relative to the
+        remembered tags, rather than always at the end. Because the underlying
+        model preserves tag order on a rename (the new tag takes the old tag's
+        slot) and restores it exactly on undo/redo, this makes a renamed tag
+        keep its position and an undone/redone tag return to its original spot,
+        matching the normal Image Tags list — while a genuinely new tag (which
+        the model appends) still lands at the end. Tags no longer present drop
+        out. ``remembered`` is mutated to the returned order so it persists
+        across refreshes of the same selection.
         """
         current_set = set(current_tags)
+        natural_index = {tag: position
+                         for position, tag in enumerate(current_tags)}
         ordered = [tag for tag in remembered if tag in current_set]
         seen = set(ordered)
         for tag in current_tags:
-            if tag not in seen:
-                ordered.append(tag)
-                seen.add(tag)
+            if tag in seen:
+                continue
+            # Insert before the first already-placed tag that comes after this
+            # one in the natural order; otherwise append at the end.
+            insert_at = len(ordered)
+            for position, placed_tag in enumerate(ordered):
+                if natural_index[placed_tag] > natural_index[tag]:
+                    insert_at = position
+                    break
+            ordered.insert(insert_at, tag)
+            seen.add(tag)
         remembered[:] = ordered
         return ordered
 
@@ -532,6 +571,30 @@ class GroupTagsPanel(QWidget):
         list_view.setCurrentIndex(index)
         list_view.selectionModel().select(
             index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+
+    @staticmethod
+    def _reselect_tags(list_view: '_TagListView', ordered_tags: list[str],
+                       wanted_tags: list[str]):
+        """Reselect the given tags by name after a refresh.
+
+        Used to preserve the user's selection across an external tag change
+        (auto-captioning, undo/redo) that resets the models: any of
+        ``wanted_tags`` still present is reselected at its new row, mirroring the
+        normal Image Tags list keeping its selection. Tags that no longer exist
+        are ignored.
+        """
+        row_by_tag = {tag: row for row, tag in enumerate(ordered_tags)}
+        rows = sorted(row_by_tag[tag] for tag in wanted_tags
+                      if tag in row_by_tag)
+        if not rows:
+            return
+        model = list_view.model()
+        selection_model = list_view.selectionModel()
+        selection_model.clearSelection()
+        for row in rows:
+            selection_model.select(
+                model.index(row), QItemSelectionModel.SelectionFlag.Select)
+        list_view.setCurrentIndex(model.index(rows[0]))
 
     @Slot()
     def _on_partial_selection_changed(self, *args):
