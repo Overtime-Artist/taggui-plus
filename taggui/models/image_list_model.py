@@ -508,6 +508,11 @@ class ImageListModel(QAbstractListModel):
         self.images: list[Image] = []
         self.undo_stack = deque(maxlen=UNDO_STACK_SIZE)
         self.redo_stack = []
+        # True only while restoring tags from the undo/redo history. Consumers
+        # (e.g. the Common/Differences panel) use this to distinguish a genuine
+        # new edit from a history restore, so an undone/redone tag returns to
+        # its original position while a freshly added tag lands at the end.
+        self.is_restoring_history = False
         self.proxy_image_list_model = None
         self.image_list_selection_model = None
         self.thumbnail_loaders = set()
@@ -1006,8 +1011,12 @@ class ImageListModel(QAbstractListModel):
             image.natural_language_prompt = history_natural_language_prompt
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
-            self.dataChanged.emit(self.index(changed_image_indices[0]),
-                                  self.index(changed_image_indices[-1]))
+            self.is_restoring_history = True
+            try:
+                self.dataChanged.emit(self.index(changed_image_indices[0]),
+                                      self.index(changed_image_indices[-1]))
+            finally:
+                self.is_restoring_history = False
         self.update_undo_and_redo_actions_requested.emit()
 
     @Slot()

@@ -443,7 +443,7 @@ class GroupTagsPanel(QWidget):
 
         self._refresh_labels(0, 0)
 
-    def set_images(self, images: list[Image]):
+    def set_images(self, images: list[Image], restore_positions: bool = False):
         common, partial, total = compute_common_and_partial(images)
         # Keep each tag in a stable slot across edits to the same selection.
         # When the selected image set changes, rebuild the order from the
@@ -467,10 +467,16 @@ class GroupTagsPanel(QWidget):
                             if preserve_common else [])
         prev_partial_tags = (self.partial_list.selected_tags()
                              if preserve_partial else [])
-        common = self._apply_stable_order(common, self._common_order)
+        # A genuinely new tag (manual add or auto-caption) lands at the end of
+        # the list, matching the normal Image Tags list. Only when restoring
+        # from the undo/redo history do we place a re-added tag back at its
+        # natural first-appearance position so it returns to its original spot.
+        place_new_at_end = not restore_positions
+        common = self._apply_stable_order(common, self._common_order,
+                                          place_new_at_end)
         partial_counts = dict(partial)
         partial_tags = self._apply_stable_order(
-            [tag for tag, _ in partial], self._partial_order)
+            [tag for tag, _ in partial], self._partial_order, place_new_at_end)
         partial = [(tag, partial_counts[tag]) for tag in partial_tags]
         self._common_model.set_tags(common)
         self._partial_model.set_rows(partial, total)
@@ -497,21 +503,26 @@ class GroupTagsPanel(QWidget):
 
     @staticmethod
     def _apply_stable_order(current_tags: list[str],
-                            remembered: list[str]) -> list[str]:
+                            remembered: list[str],
+                            place_new_at_end: bool = True) -> list[str]:
         """Order ``current_tags`` by their remembered slots, updating in place.
 
         Tags already in ``remembered`` keep their relative position, so an edit
-        that only changes a tag's ``k/N`` count doesn't reshuffle the list. Tags
-        not seen before are inserted at the position they occupy in
-        ``current_tags`` (their natural first-appearance order) relative to the
-        remembered tags, rather than always at the end. Because the underlying
-        model preserves tag order on a rename (the new tag takes the old tag's
-        slot) and restores it exactly on undo/redo, this makes a renamed tag
-        keep its position and an undone/redone tag return to its original spot,
-        matching the normal Image Tags list — while a genuinely new tag (which
-        the model appends) still lands at the end. Tags no longer present drop
-        out. ``remembered`` is mutated to the returned order so it persists
-        across refreshes of the same selection.
+        that only changes a tag's ``k/N`` count doesn't reshuffle the list. A
+        tag not seen before is placed according to ``place_new_at_end``:
+
+        - ``True`` (the default): appended at the end, so a freshly added tag
+          (manual add or auto-caption) lands at the bottom of the list, exactly
+          like the normal Image Tags list.
+        - ``False``: inserted at the position it occupies in ``current_tags``
+          (its natural first-appearance order) relative to the remembered tags.
+          This is used only when restoring from the undo/redo history, so an
+          undone/redone tag returns to its original spot. Because a rename keeps
+          the tag in ``remembered`` (the panel swaps the name in place), a
+          renamed tag also keeps its position under the ``True`` default.
+
+        Tags no longer present drop out. ``remembered`` is mutated to the
+        returned order so it persists across refreshes of the same selection.
         """
         current_set = set(current_tags)
         natural_index = {tag: position
@@ -521,13 +532,16 @@ class GroupTagsPanel(QWidget):
         for tag in current_tags:
             if tag in seen:
                 continue
-            # Insert before the first already-placed tag that comes after this
-            # one in the natural order; otherwise append at the end.
-            insert_at = len(ordered)
-            for position, placed_tag in enumerate(ordered):
-                if natural_index[placed_tag] > natural_index[tag]:
-                    insert_at = position
-                    break
+            if place_new_at_end:
+                insert_at = len(ordered)
+            else:
+                # Insert before the first already-placed tag that comes after
+                # this one in the natural order; otherwise append at the end.
+                insert_at = len(ordered)
+                for position, placed_tag in enumerate(ordered):
+                    if natural_index[placed_tag] > natural_index[tag]:
+                        insert_at = position
+                        break
             ordered.insert(insert_at, tag)
             seen.add(tag)
         remembered[:] = ordered
@@ -758,8 +772,12 @@ class GroupTagsPanel(QWidget):
 
     def _emit_rename(self, is_common: bool, anchor: int | None,
                      old_tag: str, new_tag: str):
-        # First-appearance order keeps the renamed tag at the same row, so
-        # restoring this anchor leaves the cursor on the renamed tag.
+        # Keep the renamed tag in its slot. New tags default to the end of the
+        # list, so a rename must swap the name in the remembered order in place
+        # (rather than letting the new name be treated as a brand-new tag and
+        # appended). The pending anchor then restores the cursor to that row.
+        self._rename_in_remembered_order(self._common_order, old_tag, new_tag)
+        self._rename_in_remembered_order(self._partial_order, old_tag, new_tag)
         if is_common:
             self._pending_common_anchor = anchor
         else:
@@ -767,6 +785,22 @@ class GroupTagsPanel(QWidget):
         self.rename_tag_requested.emit(old_tag, new_tag)
         self._pending_common_anchor = None
         self._pending_partial_anchor = None
+
+    @staticmethod
+    def _rename_in_remembered_order(remembered: list[str], old_tag: str,
+                                    new_tag: str):
+        """Replace ``old_tag`` with ``new_tag`` in a remembered order list.
+
+        If ``new_tag`` already exists (the rename merges into an existing tag),
+        just drop ``old_tag`` so the merged tag keeps its own slot.
+        """
+        if old_tag not in remembered:
+            return
+        index = remembered.index(old_tag)
+        if new_tag in remembered:
+            remembered.pop(index)
+        else:
+            remembered[index] = new_tag
 
     def _show_common_context_menu(self, position):
         tags = self.common_list.selected_tags()
