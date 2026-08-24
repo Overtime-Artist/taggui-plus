@@ -643,7 +643,12 @@ class GroupTagsPanel(QWidget):
         for row in rows:
             selection_model.select(
                 model.index(row), QItemSelectionModel.SelectionFlag.Select)
-        list_view.setCurrentIndex(model.index(rows[0]))
+        # Set the current (cursor) row WITHOUT disturbing the selection just
+        # built above. Using ``list_view.setCurrentIndex`` here issues a
+        # clear-and-select command in the real windowed app, which wipes the
+        # multi-row selection; ``NoUpdate`` moves only the cursor.
+        selection_model.setCurrentIndex(
+            model.index(rows[0]), QItemSelectionModel.SelectionFlag.NoUpdate)
 
     @Slot()
     def _on_partial_selection_changed(self, *args):
