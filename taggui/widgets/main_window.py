@@ -4,7 +4,8 @@ import os
 import subprocess
 import sys
 
-from PySide6.QtCore import (QEvent, QEventLoop, QKeyCombination, QModelIndex,
+from PySide6.QtCore import (QEvent, QEventLoop, QItemSelectionModel,
+                            QKeyCombination, QModelIndex,
                             QObject, QRunnable, QThreadPool, QTimer, QUrl,
                             Qt, Signal, Slot)
 from PySide6.QtGui import (QAction, QColor, QCloseEvent, QDesktopServices, QFont, QIcon,
@@ -1479,12 +1480,31 @@ class MainWindow(QMainWindow):
             self.image_list_model.add_tags)
         self.image_viewer.clicked.connect(self.image_list.raise_)
         self.image_viewer.clicked.connect(self._focus_image_list_on_preview_click)
+        self.image_viewer.grid_cell_clicked.connect(self._select_grid_cell)
         self.tag_counter_model.modelReset.connect(self.track_all_tags_changes)
         # Connecting the signal directly without `isVisible()` causes the menu
         # item to be unchecked when the widget is an inactive tab.
         self.image_list.visibilityChanged.connect(
             lambda: self.toggle_image_list_action.setChecked(
                 self.image_list.isVisible()))
+
+    @Slot(QModelIndex)
+    def _select_grid_cell(self, proxy_index: QModelIndex):
+        """Make a clicked grid cell the current image without changing selection.
+
+        Mirrors the arrow-key path (switch_between_selected_images): only the
+        current index moves, using NoUpdate so the selection set is untouched.
+        Clicks that don't map to a currently-selected image are ignored.
+        """
+        if not proxy_index.isValid():
+            return
+        selected_proxy_indices = self.image_list.list_view.selectedIndexes()
+        if proxy_index not in selected_proxy_indices:
+            return
+        if proxy_index == self.image_list_selection_model.currentIndex():
+            return
+        self.image_list_selection_model.setCurrentIndex(
+            proxy_index, QItemSelectionModel.SelectionFlag.NoUpdate)
 
     @Slot()
     def _sync_variant_group_view(self, *args):
