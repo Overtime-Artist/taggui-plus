@@ -6,8 +6,8 @@ from PySide6.QtCore import (QEvent, QModelIndex, QObject, QPoint, QRect,
                              Slot)
 from PySide6.QtGui import (QColor, QIcon, QImage, QImageReader, QPainter,
                            QPalette, QPen, QPixmap)
-from PySide6.QtWidgets import (QLabel, QScrollArea, QSizePolicy, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QLabel, QScrollArea, QSizePolicy,
+                               QVBoxLayout, QWidget)
 
 from models.proxy_image_list_model import ProxyImageListModel
 from utils.image import Image
@@ -166,12 +166,22 @@ class ImageScrollArea(QScrollArea):
     reset_requested = Signal()
     zoom_requested = Signal(int)
     viewport_resized = Signal()
+    # Emitted on a plain left click that did not turn into a drag-to-pan,
+    # carrying the release position in viewport coordinates. Used in grid mode
+    # to select the clicked cell as the current image without changing the
+    # selection. A click that moves past the drag threshold pans instead and
+    # does not emit this.
+    cell_click_requested = Signal(QPoint)
 
     def __init__(self, image_label: ImageLabel):
         super().__init__()
         self.image_label = image_label
         self.is_dragging = False
         self.last_drag_position = QPoint()
+        # Distinguish a click (select cell) from a drag (pan): the press
+        # position and whether the cursor has moved beyond the drag threshold.
+        self.press_position = QPoint()
+        self.drag_moved = False
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setWidget(image_label)
         # Don't take keyboard focus when the preview is clicked or dragged.
@@ -206,6 +216,8 @@ class ImageScrollArea(QScrollArea):
             if mouse_event.button() == Qt.MouseButton.LeftButton:
                 self.clicked.emit()
                 self.is_dragging = True
+                self.drag_moved = False
+                self.press_position = mouse_event.globalPosition().toPoint()
                 self.last_drag_position = mouse_event.globalPosition().toPoint()
                 self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
                 event.accept()
@@ -213,6 +225,11 @@ class ImageScrollArea(QScrollArea):
         if event.type() == QEvent.Type.MouseMove and self.is_dragging:
             mouse_event = event
             current_drag_position = mouse_event.globalPosition().toPoint()
+            if not self.drag_moved:
+                moved = current_drag_position - self.press_position
+                threshold = QApplication.startDragDistance()
+                if abs(moved.x()) > threshold or abs(moved.y()) > threshold:
+                    self.drag_moved = True
             delta = current_drag_position - self.last_drag_position
             self.horizontalScrollBar().setValue(
                 self.horizontalScrollBar().value() - delta.x())
@@ -227,6 +244,14 @@ class ImageScrollArea(QScrollArea):
                     and mouse_event.button() == Qt.MouseButton.LeftButton):
                 self.is_dragging = False
                 self.viewport().unsetCursor()
+                # A press-release with no real movement is a click, not a pan:
+                # request selecting the cell under the cursor (grid mode only;
+                # the ImageViewer ignores it otherwise). The release position is
+                # mapped into viewport coordinates for hit-testing.
+                if not self.drag_moved:
+                    viewport_point = self.viewport().mapFromGlobal(
+                        mouse_event.globalPosition().toPoint())
+                    self.cell_click_requested.emit(viewport_point)
                 event.accept()
                 return True
         return super().eventFilter(obj, event)
@@ -234,6 +259,9 @@ class ImageScrollArea(QScrollArea):
 
 class ImageViewer(QWidget):
     clicked = Signal()
+    # Emitted when a grid cell is clicked (not dragged), carrying the proxy
+    # QModelIndex of the clicked image so MainWindow can make it current.
+    grid_cell_clicked = Signal(QModelIndex)
     # Emitted once, after the first image has been fully decoded and scaled.
     # Used by MainWindow to defer show() until the UI is ready to paint.
     first_image_rendered = Signal()
@@ -266,6 +294,8 @@ class ImageViewer(QWidget):
         self.scroll_area.reset_requested.connect(self.reset_view)
         self.scroll_area.zoom_requested.connect(self.zoom_image)
         self.scroll_area.viewport_resized.connect(self._on_viewport_resized)
+        self.scroll_area.cell_click_requested.connect(
+            self._on_cell_click_requested)
         self.image_label.image_loaded.connect(self._on_image_loaded)
 
         self._resize_debounce_timer = QTimer(self)
@@ -759,4 +789,77 @@ class ImageViewer(QWidget):
             round(center_x - viewport_size.width() / 2))
         self.scroll_area.verticalScrollBar().setValue(
             round(center_y - viewport_size.height() / 2))
+
+    # ------------------------------------------------------------------
+    # Grid cell click-to-select
+    # ------------------------------------------------------------------
+    def _cell_at_composite_point(self, composite_x: float,
+                                 composite_y: float) -> int | None:
+        """Absolute selection position of the cell containing a composite point.
+
+        `composite_x`/`composite_y` are in the coordinate space of the
+        composited grid pixmap (``original_pixmap``). Returns the position
+        within ``self._grid_proxy_indices``, or None if the point is in a gap,
+        outside the grid, or over an empty cell.
+        """
+        if self._grid_proxy_indices is None:
+            return None
+        window_indices, highlight_position = self._grid_window(
+            self._grid_proxy_indices, self._grid_current_position,
+            self._grid_cell_cap)
+        # Absolute position of the first windowed cell within the full list.
+        window_start = self._grid_current_position - highlight_position
+        count = max(1, len(window_indices))
+        columns = max(1, math.ceil(math.sqrt(count)))
+        cell = self._grid_cell_size(count)
+        gap = GRID_GAP_PX
+        for position in range(len(window_indices)):
+            row = position // columns
+            column = position % columns
+            x = gap + column * (cell + gap)
+            y = gap + row * (cell + gap)
+            if (x <= composite_x < x + cell
+                    and y <= composite_y < y + cell):
+                return window_start + position
+        return None
+
+    def _cell_position_at(self, viewport_point: QPoint) -> int | None:
+        """Absolute selection position of the cell under a viewport point.
+
+        Maps the viewport point into composite (``original_pixmap``)
+        coordinates, accounting for the current zoom scale and scroll offset,
+        then hit-tests it against the grid layout.
+        """
+        if not self._grid_mode or self._grid_proxy_indices is None:
+            return None
+        original_size = self.image_label.original_pixmap.size()
+        scaled_size = self.image_label.size()
+        if original_size.width() <= 0 or original_size.height() <= 0:
+            return None
+        if scaled_size.width() <= 0 or scaled_size.height() <= 0:
+            return None
+        # image_label is the scroll area's widget; mapFrom converts a viewport
+        # point into label coordinates, absorbing both centering and scroll.
+        label_point = self.image_label.mapFrom(
+            self.scroll_area.viewport(), viewport_point)
+        scale_x = scaled_size.width() / original_size.width()
+        scale_y = scaled_size.height() / original_size.height()
+        if scale_x <= 0 or scale_y <= 0:
+            return None
+        composite_x = label_point.x() / scale_x
+        composite_y = label_point.y() / scale_y
+        return self._cell_at_composite_point(composite_x, composite_y)
+
+    @Slot(QPoint)
+    def _on_cell_click_requested(self, viewport_point: QPoint):
+        if not self._grid_mode or self._grid_proxy_indices is None:
+            return
+        position = self._cell_position_at(viewport_point)
+        if position is None:
+            return
+        if position < 0 or position >= len(self._grid_proxy_indices):
+            return
+        proxy_index = self._grid_proxy_indices[position]
+        if proxy_index.isValid():
+            self.grid_cell_clicked.emit(proxy_index)
 
