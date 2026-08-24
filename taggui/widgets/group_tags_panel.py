@@ -193,6 +193,15 @@ class _PartialTagDelegate(_UniformHeightDelegate):
         painter.save()
         option = QStyleOptionViewItem(option)
         self.initStyleOption(option, index)
+        # Keep a selected row painted with the vivid "active" highlight even when
+        # this list does not hold keyboard focus. Without this, losing focus
+        # (e.g. after an add -> undo, when focus moves off the list) clears the
+        # State_Active flag and the style falls back to the dim "inactive"
+        # highlight, making the selection look greyed out. The Common list and
+        # the main Image Tags list already appear vivid when unfocused; this
+        # keeps the Differences list consistent with them.
+        if option.state & QStyle.StateFlag.State_Selected:
+            option.state |= QStyle.StateFlag.State_Active
         # Paint the (possibly selected) background using the current style, but
         # without its default text so we can lay out the tag and badge.
         option.text = ''
@@ -443,20 +452,44 @@ class GroupTagsPanel(QWidget):
 
         self._refresh_labels(0, 0)
 
-    def set_images(self, images: list[Image]):
+    def set_images(self, images: list[Image], restore_positions: bool = False):
         common, partial, total = compute_common_and_partial(images)
         # Keep each tag in a stable slot across edits to the same selection.
         # When the selected image set changes, rebuild the order from the
         # natural first-appearance order returned above.
         order_key = frozenset(str(image.path) for image in images)
-        if order_key != self._order_key:
+        same_selection = order_key == self._order_key
+        if not same_selection:
             self._order_key = order_key
             self._common_order = []
             self._partial_order = []
-        common = self._apply_stable_order(common, self._common_order)
+        # When an external edit (auto-captioning, undo/redo) changes the tags of
+        # the same selection without the panel setting an explicit row anchor,
+        # remember the selected tags by name so they stay selected across the
+        # model reset below, mirroring the normal Image Tags list. Panel edits
+        # (delete/rename/add) instead restore the cursor by row via the pending
+        # anchors, so skip name-based preservation for those.
+        preserve_common = same_selection and self._pending_common_anchor is None
+        preserve_partial = (same_selection
+                            and self._pending_partial_anchor is None)
+        prev_common_tags = (self.common_list.selected_tags()
+                            if preserve_common else [])
+        prev_partial_tags = (self.partial_list.selected_tags()
+                             if preserve_partial else [])
+        # A genuinely new tag (manual add or auto-caption) lands at the end of
+        # the list, matching the normal Image Tags list. When restoring from
+        # the undo/redo history we instead keep the remembered order intact:
+        # vanished tags are not pruned and a reappearing tag reclaims its exact
+        # prior slot, so an add -> undo -> redo cycle returns the tag to where
+        # it was rather than to its natural first-appearance position.
+        place_new_at_end = not restore_positions
+        prune_absent = not restore_positions
+        common = self._apply_stable_order(common, self._common_order,
+                                          place_new_at_end, prune_absent)
         partial_counts = dict(partial)
         partial_tags = self._apply_stable_order(
-            [tag for tag, _ in partial], self._partial_order)
+            [tag for tag, _ in partial], self._partial_order, place_new_at_end,
+            prune_absent)
         partial = [(tag, partial_counts[tag]) for tag in partial_tags]
         self._common_model.set_tags(common)
         self._partial_model.set_rows(partial, total)
@@ -470,28 +503,83 @@ class GroupTagsPanel(QWidget):
         self._restore_anchor(self.partial_list, self._partial_model,
                              self._pending_partial_anchor)
         self._pending_partial_anchor = None
+        # For external edits, reselect the previously-selected tags by name so
+        # the user's selection is maintained (e.g. after auto-captioning).
+        if prev_common_tags:
+            self._reselect_tags(self.common_list, common, prev_common_tags)
+        if prev_partial_tags:
+            self._reselect_tags(self.partial_list, partial_tags,
+                                prev_partial_tags)
         # Report the (possibly restored) Differences selection so the grid
         # highlight stays in sync.
         self.partial_focus_changed.emit(self.partial_list.selected_tags())
 
     @staticmethod
     def _apply_stable_order(current_tags: list[str],
-                            remembered: list[str]) -> list[str]:
+                            remembered: list[str],
+                            place_new_at_end: bool = True,
+                            prune_absent: bool = True) -> list[str]:
         """Order ``current_tags`` by their remembered slots, updating in place.
 
-        Tags already in ``remembered`` keep their relative position; tags not
-        seen before are appended at the end in their given (first-appearance)
-        order. Tags no longer present drop out. ``remembered`` is mutated to the
-        returned order so it persists across refreshes of the same selection.
+        Returns the display order (present tags only). Tags already in
+        ``remembered`` keep their relative position, so an edit that only
+        changes a tag's ``k/N`` count doesn't reshuffle the list. A tag not seen
+        before is placed according to ``place_new_at_end``:
+
+        - ``True`` (the default): appended at the end, so a freshly added tag
+          (manual add or auto-caption) lands at the bottom of the list, exactly
+          like the normal Image Tags list.
+        - ``False``: inserted at the position it occupies in ``current_tags``
+          (its natural first-appearance order) relative to the remembered tags.
+
+        ``prune_absent`` controls how ``remembered`` is updated:
+
+        - ``True`` (the default): ``remembered`` is replaced with the display
+          order, so tags no longer present drop out. Used for ordinary edits, so
+          re-adding a previously deleted tag treats it as new (goes to the end).
+        - ``False``: tags no longer present are kept in ``remembered`` at their
+          existing slots while present tags are reordered to the display order.
+          Used when restoring from the undo/redo history, so a tag that vanishes
+          on undo reclaims its exact prior slot on redo (an add -> undo -> redo
+          cycle returns the tag to where it was, not to its natural position).
+
+        Because a rename keeps the tag in ``remembered`` (the panel swaps the
+        name in place), a renamed tag also keeps its position.
         """
         current_set = set(current_tags)
+        natural_index = {tag: position
+                         for position, tag in enumerate(current_tags)}
         ordered = [tag for tag in remembered if tag in current_set]
         seen = set(ordered)
         for tag in current_tags:
-            if tag not in seen:
-                ordered.append(tag)
-                seen.add(tag)
-        remembered[:] = ordered
+            if tag in seen:
+                continue
+            if place_new_at_end:
+                insert_at = len(ordered)
+            else:
+                # Insert before the first already-placed tag that comes after
+                # this one in the natural order; otherwise append at the end.
+                insert_at = len(ordered)
+                for position, placed_tag in enumerate(ordered):
+                    if natural_index[placed_tag] > natural_index[tag]:
+                        insert_at = position
+                        break
+            ordered.insert(insert_at, tag)
+            seen.add(tag)
+        if prune_absent:
+            remembered[:] = ordered
+        else:
+            # Rebuild the memory keeping absent tags anchored at their slots and
+            # substituting present tags in their new display order.
+            display_iter = iter(ordered)
+            rebuilt = []
+            for tag in remembered:
+                if tag in current_set:
+                    rebuilt.append(next(display_iter))
+                else:
+                    rebuilt.append(tag)
+            rebuilt.extend(display_iter)
+            remembered[:] = rebuilt
         return ordered
 
     @staticmethod
@@ -532,6 +620,35 @@ class GroupTagsPanel(QWidget):
         list_view.setCurrentIndex(index)
         list_view.selectionModel().select(
             index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+
+    @staticmethod
+    def _reselect_tags(list_view: '_TagListView', ordered_tags: list[str],
+                       wanted_tags: list[str]):
+        """Reselect the given tags by name after a refresh.
+
+        Used to preserve the user's selection across an external tag change
+        (auto-captioning, undo/redo) that resets the models: any of
+        ``wanted_tags`` still present is reselected at its new row, mirroring the
+        normal Image Tags list keeping its selection. Tags that no longer exist
+        are ignored.
+        """
+        row_by_tag = {tag: row for row, tag in enumerate(ordered_tags)}
+        rows = sorted(row_by_tag[tag] for tag in wanted_tags
+                      if tag in row_by_tag)
+        if not rows:
+            return
+        model = list_view.model()
+        selection_model = list_view.selectionModel()
+        selection_model.clearSelection()
+        for row in rows:
+            selection_model.select(
+                model.index(row), QItemSelectionModel.SelectionFlag.Select)
+        # Set the current (cursor) row WITHOUT disturbing the selection just
+        # built above. Using ``list_view.setCurrentIndex`` here issues a
+        # clear-and-select command in the real windowed app, which wipes the
+        # multi-row selection; ``NoUpdate`` moves only the cursor.
+        selection_model.setCurrentIndex(
+            model.index(rows[0]), QItemSelectionModel.SelectionFlag.NoUpdate)
 
     @Slot()
     def _on_partial_selection_changed(self, *args):
@@ -695,8 +812,12 @@ class GroupTagsPanel(QWidget):
 
     def _emit_rename(self, is_common: bool, anchor: int | None,
                      old_tag: str, new_tag: str):
-        # First-appearance order keeps the renamed tag at the same row, so
-        # restoring this anchor leaves the cursor on the renamed tag.
+        # Keep the renamed tag in its slot. New tags default to the end of the
+        # list, so a rename must swap the name in the remembered order in place
+        # (rather than letting the new name be treated as a brand-new tag and
+        # appended). The pending anchor then restores the cursor to that row.
+        self._rename_in_remembered_order(self._common_order, old_tag, new_tag)
+        self._rename_in_remembered_order(self._partial_order, old_tag, new_tag)
         if is_common:
             self._pending_common_anchor = anchor
         else:
@@ -704,6 +825,22 @@ class GroupTagsPanel(QWidget):
         self.rename_tag_requested.emit(old_tag, new_tag)
         self._pending_common_anchor = None
         self._pending_partial_anchor = None
+
+    @staticmethod
+    def _rename_in_remembered_order(remembered: list[str], old_tag: str,
+                                    new_tag: str):
+        """Replace ``old_tag`` with ``new_tag`` in a remembered order list.
+
+        If ``new_tag`` already exists (the rename merges into an existing tag),
+        just drop ``old_tag`` so the merged tag keeps its own slot.
+        """
+        if old_tag not in remembered:
+            return
+        index = remembered.index(old_tag)
+        if new_tag in remembered:
+            remembered.pop(index)
+        else:
+            remembered[index] = new_tag
 
     def _show_common_context_menu(self, position):
         tags = self.common_list.selected_tags()

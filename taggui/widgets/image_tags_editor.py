@@ -1319,13 +1319,14 @@ class ImageTagsEditor(QDockWidget):
         self.tag_input_box.group_mode_active = False
         self.set_natural_language_mode()
 
-    def _refresh_group_panel(self):
+    def _refresh_group_panel(self, restore_positions: bool = False):
         images = []
         for index in self._group_source_indices:
             image = self.image_list_model.data(index, Qt.ItemDataRole.UserRole)
             if image is not None:
                 images.append(image)
-        self.group_tags_panel.set_images(images)
+        self.group_tags_panel.set_images(images,
+                                         restore_positions=restore_positions)
 
     def _group_add_target_indices(self) -> list[QModelIndex]:
         """Target images for the Add Tag box, honoring the scope selector."""
@@ -1414,8 +1415,12 @@ class ImageTagsEditor(QDockWidget):
         """
         if self._group_mode:
             # A group edit (or undo/redo) changed tags: recompute the
-            # Common/Differences view from the current selection.
-            self._refresh_group_panel()
+            # Common/Differences view from the current selection. Preserve tag
+            # positions only when the change is an undo/redo history restore, so
+            # a re-added tag returns to its original spot while a freshly added
+            # tag still lands at the end.
+            self._refresh_group_panel(
+                restore_positions=self.image_list_model.is_restoring_history)
             return
         if self.image_index is None:
             return
