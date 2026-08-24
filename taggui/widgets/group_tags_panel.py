@@ -193,6 +193,15 @@ class _PartialTagDelegate(_UniformHeightDelegate):
         painter.save()
         option = QStyleOptionViewItem(option)
         self.initStyleOption(option, index)
+        # Keep a selected row painted with the vivid "active" highlight even when
+        # this list does not hold keyboard focus. Without this, losing focus
+        # (e.g. after an add -> undo, when focus moves off the list) clears the
+        # State_Active flag and the style falls back to the dim "inactive"
+        # highlight, making the selection look greyed out. The Common list and
+        # the main Image Tags list already appear vivid when unfocused; this
+        # keeps the Differences list consistent with them.
+        if option.state & QStyle.StateFlag.State_Selected:
+            option.state |= QStyle.StateFlag.State_Active
         # Paint the (possibly selected) background using the current style, but
         # without its default text so we can lay out the tag and badge.
         option.text = ''
@@ -445,16 +454,6 @@ class GroupTagsPanel(QWidget):
 
     def set_images(self, images: list[Image], restore_positions: bool = False):
         common, partial, total = compute_common_and_partial(images)
-        # Remember which tag list currently holds keyboard focus. Resetting the
-        # models below can leave focus off the list, which makes Qt paint the
-        # preserved selection in the dim "inactive" colour instead of the vivid
-        # focused colour. The normal Image Tags list restores focus after an
-        # undo/redo edit for the same reason; mirror that here.
-        focused_list = None
-        if self.common_list.hasFocus():
-            focused_list = self.common_list
-        elif self.partial_list.hasFocus():
-            focused_list = self.partial_list
         # Keep each tag in a stable slot across edits to the same selection.
         # When the selected image set changes, rebuild the order from the
         # natural first-appearance order returned above.
@@ -514,20 +513,6 @@ class GroupTagsPanel(QWidget):
         # Report the (possibly restored) Differences selection so the grid
         # highlight stays in sync.
         self.partial_focus_changed.emit(self.partial_list.selected_tags())
-        # Keep the preserved selection vividly highlighted. If a list held focus
-        # coming into this refresh, keep it there. On an undo/redo refresh the
-        # focus may already have been stolen (e.g. by the "Assign Tag Category"
-        # prompt shown when the added tag was new), leaving the reselected tag
-        # dimmed; return focus to the list that still holds the preserved
-        # selection so it stays vivid, matching the normal Image Tags list.
-        focus_target = focused_list
-        if focus_target is None and restore_positions:
-            if prev_partial_tags and self.partial_list.selected_tags():
-                focus_target = self.partial_list
-            elif prev_common_tags and self.common_list.selected_tags():
-                focus_target = self.common_list
-        if focus_target is not None and not focus_target.hasFocus():
-            focus_target.setFocus()
 
     @staticmethod
     def _apply_stable_order(current_tags: list[str],
