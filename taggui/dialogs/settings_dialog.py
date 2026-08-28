@@ -120,6 +120,7 @@ class SettingsDialog(QDialog):
     image_list_font_size_changed = Signal()
     image_list_image_width_changed = Signal()
     image_list_resolution_badge_settings_changed = Signal()
+    variant_grid_overlay_settings_changed = Signal()
     image_list_completion_icon_settings_changed = Signal()
     token_limit_changed = Signal()
     tag_separator_changed = Signal()
@@ -362,8 +363,56 @@ class SettingsDialog(QDialog):
                               Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
         grid_layout.addWidget(variant_grid_cell_cap_spin_box, row, 1,
                               Qt.AlignmentFlag.AlignLeft)
+        row += 1
+        grid_overlay_font_size_spin_box = FocusedScrollSettingsSpinBox(
+            key='variant_grid_overlay_font_size',
+            default=DEFAULT_SETTINGS['variant_grid_overlay_font_size'],
+            minimum=1, maximum=99)
+        grid_overlay_font_size_spin_box.valueChanged.connect(
+            lambda _: self.variant_grid_overlay_settings_changed.emit())
+        grid_overlay_transparency_spin_box = FocusedScrollSettingsSpinBox(
+            key='variant_grid_overlay_transparency',
+            default=DEFAULT_SETTINGS['variant_grid_overlay_transparency'],
+            minimum=0, maximum=100)
+        grid_overlay_transparency_spin_box.valueChanged.connect(
+            lambda _: self.variant_grid_overlay_settings_changed.emit())
+        show_grid_overlay_check_box = SettingsBigCheckBox(
+            key='variant_grid_overlay_show',
+            default=DEFAULT_SETTINGS['variant_grid_overlay_show'])
+        grid_overlay_font_size_label = QLabel(
+            'Grid page/count overlay text size (pt)')
+        grid_overlay_transparency_label = QLabel(
+            'Grid page/count overlay background transparency (%)')
 
-        # Thumbnail Cache
+        def update_grid_overlay_sub_settings_enabled(checked: bool):
+            # Grey out the overlay appearance controls when the overlay is off.
+            grid_overlay_font_size_spin_box.setEnabled(checked)
+            grid_overlay_transparency_spin_box.setEnabled(checked)
+            grid_overlay_font_size_label.setEnabled(checked)
+            grid_overlay_transparency_label.setEnabled(checked)
+
+        update_grid_overlay_sub_settings_enabled(
+            show_grid_overlay_check_box.isChecked())
+        show_grid_overlay_check_box.stateChanged.connect(
+            lambda _: (
+                update_grid_overlay_sub_settings_enabled(
+                    show_grid_overlay_check_box.isChecked()),
+                self.variant_grid_overlay_settings_changed.emit()))
+
+        grid_layout.addWidget(QLabel('Show grid page/count overlay'), row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        grid_layout.addWidget(show_grid_overlay_check_box, row, 1,
+                              Qt.AlignmentFlag.AlignLeft)
+        row += 1
+        grid_layout.addWidget(grid_overlay_font_size_label, row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        grid_layout.addWidget(grid_overlay_font_size_spin_box, row, 1,
+                              Qt.AlignmentFlag.AlignLeft)
+        row += 1
+        grid_layout.addWidget(grid_overlay_transparency_label, row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        grid_layout.addWidget(grid_overlay_transparency_spin_box, row, 1,
+                              Qt.AlignmentFlag.AlignLeft)
         grid_layout = add_section('Thumbnail Cache')
         row = 0
 

@@ -715,6 +715,8 @@ class MainWindow(QMainWindow):
             self.refresh_image_list_resolution_badge_style)
         settings_dialog.image_list_completion_icon_settings_changed.connect(
             self.refresh_image_list_resolution_badge_style)
+        settings_dialog.variant_grid_overlay_settings_changed.connect(
+            self.image_viewer.refresh_grid_overlay_style)
         settings_dialog.token_limit_changed.connect(
             self.image_tags_editor.count_tokens)
         settings_dialog.tag_separator_changed.connect(

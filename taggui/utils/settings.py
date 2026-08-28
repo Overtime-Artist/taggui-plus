@@ -121,6 +121,12 @@ DEFAULT_SETTINGS = {
     # of cells centered on the current image. Kept modest so compositing stays
     # fast and cells stay large enough to be useful.
     'variant_grid_cell_cap': 12,
+    # Subtle overlay in the multi-image grid preview showing the current page
+    # and the total number of selected images. Its appearance mirrors the
+    # resolution badge controls.
+    'variant_grid_overlay_show': True,
+    'variant_grid_overlay_font_size': 10,
+    'variant_grid_overlay_transparency': 55,
 }
 
 

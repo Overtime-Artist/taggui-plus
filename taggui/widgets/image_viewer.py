@@ -290,6 +290,21 @@ class ImageViewer(QWidget):
         # newer view, plus a reference to the running loader to keep it alive.
         self._grid_render_token = 0
         self._grid_loaders: set = set()
+        # Subtle, fixed overlay (bottom-left of the viewport) showing the
+        # current page and total image count while a grid is displayed. Parented
+        # to the viewport so it stays put regardless of zoom or scroll. Its
+        # appearance (visibility, text size, background transparency) is
+        # controlled by settings and applied via refresh_grid_overlay_style().
+        self._grid_overlay_label = QLabel(self.scroll_area.viewport())
+        self._grid_overlay_show = True
+        self._grid_overlay_font_size = DEFAULT_SETTINGS[
+            'variant_grid_overlay_font_size']
+        self._grid_overlay_background_alpha = self._transparency_to_alpha(
+            DEFAULT_SETTINGS['variant_grid_overlay_transparency'])
+        self._grid_overlay_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._grid_overlay_label.hide()
+        self.refresh_grid_overlay_style()
         self.scroll_area.clicked.connect(lambda: self.clicked.emit())
         self.scroll_area.reset_requested.connect(self.reset_view)
         self.scroll_area.zoom_requested.connect(self.zoom_image)
@@ -319,8 +334,76 @@ class ImageViewer(QWidget):
             defaultValue=DEFAULT_SETTINGS['max_image_preview_zoom'],
             type=int))
 
+    @staticmethod
+    def _transparency_to_alpha(transparency: int) -> int:
+        """Map a transparency percentage (0-100) to an alpha value (0-255).
+
+        Mirrors the resolution badge: 0% transparency -> fully opaque (255),
+        100% transparency -> fully transparent (0).
+        """
+        clamped = max(0, min(int(transparency), 100))
+        return round(255 * (100 - clamped) / 100)
+
+    def refresh_grid_overlay_style(self):
+        """Re-read the grid overlay settings and apply them to the label."""
+        settings = get_settings()
+        self._grid_overlay_show = settings.value(
+            'variant_grid_overlay_show',
+            defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_show'],
+            type=bool)
+        self._grid_overlay_font_size = settings.value(
+            'variant_grid_overlay_font_size',
+            defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_font_size'],
+            type=int)
+        transparency = settings.value(
+            'variant_grid_overlay_transparency',
+            defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_transparency'],
+            type=int)
+        self._grid_overlay_background_alpha = self._transparency_to_alpha(
+            transparency)
+        font_size = max(1, self._grid_overlay_font_size)
+        self._grid_overlay_label.setStyleSheet(
+            f'background-color: rgba(0, 0, 0, '
+            f'{self._grid_overlay_background_alpha}); '
+            f'color: rgba(255, 255, 255, 220); '
+            f'padding: 3px 8px; border-radius: 6px; font-size: {font_size}pt;')
+        # Show/hide immediately to reflect a toggled "show overlay" setting.
+        self._update_grid_overlay()
+
     def _on_viewport_resized(self):
         self._resize_debounce_timer.start()
+        self._position_grid_overlay()
+
+    def _update_grid_overlay(self):
+        """Refresh and show the subtle page / image-count overlay."""
+        if (not self._grid_overlay_show or not self._grid_mode
+                or self._grid_proxy_indices is None):
+            self._grid_overlay_label.hide()
+            return
+        total = len(self._grid_proxy_indices)
+        cell_cap = self._grid_cell_cap if self._grid_cell_cap > 0 else total
+        page_count = max(1, math.ceil(total / cell_cap))
+        current_page = self._grid_current_position // cell_cap + 1
+        noun = 'image' if total == 1 else 'images'
+        if page_count > 1:
+            text = f'Page {current_page}/{page_count} \u00b7 {total} {noun}'
+        else:
+            text = f'{total} {noun}'
+        self._grid_overlay_label.setText(text)
+        self._grid_overlay_label.adjustSize()
+        self._grid_overlay_label.show()
+        self._grid_overlay_label.raise_()
+        self._position_grid_overlay()
+
+    def _position_grid_overlay(self):
+        """Keep the overlay pinned to the bottom-left of the viewport."""
+        if not self._grid_overlay_label.isVisible():
+            return
+        margin = 10
+        viewport = self.scroll_area.viewport()
+        label = self._grid_overlay_label
+        label.move(margin,
+                   viewport.height() - label.height() - margin)
 
     def _update_scaled_image(self, force_smooth: bool = False):
         if self.image_label.original_pixmap.isNull():
@@ -548,6 +631,7 @@ class ImageViewer(QWidget):
         # arrival. The loader keeps its own reference until it finishes (it
         # removes itself in _on_grid_cells_loaded), so we must not drop it here.
         self._grid_render_token += 1
+        self._grid_overlay_label.hide()
 
     def set_marked_paths(self, paths: list[str]):
         """Mark the grid cells whose image path is in ``paths``.
@@ -621,6 +705,7 @@ class ImageViewer(QWidget):
         # silently swap them in when ready (mirrors the single-image placeholder
         # -> sharp-image transition).
         self._schedule_grid_high_quality(window_indices, token)
+        self._update_grid_overlay()
 
     def _schedule_grid_high_quality(self, window_indices: list[QModelIndex],
                                     token: int):
@@ -666,13 +751,30 @@ class ImageViewer(QWidget):
         count = len(proxy_indices)
         if count <= cell_cap:
             return proxy_indices, current_position
-        half = cell_cap // 2
-        start = max(0, current_position - half)
-        end = start + cell_cap
-        if end > count:
-            end = count
-            start = end - cell_cap
-        return proxy_indices[start:end], current_position - start
+        # Fixed pages: the selection is split into consecutive pages of
+        # ``cell_cap`` images. The current image determines which page is shown,
+        # and the highlight moves through every cell of that page before the
+        # view flips to the next (or previous) page. This avoids the window
+        # scrolling before all images in the current page have been cycled.
+        page_start = (current_position // cell_cap) * cell_cap
+        page_end = min(page_start + cell_cap, count)
+        return proxy_indices[page_start:page_end], current_position - page_start
+
+    def _grid_geometry_count(self) -> int:
+        """Cell count that drives grid geometry (cell size and columns).
+
+        When the selection spans multiple pages, geometry is based on the page
+        capacity (``cell_cap``) so every page - including a partial last page -
+        uses the same cell size and column layout; a short last page just has
+        empty trailing slots (fewer rows). When everything fits on one page,
+        geometry is based on the actual number of images so a small selection
+        still gets large, space-filling cells.
+        """
+        total = len(self._grid_proxy_indices) if self._grid_proxy_indices else 0
+        cell_cap = self._grid_cell_cap
+        if cell_cap > 0 and total > cell_cap:
+            return cell_cap
+        return max(1, total)
 
     @staticmethod
     def _grid_cell_size(cell_count: int) -> int:
@@ -722,9 +824,10 @@ class ImageViewer(QWidget):
     def _build_grid_pixmap(self, window_indices: list[QModelIndex],
                            highlight_position: int) -> QPixmap:
         count = max(1, len(window_indices))
-        columns = max(1, math.ceil(math.sqrt(count)))
+        geometry_count = self._grid_geometry_count()
+        columns = max(1, math.ceil(math.sqrt(geometry_count)))
         rows = math.ceil(count / columns)
-        cell = self._grid_cell_size(count)
+        cell = self._grid_cell_size(geometry_count)
         gap = GRID_GAP_PX
         total_width = columns * cell + (columns + 1) * gap
         total_height = rows * cell + (rows + 1) * gap
@@ -809,9 +912,9 @@ class ImageViewer(QWidget):
             self._grid_cell_cap)
         # Absolute position of the first windowed cell within the full list.
         window_start = self._grid_current_position - highlight_position
-        count = max(1, len(window_indices))
-        columns = max(1, math.ceil(math.sqrt(count)))
-        cell = self._grid_cell_size(count)
+        geometry_count = self._grid_geometry_count()
+        columns = max(1, math.ceil(math.sqrt(geometry_count)))
+        cell = self._grid_cell_size(geometry_count)
         gap = GRID_GAP_PX
         for position in range(len(window_indices)):
             row = position // columns
