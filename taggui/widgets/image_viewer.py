@@ -172,6 +172,10 @@ class ImageScrollArea(QScrollArea):
     # selection. A click that moves past the drag threshold pans instead and
     # does not emit this.
     cell_click_requested = Signal(QPoint)
+    # Emitted on a right click, carrying the click position in viewport
+    # coordinates. Used in grid mode to show a context menu for the cell under
+    # the cursor. Ignored by the ImageViewer when not in grid mode.
+    cell_context_menu_requested = Signal(QPoint)
 
     def __init__(self, image_label: ImageLabel):
         super().__init__()
@@ -213,6 +217,12 @@ class ImageScrollArea(QScrollArea):
                 return True
         if event.type() == QEvent.Type.MouseButtonPress:
             mouse_event = event
+            if mouse_event.button() == Qt.MouseButton.RightButton:
+                viewport_point = self.viewport().mapFromGlobal(
+                    mouse_event.globalPosition().toPoint())
+                self.cell_context_menu_requested.emit(viewport_point)
+                event.accept()
+                return True
             if mouse_event.button() == Qt.MouseButton.LeftButton:
                 self.clicked.emit()
                 self.is_dragging = True
@@ -262,6 +272,10 @@ class ImageViewer(QWidget):
     # Emitted when a grid cell is clicked (not dragged), carrying the proxy
     # QModelIndex of the clicked image so MainWindow can make it current.
     grid_cell_clicked = Signal(QModelIndex)
+    # Emitted when a grid cell is right-clicked, carrying the proxy QModelIndex
+    # of the image under the cursor and the global screen position where the
+    # context menu should appear.
+    grid_cell_context_menu_requested = Signal(QModelIndex, QPoint)
     # Emitted once, after the first image has been fully decoded and scaled.
     # Used by MainWindow to defer show() until the UI is ready to paint.
     first_image_rendered = Signal()
@@ -311,6 +325,8 @@ class ImageViewer(QWidget):
         self.scroll_area.viewport_resized.connect(self._on_viewport_resized)
         self.scroll_area.cell_click_requested.connect(
             self._on_cell_click_requested)
+        self.scroll_area.cell_context_menu_requested.connect(
+            self._on_cell_context_menu_requested)
         self.image_label.image_loaded.connect(self._on_image_loaded)
 
         self._resize_debounce_timer = QTimer(self)
@@ -616,7 +632,7 @@ class ImageViewer(QWidget):
             self.show_grid(proxy_indices, current_position, cell_cap)
             return
         self._render_grid(proxy_indices, current_position, cell_cap,
-                          preserve_view=True)
+                          preserve_view=True, recenter_current=True)
 
     def exit_grid(self):
         """Leave grid mode. The caller should then load the single image."""
@@ -679,7 +695,7 @@ class ImageViewer(QWidget):
 
     def _render_grid(self, proxy_indices: list[QModelIndex],
                      current_position: int, cell_cap: int,
-                     preserve_view: bool):
+                     preserve_view: bool, recenter_current: bool = False):
         self._grid_proxy_indices = list(proxy_indices)
         self._grid_current_position = current_position
         self._grid_cell_cap = cell_cap
@@ -699,7 +715,11 @@ class ImageViewer(QWidget):
             self.scroll_area.verticalScrollBar().setValue(0)
         self.image_label.set_static_pixmap(pixmap)
         self._update_scaled_image()
-        if preserve_view and self.zoom_factor > 1.0:
+        # Only scroll to the current cell when the current image actually moved
+        # (arrow-key navigation). In-place re-renders (mark changes, content
+        # refreshes) keep the user's exact scroll position instead of snapping
+        # back to the highlighted cell.
+        if preserve_view and recenter_current and self.zoom_factor > 1.0:
             self._center_on_current_cell()
         # Decode any cells not yet cached at full quality in the background, then
         # silently swap them in when ready (mirrors the single-image placeholder
@@ -965,4 +985,20 @@ class ImageViewer(QWidget):
         proxy_index = self._grid_proxy_indices[position]
         if proxy_index.isValid():
             self.grid_cell_clicked.emit(proxy_index)
+
+    @Slot(QPoint)
+    def _on_cell_context_menu_requested(self, viewport_point: QPoint):
+        if not self._grid_mode or self._grid_proxy_indices is None:
+            return
+        position = self._cell_position_at(viewport_point)
+        if position is None:
+            return
+        if position < 0 or position >= len(self._grid_proxy_indices):
+            return
+        proxy_index = self._grid_proxy_indices[position]
+        if proxy_index.isValid():
+            global_point = self.scroll_area.viewport().mapToGlobal(
+                viewport_point)
+            self.grid_cell_context_menu_requested.emit(proxy_index,
+                                                       global_point)
 
