@@ -167,6 +167,10 @@ _GENERAL_PREFERENCES_VALIDATORS = {
     'auto_apply_implications': _validate_auto_apply_implications,
     'variant_grid_view_enabled': _validate_bool,
     'variant_grid_cell_cap': _make_int_validator(minimum=4, maximum=64),
+    'variant_grid_overlay_show': _validate_bool,
+    'variant_grid_overlay_font_size': _make_int_validator(minimum=1, maximum=99),
+    'variant_grid_overlay_transparency':
+        _make_int_validator(minimum=0, maximum=100),
 }
 
 
@@ -322,7 +326,9 @@ EXPORT_CATEGORIES = {
             'tag_library_keep_or_remove_default_choice', 'tag_library_ask_keep_or_remove',
             'tag_library_new_tag_default_category_id', 'ask_before_assigning_new_tag_category',
             'auto_apply_implications', 'hidden_model_ids',
-            'variant_grid_view_enabled', 'variant_grid_cell_cap'
+            'variant_grid_view_enabled', 'variant_grid_cell_cap',
+            'variant_grid_overlay_show', 'variant_grid_overlay_font_size',
+            'variant_grid_overlay_transparency'
         ]
     },
     'keyboard_shortcuts': {
