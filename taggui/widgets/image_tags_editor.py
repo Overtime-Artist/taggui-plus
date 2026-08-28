@@ -1070,6 +1070,27 @@ class ImageTagsEditor(QDockWidget):
             return self.group_tags_panel.selected_tag_for_wiki()
         return self.image_tags_list.selected_tag_for_wiki()
 
+    def selected_group_tags(self) -> list[str]:
+        """Tags selected in the grouped (grid) Image Tags pane.
+
+        Used by the grid cell context menu to add/remove the currently
+        selected tag(s) to/from a single image. Returns an empty list when not
+        in group mode or nothing is selected.
+        """
+        if not self._group_mode:
+            return []
+        return self.group_tags_panel.currently_selected_tags()
+
+    def remember_group_tag_anchor(self):
+        """Preserve the grouped pane's cursor position across the next edit.
+
+        Called before a grid cell context-menu add/remove so the Image Tags
+        pane keeps its scroll/selection position, matching the panel's own
+        Remove/Add actions.
+        """
+        if self._group_mode:
+            self.group_tags_panel.remember_selected_tags_anchor()
+
     def focus_tags_list(self):
         """Focus the tag list for the "Focus Image Tags List" shortcut.
 

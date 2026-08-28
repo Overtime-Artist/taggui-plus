@@ -6,13 +6,14 @@ import sys
 
 from PySide6.QtCore import (QEvent, QEventLoop, QItemSelectionModel,
                             QKeyCombination, QModelIndex,
-                            QObject, QRunnable, QThreadPool, QTimer, QUrl,
-                            Qt, Signal, Slot)
+                            QObject, QPoint, QRunnable, QThreadPool, QTimer,
+                            QUrl, Qt, Signal, Slot)
 from PySide6.QtGui import (QAction, QColor, QCloseEvent, QDesktopServices, QFont, QIcon,
                            QKeySequence, QPalette, QPixmap, QShortcut)
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QGridLayout,
                                QHBoxLayout, QMainWindow, QDialog, QDockWidget, QLabel,
-                               QMessageBox, QPushButton, QScrollArea, QStackedWidget,
+                               QMenu, QMessageBox, QPushButton, QScrollArea,
+                               QStackedWidget,
                                QTabBar, QToolTip, QVBoxLayout, QWidget)
 from transformers import AutoTokenizer
 
@@ -1491,6 +1492,8 @@ class MainWindow(QMainWindow):
         self.image_viewer.clicked.connect(self.image_list.raise_)
         self.image_viewer.clicked.connect(self._focus_image_list_on_preview_click)
         self.image_viewer.grid_cell_clicked.connect(self._select_grid_cell)
+        self.image_viewer.grid_cell_context_menu_requested.connect(
+            self._show_grid_cell_tag_menu)
         self.tag_counter_model.modelReset.connect(self.track_all_tags_changes)
         # Connecting the signal directly without `isVisible()` causes the menu
         # item to be unchecked when the widget is an inactive tab.
@@ -1515,6 +1518,65 @@ class MainWindow(QMainWindow):
             return
         self.image_list_selection_model.setCurrentIndex(
             proxy_index, QItemSelectionModel.SelectionFlag.NoUpdate)
+
+    @staticmethod
+    def _shorten_tag(tag: str, limit: int = 40) -> str:
+        """Truncate a tag for display in a menu label."""
+        tag = tag.replace('\n', ' ')
+        if len(tag) <= limit:
+            return tag
+        return tag[:limit - 1] + '\u2026'
+
+    @Slot(QModelIndex, QPoint)
+    def _show_grid_cell_tag_menu(self, proxy_index: QModelIndex,
+                                 global_point: QPoint):
+        """Context menu to add/remove the selected tag on a right-clicked cell.
+
+        Shown when a grid cell is right-clicked in the multi-image (grid) view.
+        Adds or removes the tag(s) currently selected in the Image Tags pane
+        to/from just the image under the cursor.
+        """
+        if not proxy_index.isValid():
+            return
+        source_index = self.proxy_image_list_model.mapToSource(proxy_index)
+        if not source_index.isValid():
+            return
+        image: Image = self.image_list_model.data(source_index,
+                                                  Qt.ItemDataRole.UserRole)
+        if image is None:
+            return
+        selected_tags = self.image_tags_editor.selected_group_tags()
+        menu = QMenu(self)
+        if not selected_tags:
+            hint = menu.addAction('Select a tag in the Image Tags pane')
+            hint.setEnabled(False)
+            menu.exec(global_point)
+            return
+        existing = set(image.tags)
+        missing_tags = [tag for tag in selected_tags if tag not in existing]
+        present_tags = [tag for tag in selected_tags if tag in existing]
+        if len(selected_tags) == 1:
+            tag = selected_tags[0]
+            label = f"'{self._shorten_tag(tag)}'"
+            add_action = menu.addAction(f'Add {label} to this image')
+            remove_action = menu.addAction(f'Remove {label} from this image')
+        else:
+            count = len(selected_tags)
+            add_action = menu.addAction(f'Add {count} tags to this image')
+            remove_action = menu.addAction(
+                f'Remove {count} tags from this image')
+        add_action.setEnabled(bool(missing_tags))
+        remove_action.setEnabled(bool(present_tags))
+        chosen = menu.exec(global_point)
+        if chosen is None:
+            return
+        if chosen == add_action and missing_tags:
+            self.image_tags_editor.remember_group_tag_anchor()
+            self.image_list_model.add_tags(missing_tags, [source_index])
+        elif chosen == remove_action and present_tags:
+            self.image_tags_editor.remember_group_tag_anchor()
+            self.image_list_model.remove_tags_from_images(present_tags,
+                                                          [source_index])
 
     @Slot()
     def _sync_variant_group_view(self, *args):

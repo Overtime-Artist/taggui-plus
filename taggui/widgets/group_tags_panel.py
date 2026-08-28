@@ -740,6 +740,42 @@ class GroupTagsPanel(QWidget):
         data = index.data(Qt.ItemDataRole.DisplayRole)
         return str(data) if data else ''
 
+    def currently_selected_tags(self) -> list[str]:
+        """Tags selected in the panel, for the grid cell context menu.
+
+        Prefers the list that currently has keyboard focus; if neither has
+        focus, returns the selection of whichever list has one (Common before
+        Differences). Returns an empty list when nothing is selected.
+        """
+        list_view = self._active_selection_list()
+        return list_view.selected_tags() if list_view is not None else []
+
+    def _active_selection_list(self) -> '_TagListView | None':
+        """The list whose selection the grid cell context menu should use.
+
+        Prefers a focused list; otherwise the first list (Common before
+        Differences) that has any selection. Returns None if nothing is
+        selected.
+        """
+        for list_view in (self.common_list, self.partial_list):
+            if list_view.hasFocus() and list_view.selected_tags():
+                return list_view
+        for list_view in (self.common_list, self.partial_list):
+            if list_view.selected_tags():
+                return list_view
+        return None
+
+    def remember_selected_tags_anchor(self):
+        """Stash the selected list's cursor row so it survives the next refresh.
+
+        Used before a grid cell context-menu add/remove so the Image Tags pane
+        keeps its position after the edit's model reset, mirroring the panel's
+        own Remove/Add context-menu actions.
+        """
+        list_view = self._active_selection_list()
+        if list_view is not None:
+            self.remember_anchor_for_add(list_view)
+
     def selected_tag_for_wiki(self) -> str:
         """The single tag the wiki shortcut should look up from this panel.
 
