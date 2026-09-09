@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import (QEvent, QModelIndex, QObject, QPoint, QRect,
                              QRunnable, QSize, Qt, QThreadPool, QTimer, Signal,
                              Slot)
-from PySide6.QtGui import (QColor, QIcon, QImage, QImageReader, QPainter,
+from PySide6.QtGui import (QIcon, QImage, QImageReader, QPainter,
                            QPalette, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QLabel, QScrollArea, QSizePolicy,
                                QVBoxLayout, QWidget)
@@ -39,6 +39,10 @@ GRID_CELL_MAX_PX = 2048
 GRID_CELL_MIN_PX = 512
 GRID_GAP_PX = 12
 GRID_HIGHLIGHT_WIDTH_PX = 10
+# Opacity applied to grid cells that do NOT contain the tag focused in the
+# tag list. The focused ("has tag") cells stay fully opaque; hovering or the
+# current cell temporarily restores full opacity so the image can be judged.
+GRID_DIM_OPACITY = 0.28
 
 
 class _ImageFileLoader(QObject, QRunnable):
@@ -176,6 +180,13 @@ class ImageScrollArea(QScrollArea):
     # coordinates. Used in grid mode to show a context menu for the cell under
     # the cursor. Ignored by the ImageViewer when not in grid mode.
     cell_context_menu_requested = Signal(QPoint)
+    # Emitted as the cursor moves over the grid (no button held), carrying the
+    # position in viewport coordinates. Used in grid mode to light up the
+    # hovered cell so a dimmed (without-tag) image can be judged before adding.
+    cell_hovered = Signal(QPoint)
+    # Emitted when the cursor leaves the grid area, so any hover highlight can
+    # be cleared.
+    hover_left = Signal()
 
     def __init__(self, image_label: ImageLabel):
         super().__init__()
@@ -195,6 +206,10 @@ class ImageScrollArea(QScrollArea):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Track mouse motion without a button held so the grid can react to
+        # hover (lighting up a dimmed cell under the cursor).
+        self.viewport().setMouseTracking(True)
+        self.image_label.setMouseTracking(True)
         self.viewport().installEventFilter(self)
         self.image_label.installEventFilter(self)
 
@@ -248,6 +263,13 @@ class ImageScrollArea(QScrollArea):
             self.last_drag_position = current_drag_position
             event.accept()
             return True
+        if event.type() == QEvent.Type.MouseMove and not self.is_dragging:
+            viewport_point = self.viewport().mapFromGlobal(
+                event.globalPosition().toPoint())
+            self.cell_hovered.emit(viewport_point)
+            # Fall through so normal handling (cursor, etc.) still happens.
+        if event.type() == QEvent.Type.Leave:
+            self.hover_left.emit()
         if event.type() == QEvent.Type.MouseButtonRelease:
             mouse_event = event
             if (self.is_dragging
@@ -291,6 +313,7 @@ class ImageViewer(QWidget):
         # composited pixmap of all selected images instead of one image.
         self._grid_mode = False
         self._grid_cell_cache: dict[str, QPixmap] = {}
+        self._grid_cell_layout: list[tuple[QRect, int]] = []
         self._grid_current_cell_rect: QRect | None = None
         # Paths of images to mark in the grid (those containing the tag focused
         # in the Differences list) and the inputs of the last grid render, so
@@ -299,6 +322,14 @@ class ImageViewer(QWidget):
         self._grid_proxy_indices: list[QModelIndex] | None = None
         self._grid_current_position = 0
         self._grid_cell_cap = 0
+        # Absolute position (index into _grid_proxy_indices) of the cell the
+        # cursor is currently hovering, or None. A hovered without-tag cell is
+        # drawn at full opacity so it can be judged before deciding to add.
+        self._grid_hover_position: int | None = None
+        # Keyboard "peek": while True the current (highlighted) cell is drawn at
+        # full opacity even when it lacks the focused tag, giving keyboard-only
+        # users the equivalent of hovering it with the mouse.
+        self._grid_peek = False
         # Progressive loading: a monotonically increasing token identifies the
         # latest grid render so that a stale background decode can't overwrite a
         # newer view, plus a reference to the running loader to keep it alive.
@@ -327,6 +358,8 @@ class ImageViewer(QWidget):
             self._on_cell_click_requested)
         self.scroll_area.cell_context_menu_requested.connect(
             self._on_cell_context_menu_requested)
+        self.scroll_area.cell_hovered.connect(self._on_cell_hovered)
+        self.scroll_area.hover_left.connect(self._on_hover_left)
         self.image_label.image_loaded.connect(self._on_image_loaded)
 
         self._resize_debounce_timer = QTimer(self)
@@ -640,9 +673,12 @@ class ImageViewer(QWidget):
             return
         self._grid_mode = False
         self._grid_cell_cache.clear()
+        self._grid_cell_layout = []
         self._grid_current_cell_rect = None
         self._grid_marked_paths = set()
         self._grid_proxy_indices = None
+        self._grid_hover_position = None
+        self._grid_peek = False
         # Invalidate any in-flight background decode so its result is ignored on
         # arrival. The loader keeps its own reference until it finishes (it
         # removes itself in _on_grid_cells_loaded), so we must not drop it here.
@@ -666,6 +702,73 @@ class ImageViewer(QWidget):
 
     def is_grid_mode(self) -> bool:
         return self._grid_mode
+
+    def _grid_dimming_active(self) -> bool:
+        """True when a difference tag is focused so some cells are dimmed.
+
+        Dimming applies only when the marked ("has tag") images are a
+        non-empty strict subset of the currently displayed window; a common
+        tag (all marked) or no focus (none marked) leaves every cell full.
+        """
+        if not self._grid_marked_paths or self._grid_proxy_indices is None:
+            return False
+        window_indices, _ = self._grid_window(
+            self._grid_proxy_indices, self._grid_current_position,
+            self._grid_cell_cap)
+        if not window_indices:
+            return False
+        marked = 0
+        for proxy_index in window_indices:
+            image: Image = self.proxy_image_list_model.data(
+                proxy_index, Qt.ItemDataRole.UserRole)
+            if image is not None and str(image.path) in self._grid_marked_paths:
+                marked += 1
+        return 0 < marked < len(window_indices)
+
+    def _rerender_grid_in_place(self):
+        self._render_grid(self._grid_proxy_indices,
+                          self._grid_current_position,
+                          self._grid_cell_cap, preserve_view=True)
+
+    @Slot(QPoint)
+    def _on_cell_hovered(self, viewport_point: QPoint):
+        if not self._grid_mode or self._grid_proxy_indices is None:
+            return
+        # Hover only matters while some cells are dimmed; otherwise there's
+        # nothing to light up and a re-render would be wasted work.
+        if not self._grid_dimming_active():
+            if self._grid_hover_position is not None:
+                self._grid_hover_position = None
+            return
+        position = self._cell_position_at(viewport_point)
+        if position == self._grid_hover_position:
+            return
+        self._grid_hover_position = position
+        self._rerender_grid_in_place()
+
+    @Slot()
+    def _on_hover_left(self):
+        if self._grid_hover_position is None:
+            return
+        self._grid_hover_position = None
+        if (self._grid_mode and self._grid_proxy_indices is not None
+                and self._grid_dimming_active()):
+            self._rerender_grid_in_place()
+
+    def set_grid_peek(self, enabled: bool):
+        """Reveal the current (highlighted) cell at full opacity while held.
+
+        The keyboard equivalent of hovering the current cell: lets a
+        keyboard-only user see a dimmed (without-tag) current image clearly
+        before deciding whether to add the focused tag to it.
+        """
+        enabled = bool(enabled)
+        if enabled == self._grid_peek:
+            return
+        self._grid_peek = enabled
+        if (self._grid_mode and self._grid_proxy_indices is not None
+                and self._grid_dimming_active()):
+            self._rerender_grid_in_place()
 
     def refresh_grid_paths(self, changed_paths: set[str]):
         """Re-decode grid cells whose image file changed on disk.
@@ -843,30 +946,56 @@ class ImageViewer(QWidget):
 
     def _build_grid_pixmap(self, window_indices: list[QModelIndex],
                            highlight_position: int) -> QPixmap:
-        count = max(1, len(window_indices))
+        window_start = self._grid_current_position - highlight_position
+        cell_infos: list[tuple[QModelIndex, Image, int, bool]] = []
+        marked_count = 0
+        for position, proxy_index in enumerate(window_indices):
+            image: Image = self.proxy_image_list_model.data(
+                proxy_index, Qt.ItemDataRole.UserRole)
+            is_marked = str(image.path) in self._grid_marked_paths
+            if is_marked:
+                marked_count += 1
+            cell_infos.append(
+                (proxy_index, image, window_start + position, is_marked))
+        # Dim the cells that don't contain the focused tag, but only when the
+        # marked images are a non-empty strict subset (a focused difference
+        # tag). A common tag (all marked) or no focus leaves every cell full.
+        dim_active = 0 < marked_count < len(cell_infos)
+        count = max(1, len(cell_infos))
         geometry_count = self._grid_geometry_count()
         columns = max(1, math.ceil(math.sqrt(geometry_count)))
-        rows = math.ceil(count / columns)
         cell = self._grid_cell_size(geometry_count)
         gap = GRID_GAP_PX
         total_width = columns * cell + (columns + 1) * gap
+        rows = math.ceil(count / columns)
         total_height = rows * cell + (rows + 1) * gap
         canvas = QPixmap(total_width, total_height)
         canvas.fill(self.palette().color(QPalette.ColorRole.Window))
         painter = QPainter(canvas)
         self._grid_current_cell_rect = None
-        for position, proxy_index in enumerate(window_indices):
+        self._grid_cell_layout = []
+
+        for position, (proxy_index, image, absolute_position, is_marked) \
+                in enumerate(cell_infos):
             row = position // columns
             column = position % columns
             x = gap + column * (cell + gap)
             y = gap + row * (cell + gap)
-            image: Image = self.proxy_image_list_model.data(
-                proxy_index, Qt.ItemDataRole.UserRole)
+            cell_rect = QRect(x, y, cell, cell)
+            self._grid_cell_layout.append((cell_rect, absolute_position))
             # Prefer the sharp cached image; fall back to the list thumbnail as
             # an instant placeholder until the background decode fills the cache.
             source_pixmap = self._grid_cell_cache.get(str(image.path))
             if source_pixmap is None or source_pixmap.isNull():
                 source_pixmap = self._get_cell_thumbnail(proxy_index)
+            # A without-tag cell is dimmed, except the cell under the cursor
+            # (hover) and, while peeking, the current cell. The current cell is
+            # otherwise dimmed like any other so its brightness honestly
+            # reflects whether it has the focused tag.
+            is_current = absolute_position == self._grid_current_position
+            should_dim = (dim_active and not is_marked
+                          and absolute_position != self._grid_hover_position
+                          and not (is_current and self._grid_peek))
             if not source_pixmap.isNull():
                 footprint = self._cell_footprint(image, source_pixmap, cell)
                 fitted = source_pixmap.scaled(
@@ -874,24 +1003,19 @@ class ImageViewer(QWidget):
                     Qt.TransformationMode.SmoothTransformation)
                 offset_x = x + (cell - fitted.width()) // 2
                 offset_y = y + (cell - fitted.height()) // 2
+                if should_dim:
+                    painter.setOpacity(GRID_DIM_OPACITY)
                 painter.drawPixmap(offset_x, offset_y, fitted)
-            if str(image.path) in self._grid_marked_paths:
-                # Distinct (amber) inset border marks images that contain the
-                # tag focused in the Differences list. Drawn inside the cell so
-                # it stays visible even under the current-cell highlight.
-                mark_pen = QPen(QColor(255, 176, 0))
-                mark_pen.setWidth(GRID_HIGHLIGHT_WIDTH_PX)
-                painter.setPen(mark_pen)
-                m = GRID_HIGHLIGHT_WIDTH_PX
-                painter.drawRect(x + m, y + m, cell - 2 * m, cell - 2 * m)
-            if position == highlight_position:
+                if should_dim:
+                    painter.setOpacity(1.0)
+            if absolute_position == self._grid_current_position:
                 pen = QPen(self.palette().color(QPalette.ColorRole.Highlight))
                 pen.setWidth(GRID_HIGHLIGHT_WIDTH_PX)
                 painter.setPen(pen)
                 inset = GRID_HIGHLIGHT_WIDTH_PX // 2
                 painter.drawRect(x - inset, y - inset,
                                  cell + 2 * inset, cell + 2 * inset)
-                self._grid_current_cell_rect = QRect(x, y, cell, cell)
+                self._grid_current_cell_rect = cell_rect
         painter.end()
         return canvas
 
@@ -925,25 +1049,10 @@ class ImageViewer(QWidget):
         within ``self._grid_proxy_indices``, or None if the point is in a gap,
         outside the grid, or over an empty cell.
         """
-        if self._grid_proxy_indices is None:
-            return None
-        window_indices, highlight_position = self._grid_window(
-            self._grid_proxy_indices, self._grid_current_position,
-            self._grid_cell_cap)
-        # Absolute position of the first windowed cell within the full list.
-        window_start = self._grid_current_position - highlight_position
-        geometry_count = self._grid_geometry_count()
-        columns = max(1, math.ceil(math.sqrt(geometry_count)))
-        cell = self._grid_cell_size(geometry_count)
-        gap = GRID_GAP_PX
-        for position in range(len(window_indices)):
-            row = position // columns
-            column = position % columns
-            x = gap + column * (cell + gap)
-            y = gap + row * (cell + gap)
-            if (x <= composite_x < x + cell
-                    and y <= composite_y < y + cell):
-                return window_start + position
+        for rect, absolute_position in self._grid_cell_layout:
+            if (rect.x() <= composite_x < rect.x() + rect.width()
+                    and rect.y() <= composite_y < rect.y() + rect.height()):
+                return absolute_position
         return None
 
     def _cell_position_at(self, viewport_point: QPoint) -> int | None:
@@ -1001,4 +1110,3 @@ class ImageViewer(QWidget):
                 viewport_point)
             self.grid_cell_context_menu_requested.emit(proxy_index,
                                                        global_point)
-

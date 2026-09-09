@@ -342,8 +342,9 @@ Where you edit the current image's caption.
   token limit. A green **`Complete`** label appears when the image is marked as
   complete.
 - With **multiple images selected**, the pane groups their tags into **`Common`**
-  and **`Differences`** lists and shows a **scope selector** for where new tags
-  go — see [Tagging variant images](#tagging-variant-images).
+  and **`Differences`** (each with a `k/N` badge) and adds a **`Current image
+  only`** toggle for where new tags go — see
+  [Tagging variant images](#tagging-variant-images).
 
 <p align='center'>
   <img src='images/TagGUI_Tag_Mode.png' alt='TagGUI Plus Tag Mode' style='width: 42%; margin-right: 40px;'>
@@ -390,26 +391,36 @@ When you **select two or more images** (with the feature enabled in
   across all of them at once. The **current** image has a **blue outline**; use
   `Left` / `Right` to move the current image through the selection without
   changing what is selected.
-- **Grouped Image Tags pane** — the tag list splits into two:
-  - **`Common`** — tags present on **every** selected image.
-  - **`Differences`** — tags on **some but not all** of them, each showing a
-    `k/N` badge (how many of the selected images have the tag). Selecting a
-    Differences tag outlines the images that contain it in **orange** in the
-    grid.
+- **Grouped Image Tags pane** — the pane shows a single combined tag list, but
+  each tag now carries a **`k/N` badge** for how many of the selected images
+  have it:
+  - **`Common`** tags are on **every** selected image (the badge reads `N/N`).
+  - **`Differences`** tags are on **some but not all** of them (`k/N`, with `k`
+    below `N`). Selecting a Differences tag **dims the grid images that don't
+    have it**, so the ones that do stand out. Hover an image to brighten it
+    briefly, or — for keyboard use — **hold `Ctrl`** to brighten the current
+    image while you decide whether to add the tag to it.
 
-A **scope selector** at the top of the pane controls where new tags and edits
-go:
+A **`Current image only`** toggle at the top of the pane controls where the
+`Add Tag` box adds tags:
 
-- **`All selected images`** (default) — the `Add Tag` box and tag edits apply to
-  the whole selection.
-- **`Current image only`** — they apply to just the current (blue-outlined)
-  image, so you can adjust one variant without touching the rest.
+- **off** (default) — tags go to **all selected images**.
+- **on** (the button highlights) — tags go to just the **current**
+  (blue-outlined) image, so you can adjust one variant without touching the rest.
 
-Both the `Common` and `Differences` lists behave like the normal tag list:
+You can also **right-click any tag** to *Add to* / *Remove from* **all selected**
+or **the current image**, applying a single tag to either scope without changing
+the toggle.
+
+The grouped list behaves like the normal tag list:
 double-click to rename, `Delete` to remove, copy the selected tags, look a tag up
 on a wiki, or assign it to a category. Tags keep a **stable position** as you
 edit, so removing a tag from one image only updates its `k/N` count instead of
-reshuffling the list.
+reshuffling the list. At the bottom of the pane, the **`X common` /
+`Y differences` counts** double as **filters**: click one to show only those
+tags, and click it again to show everything. Choosing `differences` also turns
+the `Current image only` toggle on and `common` turns it off, so the Add Tag
+scope matches what you're looking at.
 
 > [!NOTE]
 > You can turn this off (and always keep the single-image view) with
@@ -621,6 +632,11 @@ you choose to caption **all selected images** or **only the current image**
 (handy in the [grid view](#tagging-variant-images) when you only want to redo one
 variant), and whether to **show an alert when it finishes**. Captioning a single
 image runs immediately without this prompt.
+
+After a run, any tags it **added or increased the count of** are flagged with a
+small **amber dot** in the tag list (in both the single-image and grouped views),
+so you can review what changed at a glance. Selecting a flagged tag clears its
+dot.
 
 ### Supported models
 
@@ -844,8 +860,8 @@ shortcuts`**; the defaults are listed below.
 - **Right-click a tag:** copy it, view it on the Danbooru/Gelbooru wiki, or
   assign/clear its category.
 - With **multiple images selected**, tags are grouped into `Common` and
-  `Differences` lists, and the scope selector sends new tags to all selected
-  images or only the current one — see
+  `Differences` (each with a `k/N` badge), and the `Current image only` toggle
+  sends new tags to all selected images or only the current one — see
   [Tagging variant images](#tagging-variant-images).
 
 ### All Tags pane

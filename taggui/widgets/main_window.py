@@ -390,6 +390,22 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
 
     def eventFilter(self, obj, event):
+        # Grid-view hold-to-peek robustness: the per-widget peek handlers (in
+        # ImageTagsEditor.eventFilter and ImageListView) turn peek ON when Ctrl
+        # is pressed and OFF when it is released. If a modal dialog (e.g. the
+        # undo confirmation) opens while Ctrl is held, it steals focus, so the
+        # Ctrl *release* never reaches those handlers and the current grid cell
+        # stays lit. Catch the release here at the application level (it sees
+        # the event regardless of which widget has focus) and also clear peek
+        # whenever a dialog appears, so the cell can never get stuck bright.
+        editor = getattr(self, 'image_tags_editor', None)
+        if editor is not None and editor.is_group_mode():
+            if (event.type() == QEvent.Type.KeyRelease
+                    and event.key() == Qt.Key.Key_Control
+                    and not event.isAutoRepeat()):
+                editor.set_grid_peek(False)
+            elif event.type() == QEvent.Type.Show and isinstance(obj, QDialog):
+                editor.set_grid_peek(False)
         if event.type() == QEvent.Type.Show and isinstance(obj, QDialog):
             self.apply_dialog_title_bar_theme(obj)
         if (event.type() == QEvent.Type.Show
@@ -1714,6 +1730,8 @@ class MainWindow(QMainWindow):
             self.record_newly_added_library_tags)
         self.image_tags_editor.grid_mark_paths_changed.connect(
             self.image_viewer.set_marked_paths)
+        self.image_tags_editor.grid_peek_changed.connect(
+            self.image_viewer.set_grid_peek)
         self.image_tags_editor.danbooru_wiki_requested.connect(
             self.show_danbooru_wiki_dialog)
         self.image_tags_editor.gelbooru_wiki_requested.connect(
@@ -2095,8 +2113,12 @@ class MainWindow(QMainWindow):
     def connect_auto_captioner_signals(self):
         self.auto_captioner.captioning_started.connect(
             self.clear_pending_auto_caption_category_tags)
+        self.auto_captioner.captioning_started.connect(
+            self.image_tags_editor.begin_auto_caption_run)
         self.auto_captioner.captioning_finished.connect(
             self.schedule_pending_auto_caption_category_prompt)
+        self.auto_captioner.captioning_finished.connect(
+            self.image_tags_editor.end_auto_caption_run)
         self.auto_captioner.caption_generated.connect(
             self.handle_auto_caption_generated)
         self.auto_captioner.caption_generated.connect(

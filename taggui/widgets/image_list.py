@@ -508,6 +508,14 @@ class ImageListView(ElidedToolTipListView):
     def keyPressEvent(self, event):
         key = event.key()
         modifiers = event.modifiers()
+        # Hold-to-peek: while the thumbnails have focus in grouped (grid) mode,
+        # holding Ctrl brightens the current grid cell (keyboard equivalent of
+        # hovering it). Ctrl is observed but NOT consumed, so Ctrl+key shortcuts
+        # keep working. Kept in sync with GRID_PEEK_KEY in image_tags_editor.
+        editor = getattr(self, 'image_tags_editor', None)
+        if (editor is not None and editor.is_group_mode()
+                and key == Qt.Key.Key_Control and not event.isAutoRepeat()):
+            editor.set_grid_peek(True)
         arrow_keys = (Qt.Key.Key_Left, Qt.Key.Key_Right,
                       Qt.Key.Key_Up, Qt.Key.Key_Down)
         # With a multi-image selection, keep the arrow keys "inside" the
@@ -536,6 +544,15 @@ class ImageListView(ElidedToolTipListView):
             editor.tag_input_box.insert(event.text())
             return
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        # Release the hold-to-peek started in keyPressEvent (see there).
+        editor = getattr(self, 'image_tags_editor', None)
+        if (editor is not None and editor.is_group_mode()
+                and event.key() == Qt.Key.Key_Control
+                and not event.isAutoRepeat()):
+            editor.set_grid_peek(False)
+        super().keyReleaseEvent(event)
 
     def _should_redirect_typing_to_tag_input(self, event: QKeyEvent) -> bool:
         """Whether a keystroke in the thumbnails should start a new tag.
