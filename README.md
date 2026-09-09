@@ -416,10 +416,11 @@ The grouped list behaves like the normal tag list:
 double-click to rename, `Delete` to remove, copy the selected tags, look a tag up
 on a wiki, or assign it to a category. Tags keep a **stable position** as you
 edit, so removing a tag from one image only updates its `k/N` count instead of
-reshuffling the list. An **`Only differences`** button (where `Natural language
-mode` sits for single images) hides the `Common` tags so you can focus on what
-varies, and the running **`Common` / `Differences` counts** are shown at the
-bottom of the pane.
+reshuffling the list. At the bottom of the pane, the **`X common` /
+`Y differences` counts** double as **filters**: click one to show only those
+tags, and click it again to show everything. Choosing `differences` also turns
+the `Current image only` toggle on and `common` turns it off, so the Add Tag
+scope matches what you're looking at.
 
 > [!NOTE]
 > You can turn this off (and always keep the single-image view) with
