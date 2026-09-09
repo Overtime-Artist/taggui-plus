@@ -1,4 +1,5 @@
-from PySide6.QtCore import QEvent, QItemSelectionModel, Qt
+from PySide6.QtCore import QEvent, QItemSelectionModel, QRect, Qt
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (QFrame, QMessageBox, QPlainTextEdit,
                                 QStyledItemDelegate)
 
@@ -40,7 +41,34 @@ class TextEditItemDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         # Add some left padding.
         option.rect.adjust(4, 0, 0, 0)
+        # Draw a subtle amber "review" marker for tags the most recent
+        # Auto-Captioner run added, matching the grouped (grid) view. Only the
+        # Image Tags list carries a ``_recently_captioned`` set, so other views
+        # sharing this delegate (e.g. All Tags) never get a dot. When present,
+        # the dot reserves a little width on the right so it never overlaps the
+        # tag text.
+        view = self.parent()
+        tag = index.data(Qt.ItemDataRole.DisplayRole)
+        marked = bool(tag
+                      and tag in getattr(view, '_recently_captioned', ()))
+        if not marked:
+            super().paint(painter, option, index)
+            return
+        dot_diameter = 6
+        dot_gap = 5
+        dot_reserve = dot_diameter + 2 * dot_gap
+        full_rect = QRect(option.rect)
+        option.rect.adjust(0, 0, -dot_reserve, 0)
         super().paint(painter, option, index)
+        dot_right = full_rect.right() - dot_gap
+        dot_left = dot_right - dot_diameter
+        dot_top = full_rect.center().y() - dot_diameter // 2 + 1
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0xE0, 0xA0, 0x30))
+        painter.drawEllipse(dot_left, dot_top, dot_diameter, dot_diameter)
+        painter.restore()
 
     def createEditor(self, parent, option, index):
         editor = QPlainTextEdit(parent)

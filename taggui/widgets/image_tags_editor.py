@@ -22,6 +22,13 @@ from utils.utils import get_confirmation_dialog_reply
 from widgets.image_list import ImageList
 from widgets.group_tags_panel import GroupTagsPanel
 
+# Key held to "peek" (temporarily brighten) the current grid cell in grouped
+# mode — the keyboard equivalent of hovering it with the mouse. Ctrl is used
+# because it produces no text (so it never interferes with type-to-add-tag) and
+# is observed without being consumed (so Ctrl-based shortcuts still work). Kept
+# here so the thumbnails view (widgets.image_list) and this pane agree on it.
+GRID_PEEK_KEY = Qt.Key.Key_Control
+
 
 class CompleterPopupList(QListView):
     def viewportEvent(self, event):
@@ -278,6 +285,13 @@ class TagInputBox(QLineEdit):
         # single-image fast path and per-add confirmation are skipped.
         self.group_mode_active = False
         self.target_indices_provider = None
+        # Whether the pending commit targets only the current image. Kept in
+        # sync with the editor's "Current image only" scope toggle.
+        self.pending_scope_current = False
+        # Placeholder shown in group mode (states the default scope + count).
+        # Restored after a transient post-commit confirmation.
+        self._group_placeholder = ''
+        self._scope_feedback_timer: Optional[QTimer] = None
         # Connect the library-change signals once. The refresh handler is a
         # no-op while autocomplete is disabled (guarded by `completer_model`),
         # so it is safe to keep connected even when the completer is torn down.
@@ -447,6 +461,11 @@ class TagInputBox(QLineEdit):
         self.add_new_tags_to_library(tags_to_add)
         self.tags_addition_requested.emit(tags_to_add, selected_image_indices)
         self.flash_added_feedback()
+        if self.group_mode_active:
+            # Confirm which scope the tag(s) went to, so the (now hidden)
+            # persistent selector isn't missed.
+            self._show_scope_feedback(self.pending_scope_current,
+                                      len(selected_image_indices))
 
     def _all_target_images_have_tags(self, tags: list[str],
                                      image_indices: list) -> bool:
@@ -535,6 +554,42 @@ class TagInputBox(QLineEdit):
         """
         if self._new_tag_auto_select_disabled():
             self._flash_success()
+
+    def set_group_placeholder(self, text: str):
+        """Set the Add Tag box placeholder shown in group mode (stating the
+        default scope and selected-image count). Applied immediately unless a
+        transient post-commit confirmation is currently showing."""
+        self._group_placeholder = text
+        if self._scope_feedback_timer is None:
+            self.setPlaceholderText(text)
+
+    def reset_group_placeholder(self):
+        """Return to the plain single-image placeholder when leaving group mode."""
+        if self._scope_feedback_timer is not None:
+            self._scope_feedback_timer.stop()
+            self._scope_feedback_timer = None
+        self._group_placeholder = ''
+        self.setPlaceholderText('Add Tag')
+
+    def _show_scope_feedback(self, scope_current: bool, count: int):
+        """Briefly replace the placeholder with a confirmation naming the scope
+        the just-added tag went to, then restore the group placeholder."""
+        if scope_current:
+            message = '\u2713 Added to current image'
+        else:
+            message = f'\u2713 Added to all {count} images'
+        self.setPlaceholderText(message)
+        if self._scope_feedback_timer is not None:
+            self._scope_feedback_timer.stop()
+        self._scope_feedback_timer = QTimer(self)
+        self._scope_feedback_timer.setSingleShot(True)
+        self._scope_feedback_timer.timeout.connect(
+            self._restore_group_placeholder)
+        self._scope_feedback_timer.start(1600)
+
+    def _restore_group_placeholder(self):
+        self._scope_feedback_timer = None
+        self.setPlaceholderText(self._group_placeholder or 'Add Tag')
 
     def _flash_border(self, color: str):
         """Turn the input box border `color` for `FLASH_DURATION_MS`, then
@@ -638,6 +693,38 @@ class ImageTagsList(ElidedToolTipListView):
         # this, Qt paints the selection with the muted "inactive" color, so a
         # newly added tag would not appear highlighted.
         self._sync_inactive_selection_colors()
+        # Tags the most recent Auto-Captioner run added to this image. The
+        # delegate paints a small amber "review" dot next to each so the user
+        # can see at a glance which tags to check (mirrors the grouped view).
+        self._recently_captioned: set[str] = set()
+        self.selectionModel().selectionChanged.connect(
+            self._clear_captioned_markers_on_selection)
+
+    def set_recently_captioned(self, tags):
+        """Flag the given tags as newly auto-captioned and repaint."""
+        new_marks = set(tags)
+        if new_marks != self._recently_captioned:
+            self._recently_captioned = new_marks
+            self.viewport().update()
+
+    def clear_recently_captioned(self):
+        """Drop all auto-caption review markers and repaint if needed."""
+        if self._recently_captioned:
+            self._recently_captioned = set()
+            self.viewport().update()
+
+    def _clear_captioned_markers_on_selection(self, *args):
+        # Once the user selects a captioned-tag marker it has served its
+        # "review me" purpose, so drop the marker for any now-selected tag.
+        if not self._recently_captioned:
+            return
+        selected = {self.image_tag_list_model.data(index,
+                                                   Qt.ItemDataRole.DisplayRole)
+                    for index in self.selectedIndexes()}
+        newly_cleared = self._recently_captioned & selected
+        if newly_cleared:
+            self._recently_captioned -= newly_cleared
+            self.viewport().update()
 
     def _sync_inactive_selection_colors(self):
         palette = self.palette()
@@ -849,6 +936,10 @@ class ImageTagsEditor(QDockWidget):
     # The set of image file paths whose cells should be marked in the grid
     # preview (the images containing the currently-focused Differences tag).
     grid_mark_paths_changed = Signal(list)
+    # Emitted while the keyboard "peek" key is held in grouped/grid mode, so the
+    # grid can reveal the current (highlighted) cell at full brightness (the
+    # keyboard equivalent of hovering it). True on press, False on release.
+    grid_peek_changed = Signal(bool)
 
     def __init__(self, image_list_model: ImageListModel,
                  proxy_image_list_model: ProxyImageListModel,
@@ -864,6 +955,9 @@ class ImageTagsEditor(QDockWidget):
         self.tag_separator = tag_separator
         self.image_index = None
         self.is_loading_image_tags = False
+        # Snapshot of the displayed image's tags taken when an Auto-Captioner
+        # run starts, so the run's newly added tags can be flagged for review.
+        self._auto_caption_snapshot: set[str] | None = None
 
         # Each `QDockWidget` needs a unique object name for saving its state.
         self.setObjectName('image_tags_editor')
@@ -878,7 +972,17 @@ class ImageTagsEditor(QDockWidget):
         self.natural_language_mode_check_box.setCheckable(True)
         self.natural_language_mode_check_box.setAutoDefault(False)
         self.natural_language_mode_check_box.setDefault(False)
-        self._update_nl_button_style()
+        # Grouped-view scope toggle: when checked, the Add Tag box adds only to
+        # the current (highlighted) image; unchecked adds to all selected. Sits
+        # in the same top slot as the NL button and highlights blue the same
+        # way. The common/differences summary auto-sets it (differences -> on,
+        # common -> off); manually toggling it never changes the filter.
+        self.scope_button = QPushButton('Current image only')
+        self.scope_button.setCheckable(True)
+        self.scope_button.setAutoDefault(False)
+        self.scope_button.setDefault(False)
+        self.scope_button.setVisible(False)
+        self.scope_button.toggled.connect(self._on_scope_toggled)
         self.image_tags_list = ImageTagsList(self.image_tag_list_model,
                                              tag_library_model)
         # Let the tag list redirect typing to the Add Tag box.
@@ -893,19 +997,14 @@ class ImageTagsEditor(QDockWidget):
         self.image_tags_list.gelbooru_wiki_requested.connect(
             self.gelbooru_wiki_requested.emit)
 
-        # Group (multi-image) mode: a scope selector for the Add Tag box and the
-        # Common/Differences panel. Both are hidden until group mode is entered.
-        self.scope_row = QWidget()
-        scope_layout = QHBoxLayout(self.scope_row)
-        scope_layout.setContentsMargins(0, 0, 0, 0)
-        scope_layout.addWidget(QLabel('Add to:'))
-        self.scope_selector = QComboBox()
-        self.scope_selector.addItems(['All selected images',
-                                      'Current image only'])
-        scope_layout.addWidget(self.scope_selector, 1)
-        self.scope_row.setVisible(False)
+        # Group (multi-image) mode: the unified grouped-tags panel. Hidden until
+        # group mode is entered. The Add Tag box's scope is chosen by the
+        # persistent "Current image only" toggle in the top button row.
         self.group_tags_panel = GroupTagsPanel(tag_library_model)
         self.group_tags_panel.setVisible(False)
+        # Apply the shared checked-button style to both the Natural language
+        # mode button and the scope toggle.
+        self._update_nl_button_style()
         self.group_tags_panel.remove_from_all_requested.connect(
             self._remove_group_tags_from_all)
         self.group_tags_panel.add_to_all_requested.connect(
@@ -926,6 +1025,8 @@ class ImageTagsEditor(QDockWidget):
             self.gelbooru_wiki_requested.emit)
         self.group_tags_panel.rename_tag_requested.connect(
             self._rename_group_tag)
+        self.group_tags_panel.filter_mode_changed.connect(
+            self._on_filter_mode_changed)
         # Group-mode state.
         self._group_mode = False
         self._group_source_indices: list[QModelIndex] = []
@@ -938,10 +1039,9 @@ class ImageTagsEditor(QDockWidget):
         # swallow the arrows (the tag lists, the scope selector, the collapse
         # header). The Add Tag box is included too, but only cycles when it is
         # empty so typed text can still be edited with the arrows.
-        for group_widget in (self.scope_selector, self.group_tags_panel,
-                              self.group_tags_panel.common_list,
-                              self.group_tags_panel.partial_list,
-                              self.group_tags_panel.common_header,
+        for group_widget in (self.group_tags_panel,
+                              self.group_tags_panel.tag_list,
+                              self.scope_button,
                               self.tag_input_box):
             group_widget.installEventFilter(self)
 
@@ -959,6 +1059,11 @@ class ImageTagsEditor(QDockWidget):
         self.token_row = QWidget()
         token_count_layout = QHBoxLayout(self.token_row)
         token_count_layout.setContentsMargins(0, 0, 0, 0)
+        # In grouped mode this bottom row shows the common/differences summary
+        # (hidden for a single image); the token count / Complete label show for
+        # a single image instead.
+        self.group_tags_panel.summary_label.setVisible(False)
+        token_count_layout.addWidget(self.group_tags_panel.summary_label)
         token_count_layout.addWidget(self.token_count_label)
         token_count_layout.addStretch()
         token_count_layout.addWidget(self.complete_label)
@@ -966,7 +1071,10 @@ class ImageTagsEditor(QDockWidget):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.addWidget(self.natural_language_mode_check_box)
-        layout.addWidget(self.scope_row)
+        # The Add Tag scope toggle sits in the same top slot as the "Natural
+        # language mode" button (only one is visible at a time) and is hidden
+        # until grouped mode is entered.
+        layout.addWidget(self.scope_button)
         layout.addWidget(self.tag_input_box)
         layout.addWidget(self.image_tags_list)
         layout.addWidget(self.group_tags_panel)
@@ -996,13 +1104,16 @@ class ImageTagsEditor(QDockWidget):
     def _update_nl_button_style(self):
         is_dark = self.palette().windowText().color().lightness() > 128
         color = '#2a82da' if is_dark else '#308cc6'
-        self.natural_language_mode_check_box.setStyleSheet(
+        checked_style = (
             f'QPushButton:checked {{'
             f' background-color: {color};'
             f' color: white;'
             f' border: 1px solid {color};'
             f'}}'
         )
+        self.natural_language_mode_check_box.setStyleSheet(checked_style)
+        # The scope toggle highlights the same way when active.
+        self.scope_button.setStyleSheet(checked_style)
 
     def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase):
         self.tokenizer = tokenizer
@@ -1056,8 +1167,7 @@ class ImageTagsEditor(QDockWidget):
         shortcut to decide whether this pane should provide the search tag.
         """
         if self._group_mode:
-            return (self.group_tags_panel.common_list.hasFocus()
-                    or self.group_tags_panel.partial_list.hasFocus())
+            return self.group_tags_panel.tag_list.hasFocus()
         return self.image_tags_list.hasFocus()
 
     def selected_tag_for_wiki(self) -> str:
@@ -1167,6 +1277,12 @@ class ImageTagsEditor(QDockWidget):
             self.save_natural_language_prompt()
         next_image_index = self.proxy_image_list_model.mapToSource(
             proxy_image_index)
+        # Auto-caption review markers belong to one image, so drop them when the
+        # displayed image actually changes (but keep them across in-place tag
+        # edits such as undo/redo of the same image).
+        if (self.image_index is None
+                or self.image_index.row() != next_image_index.row()):
+            self.image_tags_list.clear_recently_captioned()
         self.image_index = next_image_index
         image: Image = self.proxy_image_list_model.data(
             proxy_image_index, Qt.ItemDataRole.UserRole)
@@ -1201,7 +1317,9 @@ class ImageTagsEditor(QDockWidget):
         is_natural_language_mode = (
             self.natural_language_mode_check_box.isChecked())
         self.natural_language_mode_check_box.setVisible(True)
-        self.scope_row.setVisible(False)
+        self.scope_button.setVisible(False)
+        self.group_tags_panel.summary_label.setVisible(False)
+        self.token_count_label.setVisible(True)
         self.group_tags_panel.setVisible(False)
         self.token_row.setVisible(True)
         self.tag_input_box.setVisible(not is_natural_language_mode)
@@ -1218,11 +1336,18 @@ class ImageTagsEditor(QDockWidget):
         tag_list_had_focus = self.image_tags_list.hasFocus()
         self.natural_language_mode_check_box.setVisible(False)
         self.natural_language_text_edit.setVisible(False)
-        self.token_row.setVisible(False)
         self.image_tags_list.setVisible(False)
-        self.scope_row.setVisible(True)
+        # Grouped controls: the Add Tag scope toggle up top and the clickable
+        # common/differences summary in the bottom status row (in place of the
+        # per-image token count / Complete label).
+        self.scope_button.setVisible(True)
+        self.token_count_label.setVisible(False)
+        self.complete_label.setVisible(False)
+        self.group_tags_panel.summary_label.setVisible(True)
+        self.token_row.setVisible(True)
         self.group_tags_panel.setVisible(True)
         self.tag_input_box.setVisible(True)
+        self._update_group_placeholder()
         if tag_list_had_focus:
             # Keep focus on the thumbnails so arrow cycling and typing a new tag
             # keep working after entering the grouped view.
@@ -1239,6 +1364,12 @@ class ImageTagsEditor(QDockWidget):
         """
         if self._group_mode and event.type() == QEvent.Type.KeyPress:
             key = event.key()
+            if (key == GRID_PEEK_KEY
+                    and watched is self.group_tags_panel.tag_list
+                    and not event.isAutoRepeat()):
+                # Hold-to-peek: brighten the current grid cell while Ctrl is
+                # held. Observed, not consumed, so Ctrl+key shortcuts still work.
+                self.set_grid_peek(True)
             if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
                 # In the Add Tag box, only cycle when there's no text to edit.
                 if watched is self.tag_input_box and self.tag_input_box.text():
@@ -1254,8 +1385,7 @@ class ImageTagsEditor(QDockWidget):
                 if list_view._should_redirect_typing_to_tag_input(event):
                     self.raise_()
                     panel = self.group_tags_panel
-                    if watched is panel.partial_list \
-                            or watched is panel.common_list:
+                    if watched is panel.tag_list:
                         # Match the normal Image Tags list: after the tag is
                         # added, return focus to this list and reselect the tag
                         # that was highlighted when typing began (the model
@@ -1267,10 +1397,63 @@ class ImageTagsEditor(QDockWidget):
                     self.tag_input_box.setFocus()
                     self.tag_input_box.insert(event.text())
                     return True
+        if (self._group_mode and event.type() == QEvent.Type.KeyRelease
+                and event.key() == GRID_PEEK_KEY
+                and watched is self.group_tags_panel.tag_list
+                and not event.isAutoRepeat()):
+            self.set_grid_peek(False)
         return super().eventFilter(watched, event)
+
+    def set_grid_peek(self, enabled: bool):
+        """Signal the grid to peek (True) or stop peeking (False) the current
+        cell. No-op outside grouped mode."""
+        if not self._group_mode and enabled:
+            return
+        self.grid_peek_changed.emit(bool(enabled))
 
     def is_group_mode(self) -> bool:
         return self._group_mode
+
+    def begin_auto_caption_run(self):
+        """Forward an auto-caption run start to the grouped tag panel so it can
+        flag which tags the run touches. In single-image mode, snapshot the
+        displayed image's tags instead."""
+        if self._group_mode:
+            self.group_tags_panel.begin_auto_caption_run()
+            return
+        self._auto_caption_snapshot = set(
+            self.image_tag_list_model.stringList())
+
+    def end_auto_caption_run(self):
+        """Forward an auto-caption run finish to the grouped tag panel so it can
+        mark the touched tags for review. In single-image mode, flag the tags
+        the run added to the displayed image."""
+        if self._group_mode:
+            self.group_tags_panel.end_auto_caption_run()
+            return
+        if self._auto_caption_snapshot is None:
+            return
+        before = self._auto_caption_snapshot
+        self._auto_caption_snapshot = None
+        touched = set(self.image_tag_list_model.stringList()) - before
+        self.image_tags_list.set_recently_captioned(touched)
+
+    @Slot(bool)
+    def _on_scope_toggled(self, checked: bool):
+        """Persist the Add Tag scope. When checked, the Add Tag box (Enter or
+        Ctrl+Enter) targets only the current image; unchecked targets all
+        selected. Does not touch the tag-list filter."""
+        self.tag_input_box.pending_scope_current = bool(checked)
+
+    @Slot(str)
+    def _on_filter_mode_changed(self, mode: str):
+        """Auto-set the scope toggle from the common/differences filter:
+        'differences' -> current image only, 'common' -> all selected. 'all'
+        leaves the toggle as the user last set it."""
+        if mode == 'differences':
+            self.scope_button.setChecked(True)
+        elif mode == 'common':
+            self.scope_button.setChecked(False)
 
     def current_group_image_index(self) -> Optional[QModelIndex]:
         """Source-model index of the current image in the grouped (grid) view.
@@ -1291,6 +1474,10 @@ class ImageTagsEditor(QDockWidget):
         self._group_current_index = current_index
         self.image_index = current_index
         self.tag_input_box.group_mode_active = True
+        # Start each grouped session from a clean slate: no filter, scope off
+        # (add to all). The filter can then drive the scope as the user clicks.
+        self.group_tags_panel.reset_filter()
+        self.scope_button.setChecked(False)
         self._refresh_group_panel()
         self._apply_group_visibility()
 
@@ -1311,6 +1498,7 @@ class ImageTagsEditor(QDockWidget):
         self.image_index = current_index
         if not same_selection:
             self._refresh_group_panel()
+        self._update_group_placeholder()
 
     @Slot(list)
     def _on_partial_focus_changed(self, tags: list[str]):
@@ -1338,6 +1526,9 @@ class ImageTagsEditor(QDockWidget):
         self._group_source_indices = []
         self._group_current_index = None
         self.tag_input_box.group_mode_active = False
+        self.tag_input_box.reset_group_placeholder()
+        # Make sure a held peek doesn't linger after leaving grouped mode.
+        self.grid_peek_changed.emit(False)
         self.set_natural_language_mode()
 
     def _refresh_group_panel(self, restore_positions: bool = False):
@@ -1349,11 +1540,18 @@ class ImageTagsEditor(QDockWidget):
         self.group_tags_panel.set_images(images,
                                          restore_positions=restore_positions)
 
+    def _update_group_placeholder(self):
+        """Set the Add Tag box placeholder for grouped mode. Scope is chosen by
+        the persistent "Current image only" toggle, so the placeholder is just
+        the plain prompt."""
+        self.tag_input_box.set_group_placeholder('Add Tag')
+
     def _group_add_target_indices(self) -> list[QModelIndex]:
-        """Target images for the Add Tag box, honoring the scope selector."""
+        """Target images for the Add Tag box, honoring the scope toggle
+        ("Current image only" = current image, off = all selected)."""
         if self._group_mode:
-            if self.scope_selector.currentIndex() == 1:
-                # "Current image only".
+            if self.tag_input_box.pending_scope_current:
+                # Scope toggle on: add to just the current (highlighted) image.
                 if self._group_current_index is not None:
                     return [self._group_current_index]
                 return []
@@ -1448,10 +1646,11 @@ class ImageTagsEditor(QDockWidget):
         if (first_changed_index.row() <= self.image_index.row()
                 <= last_changed_index.row()):
             # Preserve the user's current selection across in-place tag edits
-            # such as undo/redo, instead of resetting to the first tag. When
-            # auto-select is on and the edit re-added a tag (e.g. redoing an add
-            # or undoing a delete), select that re-added tag instead, mirroring
-            # the behavior of adding a new tag.
+            # such as undo/redo, instead of resetting to the first tag. An
+            # undo/redo that re-adds a tag now honors the "Do not auto-select
+            # newly added tags" setting: with auto-select on it selects the
+            # re-added tag; with it off it keeps the current selection but still
+            # scrolls the re-added tag into view so the change stays visible.
             previous_row = self.image_tags_list.currentIndex().row()
             had_focus = self.image_tags_list.hasFocus()
             old_tags = self.image_tag_list_model.stringList()
@@ -1462,17 +1661,26 @@ class ImageTagsEditor(QDockWidget):
             new_row_count = len(new_tags)
             if new_row_count == 0:
                 return
+            disabled = self.tag_input_box._new_tag_auto_select_disabled()
+            is_restore = self.image_list_model.is_restoring_history
+            old_tag_set = set(old_tags)
+            added_rows = [row for row, tag in enumerate(new_tags)
+                          if tag not in old_tag_set]
             row_to_select = None
-            if not self.tag_input_box._new_tag_auto_select_disabled():
-                old_tag_set = set(old_tags)
-                added_rows = [row for row, tag in enumerate(new_tags)
-                              if tag not in old_tag_set]
-                if added_rows:
-                    # Select the last re-added tag.
-                    row_to_select = added_rows[-1]
+            row_to_scroll = None
+            if added_rows and not disabled:
+                # Select the last (re-)added tag.
+                row_to_select = added_rows[-1]
+            elif added_rows and is_restore:
+                # Setting on: keep the cursor put, but scroll the re-added tag
+                # into view so the undo/redo's effect is visible.
+                row_to_scroll = added_rows[-1]
             if row_to_select is None and previous_row >= 0:
                 row_to_select = min(previous_row, new_row_count - 1)
             if row_to_select is not None:
                 self.image_tags_list.select_tag(row_to_select)
                 if had_focus:
                     self.image_tags_list.setFocus()
+            if row_to_scroll is not None:
+                self.image_tags_list.scrollTo(
+                    self.image_tag_list_model.index(row_to_scroll))

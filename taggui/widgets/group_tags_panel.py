@@ -1,12 +1,16 @@
-"""Grouped Common/Partial tags view for multi-image (variant) selections.
+﻿"""Unified grouped tags view for multi-image (variant) selections.
 
 When two or more images are selected, the Image Tags pane switches to this
-panel instead of the single-image tag list. It shows:
+panel instead of the single-image tag list. It shows a single flat list of
+every tag across the selection, each with a ``k/N`` badge counting how many of
+the N selected images have it (a *common* tag reads ``N/N``; a *difference*
+reads ``k/N`` with ``k < N``). The list stays in a stable first-appearance
+order that is frozen for the whole review, so cycling the current image never
+reshuffles it.
 
-* **Common tags** — tags present on *every* selected image (the shared base).
-  Collapsible so it can be folded down to a one-line summary.
-* **Differences** — tags present on *some* of the selected images, each with a
-  ``k/N`` badge showing how many of the N selected images have it.
+A "Only differences" filter hides the common tags without reordering anything,
+and selecting a difference tag drives the grid split via
+``partial_focus_changed``.
 
 The panel only computes and displays the aggregate; the actual edits are
 performed by the owning editor/model via the emitted signals, so all changes go
@@ -15,32 +19,34 @@ through the normal undo stack.
 
 from PySide6.QtCore import (QAbstractListModel, QItemSelectionModel,
                             QModelIndex, QSize, Qt, QTimer, Signal, Slot)
-from PySide6.QtGui import QColor, QKeyEvent, QPalette
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QListView,
-                               QMenu, QLabel, QPushButton, QStyle,
+from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPalette
+from PySide6.QtWidgets import (QAbstractItemView, QApplication,
+                               QHBoxLayout,
+                               QListView, QMenu, QLabel,
+                               QStyle,
                                QStyledItemDelegate, QStyleOptionViewItem,
                                QVBoxLayout, QWidget)
 
 from models.tag_library_model import TagLibraryModel
 from utils.image import Image
-from utils.settings import get_tag_separator
+from utils.settings import DEFAULT_SETTINGS, get_settings, get_tag_separator
 
-# Custom roles used by the partial-tags model to carry the per-tag count and
-# the total number of selected images through to the delegate.
+# Custom roles used by the tag model to carry the per-tag count and the total
+# number of selected images through to the delegate.
 COUNT_ROLE = Qt.ItemDataRole.UserRole + 1
 TOTAL_ROLE = Qt.ItemDataRole.UserRole + 2
 
 
-def compute_common_and_partial(
-        images: list[Image]) -> tuple[list[str], list[tuple[str, int]], int]:
-    """Return ``(common, partial, total)`` for a list of images.
+def compute_tag_rows(
+        images: list[Image]) -> tuple[list[tuple[str, int]], int]:
+    """Return ``(rows, total)`` for a list of images.
 
-    ``common`` is the tags present on every image (order of first appearance).
-    ``partial`` is ``(tag, count)`` pairs for tags on some-but-not-all images,
-    also in order of first appearance (consistent with ``common`` and the
-    normal Image Tags list, and stable when a tag's count changes). Each row's
-    ``k/N`` badge conveys the frequency instead. ``total`` is the number of
-    images.
+    ``rows`` is ``(tag, count)`` pairs for every tag present on any of the
+    images, in order of first appearance across the selection (consistent with
+    the normal Image Tags list, and stable when a tag's count changes). ``count``
+    is how many of the images contain the tag, and ``total`` is the number of
+    images, so a tag is *common* when ``count == total`` and a *difference*
+    otherwise.
     """
     total = len(images)
     counts: dict[str, int] = {}
@@ -51,68 +57,16 @@ def compute_common_and_partial(
                 counts[tag] = 0
                 order.append(tag)
             counts[tag] += 1
-    common = [tag for tag in order if counts[tag] == total]
-    partial = [(tag, counts[tag]) for tag in order
-               if 0 < counts[tag] < total]
-    return common, partial, total
+    rows = [(tag, counts[tag]) for tag in order]
+    return rows, total
 
 
-class _CommonTagModel(QAbstractListModel):
-    """List of the common tags, colored by tag category. Editable (rename)."""
+class _UnifiedTagModel(QAbstractListModel):
+    """Flat list of ``(tag, count)`` rows, colored by category. Editable.
 
-    rename_requested = Signal(str, str)
-
-    def __init__(self, tag_library_model: TagLibraryModel):
-        super().__init__()
-        self.tag_library_model = tag_library_model
-        self._tags: list[str] = []
-
-    def set_tags(self, tags: list[str]):
-        self.beginResetModel()
-        self._tags = list(tags)
-        self.endResetModel()
-
-    def rowCount(self, parent=QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self._tags)
-
-    def data(self, index: QModelIndex,
-             role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid():
-            return None
-        tag = self._tags[index.row()]
-        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
-            return tag
-        if role == Qt.ItemDataRole.ForegroundRole:
-            category = self.tag_library_model.get_category_for_tag(tag)
-            if category:
-                color = QColor(category['color'])
-                if color.isValid():
-                    return color
-        return None
-
-    def setData(self, index: QModelIndex, value,
-                role=Qt.ItemDataRole.EditRole) -> bool:
-        if role != Qt.ItemDataRole.EditRole or not index.isValid():
-            return False
-        old_tag = self._tags[index.row()]
-        new_tag = str(value).strip()
-        if new_tag and new_tag != old_tag:
-            # The actual rename resets this model, so it is deferred by the
-            # panel until the in-place editor has closed. Return False so the
-            # view does not try to update the (about-to-be-reset) row itself.
-            self.rename_requested.emit(old_tag, new_tag)
-        return False
-
-    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
-        if not index.isValid():
-            return Qt.ItemFlag.NoItemFlags
-        return (Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsEditable)
-
-
-class _PartialTagModel(QAbstractListModel):
-    """List of ``(tag, count)`` differences, colored by category. Editable."""
+    Carries the per-tag count and the shared total through the count/total
+    roles so the delegate can draw each row's ``k/N`` badge.
+    """
 
     rename_requested = Signal(str, str)
 
@@ -157,6 +111,9 @@ class _PartialTagModel(QAbstractListModel):
         old_tag = self._rows[index.row()][0]
         new_tag = str(value).strip()
         if new_tag and new_tag != old_tag:
+            # The actual rename resets this model, so it is deferred by the
+            # panel until the in-place editor has closed. Return False so the
+            # view does not try to update the (about-to-be-reset) row itself.
             self.rename_requested.emit(old_tag, new_tag)
         return False
 
@@ -169,24 +126,22 @@ class _PartialTagModel(QAbstractListModel):
 
 
 class _UniformHeightDelegate(QStyledItemDelegate):
-    """Item delegate whose row height depends only on the font.
+    """Item delegate whose row height matches the single-image Image Tags list.
 
-    Used for both tag lists so their vertical spacing matches. (The default
-    delegate and a custom-painted delegate can otherwise pick slightly
-    different row heights.)
+    The single-image list uses ``TextEditItemDelegate``, whose ``sizeHint`` adds
+    8 px to the default row height. This mirrors that exactly so the grouped
+    (grid-view) tag list has identical vertical spacing; without it the custom
+    delegate picks a slightly shorter row and the list looks denser.
     """
 
     def sizeHint(self, option: QStyleOptionViewItem,
                  index: QModelIndex) -> QSize:
-        option = QStyleOptionViewItem(option)
-        self.initStyleOption(option, index)
         size = super().sizeHint(option, index)
-        height = max(size.height(), option.fontMetrics.height() + 6)
-        return QSize(size.width(), height)
+        return QSize(size.width(), size.height() + 8)
 
 
-class _PartialTagDelegate(_UniformHeightDelegate):
-    """Draws a partial tag on the left and its ``k/N`` badge on the right."""
+class _TagBadgeDelegate(_UniformHeightDelegate):
+    """Draws a tag on the left and its ``k/N`` badge on the right."""
 
     def paint(self, painter, option: QStyleOptionViewItem,
               index: QModelIndex):
@@ -226,7 +181,24 @@ class _PartialTagDelegate(_UniformHeightDelegate):
         badge = f'{count}/{total}'
         metrics = option.fontMetrics
         badge_width = metrics.horizontalAdvance(badge) + 8
-        content_rect = option.rect.adjusted(8, 0, -8, 0)
+        # Lay the text out in exactly the same place as the single-image Image
+        # Tags list so the two lists align pixel-for-pixel. That list uses
+        # TextEditItemDelegate, which inset the row by +4 and then lets the
+        # style position the text (adding its own margin). Mirror both steps by
+        # asking the style for the text sub-rect of the +4 inset row, instead of
+        # drawing at a hard-coded offset (which omits the style margin).
+        text_option = QStyleOptionViewItem(option)
+        text_option.rect = option.rect.adjusted(4, 0, 0, 0)
+        # subElementRect gives the item's text area, but the style then insets
+        # the text by a further `textMargin` (PM_FocusFrameHMargin + 1) on each
+        # side when it actually draws it. The single-image list goes through the
+        # style, so mirror that inset here; otherwise the grid text sits a few
+        # pixels further left than the single-image list.
+        text_margin = style.pixelMetric(
+            QStyle.PixelMetric.PM_FocusFrameHMargin, option, option.widget) + 1
+        content_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, text_option,
+            option.widget).adjusted(text_margin, 0, -text_margin, 0)
 
         painter.setPen(badge_color)
         painter.drawText(content_rect,
@@ -235,7 +207,29 @@ class _PartialTagDelegate(_UniformHeightDelegate):
                          badge)
 
         tag = index.data(Qt.ItemDataRole.DisplayRole)
-        text_rect = content_rect.adjusted(0, 0, -badge_width, 0)
+        # Draw a subtle "review" marker for tags the most recent Auto-Captioner
+        # run added or increased the count of, so the user can see at a glance
+        # which existing tags were touched. The dot sits just left of the k/N
+        # badge; when present it reserves a little extra width so it never
+        # overlaps the (right-elided) tag text or the badge.
+        panel = self.parent()
+        marked = bool(panel is not None
+                      and tag in getattr(panel, '_recently_captioned', ()))
+        dot_reserve = 0
+        if marked:
+            dot_diameter = 6
+            dot_gap = 5
+            dot_reserve = dot_diameter + 2 * dot_gap
+            dot_color = QColor(0xE0, 0xA0, 0x30)
+            dot_right = content_rect.right() - badge_width - dot_gap
+            dot_left = dot_right - dot_diameter
+            dot_top = content_rect.center().y() - dot_diameter // 2 + 1
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(dot_color)
+            painter.drawEllipse(dot_left, dot_top, dot_diameter, dot_diameter)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+        text_rect = content_rect.adjusted(0, 0, -(badge_width + dot_reserve), 0)
         elided = metrics.elidedText(tag, Qt.TextElideMode.ElideRight,
                                     text_rect.width())
         painter.setPen(text_color)
@@ -349,8 +343,89 @@ class _TagListView(QListView):
         return True
 
 
+class _ClickableLabel(QLabel):
+    """A text label that acts like a link: it emits ``clicked`` when pressed,
+    shows a pointing-hand cursor, and underlines on hover. Its text colour is
+    driven by the parent (bright when active, muted when not) via ``set_color``;
+    the look of the text otherwise never changes.
+    """
+
+    clicked = Signal()
+
+    def __init__(self, text: str = ''):
+        super().__init__(text)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_color(self, color: QColor):
+        self.setStyleSheet(f'color: {color.name()};')
+
+    def _set_underline(self, on: bool):
+        font = self.font()
+        font.setUnderline(on)
+        self.setFont(font)
+
+    def enterEvent(self, event):
+        self._set_underline(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._set_underline(False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class SummaryFilter(QWidget):
+    """The ``N common · M differences`` status text, with each half clickable to
+    filter the tag list. Clicking a half activates that filter (and brightens
+    that half); clicking the active half again returns to showing all tags. The
+    look is unchanged except that the active half is brightened and the inactive
+    half dimmed.
+    """
+
+    # Emitted with the half that was clicked: 'common' or 'differences'.
+    half_clicked = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.common_label = _ClickableLabel('0 common')
+        self.dot_label = QLabel('\u00b7')
+        self.diff_label = _ClickableLabel('0 differences')
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.common_label)
+        layout.addWidget(self.dot_label)
+        layout.addWidget(self.diff_label)
+        self.common_label.clicked.connect(
+            lambda: self.half_clicked.emit('common'))
+        self.diff_label.clicked.connect(
+            lambda: self.half_clicked.emit('differences'))
+
+    def set_counts(self, common: int, differences: int):
+        self.common_label.setText(f'{common} common')
+        self.diff_label.setText(f'{differences} differences')
+
+    def set_active(self, mode: str):
+        """Brighten the active half (mode 'common'/'differences') and dim the
+        rest. 'all' dims both. Colours are read from the palette so this works
+        in both light and dark themes."""
+        palette = self.palette()
+        active = palette.color(QPalette.ColorRole.WindowText)
+        muted = palette.color(QPalette.ColorGroup.Disabled,
+                              QPalette.ColorRole.WindowText)
+        self.common_label.set_color(
+            active if mode == 'common' else muted)
+        self.diff_label.set_color(
+            active if mode == 'differences' else muted)
+        self.dot_label.setStyleSheet(f'color: {muted.name()};')
+
+
 class GroupTagsPanel(QWidget):
-    """The Common/Differences panel shown for multi-image selections."""
+    """The unified grouped-tags panel shown for multi-image selections."""
 
     # Remove the given tags from every selected image.
     remove_from_all_requested = Signal(list)
@@ -361,12 +436,12 @@ class GroupTagsPanel(QWidget):
     remove_from_current_requested = Signal(list)
     # Add the given tags to just the current (highlighted) image.
     add_to_current_requested = Signal(list)
-    # The set of currently-selected Differences tags changed. Carries the list
-    # of selected partial tags (empty when nothing is selected) so the grid can
-    # highlight which images contain them.
+    # The set of currently-selected *difference* tags changed. Carries the list
+    # of selected tags that are not on every image (empty when nothing, or only
+    # common tags, is selected) so the grid can split by them.
     partial_focus_changed = Signal(list)
     # Move the current image to the previous (-1) / next (1) selected image,
-    # requested when arrowing past the top/bottom of a tag list.
+    # requested when arrowing past the top/bottom of the tag list.
     cycle_image_requested = Signal(int)
     # Select an image outside the current selection (Ctrl+Up / Ctrl+Down).
     escape_selection_requested = Signal(int)
@@ -375,212 +450,228 @@ class GroupTagsPanel(QWidget):
     gelbooru_wiki_requested = Signal(str)
     # Rename a tag (old, new) on the selected images that contain it.
     rename_tag_requested = Signal(str, str)
+    # The tag-list filter changed via the clickable summary. Carries the new
+    # mode: 'all', 'common', or 'differences'. Used to drive the Add Tag scope
+    # button (differences -> current-image-only, common -> all).
+    filter_mode_changed = Signal(str)
 
     def __init__(self, tag_library_model: TagLibraryModel):
         super().__init__()
         self.tag_library_model = tag_library_model
-        self._common_model = _CommonTagModel(tag_library_model)
-        self._partial_model = _PartialTagModel(tag_library_model)
-        self._common_collapsed = False
+        self._model = _UnifiedTagModel(tag_library_model)
+        # The active tag-list filter: 'all' shows every tag, 'common' shows only
+        # tags on every selected image (k == N), 'differences' shows only tags
+        # missing from at least one (k < N).
+        self._filter_mode = 'all'
         # Row to reselect after the next model refresh, so deleting/editing a
-        # tag from a list keeps the cursor at the same position instead of
-        # resetting to the top (mirrors the normal Image Tags list). One-shot:
-        # set right before an edit is requested, consumed by the next refresh.
-        self._pending_common_anchor: int | None = None
-        self._pending_partial_anchor: int | None = None
-        # Persistent display order for the Common/Differences lists. Tags keep
-        # their slot across edits to the same selection so that, e.g., removing
-        # a tag from the current image changes only its k/N badge, not its
-        # position. `_order_key` identifies the current selection (by image
-        # paths); when it changes the remembered order is rebuilt from the
-        # natural first-appearance order. See `_apply_stable_order`.
+        # tag keeps the cursor at the same position instead of resetting to the
+        # top (mirrors the normal Image Tags list). One-shot: set right before
+        # an edit is requested, consumed by the next refresh.
+        self._pending_anchor: int | None = None
+        # Stable display order for the tag list. Every tag seen during the
+        # current selection is assigned a permanent slot number the first time
+        # it appears; the list is always shown sorted by that slot. Because a
+        # slot is NEVER reused or pruned while the selection is unchanged, a tag
+        # that is removed from every image (and so vanishes) reclaims its exact
+        # original position if it comes back via undo/redo — independent of the
+        # order it was removed from / re-added to the individual images. A
+        # brand-new tag (manual add or auto-caption), or a fully-removed tag
+        # that is manually re-added, gets a fresh slot at the end.
+        # `_order_key` identifies the current selection (by image paths); when
+        # it changes the slots are rebuilt from natural first-appearance order.
         self._order_key: frozenset[str] | None = None
-        self._common_order: list[str] = []
-        self._partial_order: list[str] = []
+        self._slot_of: dict[str, int] = {}
+        self._next_slot = 0
+        # Tags that were present at the previous refresh. Used to tell a tag
+        # that (re)appeared on a normal edit (-> fresh slot at the end) from one
+        # that was merely restored by undo/redo (-> keep its permanent slot).
+        self._present_prev: set[str] = set()
+        # Tags touched by the most recent auto-caption run (newly added or whose
+        # image count increased). Shown with a subtle marker so they are easy to
+        # review; cleared when the selection changes or a marked tag is clicked.
+        self._recently_captioned: set[str] = set()
+        # Per-tag image counts snapshotted when an auto-caption run starts, so
+        # the touched set can be computed when it finishes. None outside a run.
+        self._auto_caption_counts: dict[str, int] | None = None
+        # Tags to select after the next refresh (undo/redo re-adds): mirrors the
+        # single-image list, which selects a re-added tag. One-shot.
+        self._pending_select_tags: list[str] = []
+        # A re-added tag to scroll into view (without selecting) after the next
+        # refresh, used on undo/redo when the "Do not auto-select newly added
+        # tags" setting is on so the change stays visible. One-shot.
+        self._pending_scroll_tag: str | None = None
+        # The full ordered rows for the current selection (all tags, before the
+        # "Only differences" filter) and the shared image count. Kept so the
+        # filter can be toggled without recomputing from the images.
+        self._rows_full: list[tuple[str, int]] = []
+        self._total = 0
 
-        self.common_header = QPushButton()
-        self.common_header.setCheckable(True)
-        self.common_header.setChecked(True)
-        self.common_header.setFlat(True)
-        self.common_header.setStyleSheet('QPushButton { text-align: left; }')
-        self.common_header.setAutoDefault(False)
-        self.common_header.setDefault(False)
-        self.common_header.toggled.connect(self._on_common_header_toggled)
+        # The clickable common/differences summary. Created here but placed by
+        # ImageTagsEditor in the bottom status row (where the token count shows
+        # for a single image). Clicking a half filters the tag list; the tag
+        # list itself gets the full panel height. (The old top "Only
+        # differences" button is gone; the editor now puts an Add Tag scope
+        # button in that top slot instead.)
+        self.summary_label = SummaryFilter()
+        self.summary_label.half_clicked.connect(self._on_summary_half_clicked)
 
-        self.common_list = _TagListView()
-        self.common_list.setModel(self._common_model)
-        self.common_list.setItemDelegate(_UniformHeightDelegate(self))
-        self.common_list.delete_requested.connect(
-            self._remove_selected_common)
-        self.common_list.customContextMenuRequested.connect(
-            self._show_common_context_menu)
-        self.common_list.edge_navigation.connect(self._on_common_edge)
-        self.common_list.escape_navigation.connect(
+        self.tag_list = _TagListView()
+        self.tag_list.setModel(self._model)
+        self.tag_list.setItemDelegate(_TagBadgeDelegate(self))
+        self.tag_list.delete_requested.connect(self._remove_selected)
+        self.tag_list.customContextMenuRequested.connect(
+            self._show_context_menu)
+        self.tag_list.selectionModel().selectionChanged.connect(
+            self._on_selection_changed)
+        self.tag_list.edge_navigation.connect(self._on_edge)
+        self.tag_list.escape_navigation.connect(
             self.escape_selection_requested)
-        self._common_model.rename_requested.connect(
-            lambda old, new: self._on_rename_requested(
-                self.common_list, old, new))
-
-        self.partial_label = QLabel()
-        self.partial_list = _TagListView()
-        self.partial_list.setModel(self._partial_model)
-        self.partial_list.setItemDelegate(_PartialTagDelegate(self))
-        self.partial_list.delete_requested.connect(
-            self._remove_selected_partial)
-        self.partial_list.customContextMenuRequested.connect(
-            self._show_partial_context_menu)
-        self.partial_list.selectionModel().selectionChanged.connect(
-            self._on_partial_selection_changed)
-        self.partial_list.edge_navigation.connect(self._on_partial_edge)
-        self.partial_list.escape_navigation.connect(
-            self.escape_selection_requested)
-        self._partial_model.rename_requested.connect(
-            lambda old, new: self._on_rename_requested(
-                self.partial_list, old, new))
+        self._model.rename_requested.connect(self._on_rename_requested)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.common_header)
-        layout.addWidget(self.common_list)
-        layout.addWidget(self.partial_label)
-        layout.addWidget(self.partial_list)
-        # The common tags are the shared base and tend to be the longer list,
-        # so give that list the larger share of the vertical space when the
-        # pane grows. The differences list still gets a meaningful minimum.
-        layout.setStretchFactor(self.common_list, 3)
-        layout.setStretchFactor(self.partial_list, 2)
+        layout.addWidget(self.tag_list)
 
-        self._refresh_labels(0, 0)
+        self._refresh_summary()
 
+    # ------------------------------------------------------------------
+    # Population and stable ordering
+    # ------------------------------------------------------------------
     def set_images(self, images: list[Image], restore_positions: bool = False):
-        common, partial, total = compute_common_and_partial(images)
-        # Keep each tag in a stable slot across edits to the same selection.
-        # When the selected image set changes, rebuild the order from the
-        # natural first-appearance order returned above.
+        rows, total = compute_tag_rows(images)
+        counts = dict(rows)
+        present = [tag for tag, _ in rows]  # natural first-appearance order
+        present_set = set(present)
+        # When the selected image set changes, start a fresh stable order (and
+        # drop any leftover auto-caption markers, which belonged to the old
+        # selection).
         order_key = frozenset(str(image.path) for image in images)
         same_selection = order_key == self._order_key
         if not same_selection:
             self._order_key = order_key
-            self._common_order = []
-            self._partial_order = []
+            self._slot_of = {}
+            self._next_slot = 0
+            self._present_prev = set()
+            self._recently_captioned = set()
         # When an external edit (auto-captioning, undo/redo) changes the tags of
         # the same selection without the panel setting an explicit row anchor,
         # remember the selected tags by name so they stay selected across the
         # model reset below, mirroring the normal Image Tags list. Panel edits
         # (delete/rename/add) instead restore the cursor by row via the pending
-        # anchors, so skip name-based preservation for those.
-        preserve_common = same_selection and self._pending_common_anchor is None
-        preserve_partial = (same_selection
-                            and self._pending_partial_anchor is None)
-        prev_common_tags = (self.common_list.selected_tags()
-                            if preserve_common else [])
-        prev_partial_tags = (self.partial_list.selected_tags()
-                             if preserve_partial else [])
-        # A genuinely new tag (manual add or auto-caption) lands at the end of
-        # the list, matching the normal Image Tags list. When restoring from
-        # the undo/redo history we instead keep the remembered order intact:
-        # vanished tags are not pruned and a reappearing tag reclaims its exact
-        # prior slot, so an add -> undo -> redo cycle returns the tag to where
-        # it was rather than to its natural first-appearance position.
-        place_new_at_end = not restore_positions
-        prune_absent = not restore_positions
-        common = self._apply_stable_order(common, self._common_order,
-                                          place_new_at_end, prune_absent)
-        partial_counts = dict(partial)
-        partial_tags = self._apply_stable_order(
-            [tag for tag, _ in partial], self._partial_order, place_new_at_end,
-            prune_absent)
-        partial = [(tag, partial_counts[tag]) for tag in partial_tags]
-        self._common_model.set_tags(common)
-        self._partial_model.set_rows(partial, total)
-        self._refresh_labels(len(common), len(partial))
-        # Resetting the models above clears any selection. If an edit was just
-        # made from one of the lists, restore the cursor to the same row so the
-        # position is preserved (consistent with the normal Image Tags list).
-        self._restore_anchor(self.common_list, self._common_model,
-                             self._pending_common_anchor)
-        self._pending_common_anchor = None
-        self._restore_anchor(self.partial_list, self._partial_model,
-                             self._pending_partial_anchor)
-        self._pending_partial_anchor = None
-        # For external edits, reselect the previously-selected tags by name so
-        # the user's selection is maintained (e.g. after auto-captioning).
-        if prev_common_tags:
-            self._reselect_tags(self.common_list, common, prev_common_tags)
-        if prev_partial_tags:
-            self._reselect_tags(self.partial_list, partial_tags,
-                                prev_partial_tags)
-        # Report the (possibly restored) Differences selection so the grid
-        # highlight stays in sync.
-        self.partial_focus_changed.emit(self.partial_list.selected_tags())
+        # anchor, so skip name-based preservation for those.
+        preserve = same_selection and self._pending_anchor is None
+        prev_tags = self.tag_list.selected_tags() if preserve else []
+        # Assign / keep permanent slots (see _slot_of docs in __init__).
+        if not same_selection:
+            # Fresh selection: slot every tag in natural first-appearance order.
+            for tag in present:
+                self._assign_slot(tag)
+        elif restore_positions:
+            # Undo/redo: never reassign an existing slot, so a returning tag
+            # reclaims its exact position. Only a tag never seen this selection
+            # (shouldn't normally happen on a restore) gets a new end slot.
+            for tag in present:
+                if tag not in self._slot_of:
+                    self._assign_slot(tag)
+        else:
+            # Normal edit: a tag that just (re)appeared gets a fresh slot at the
+            # end; tags already present keep their slots.
+            for tag in present:
+                if tag not in self._present_prev or tag not in self._slot_of:
+                    self._assign_slot(tag, force_end=True)
+        ordered_tags = sorted(present, key=lambda tag: self._slot_of[tag])
+        self._rows_full = [(tag, counts[tag]) for tag in ordered_tags]
+        self._total = total
+        # Undo/redo that re-adds tag(s): honor the "Do not auto-select newly
+        # added tags" setting, matching the single-image list. When auto-select
+        # is on, pick the last re-added tag; when off, keep the user's current
+        # selection but scroll the re-added tag into view so the undo/redo's
+        # effect stays visible. `restore_positions` is set only for an undo/redo
+        # history restore.
+        if restore_positions and same_selection:
+            readded = [tag for tag in ordered_tags
+                       if tag not in self._present_prev]
+            if readded:
+                if not self._new_tag_auto_select_disabled():
+                    self._pending_select_tags = readded[-1:]
+                    prev_tags = []
+                else:
+                    self._pending_scroll_tag = readded[-1]
+        self._present_prev = present_set
+        self._refresh_view(prev_tags)
 
     @staticmethod
-    def _apply_stable_order(current_tags: list[str],
-                            remembered: list[str],
-                            place_new_at_end: bool = True,
-                            prune_absent: bool = True) -> list[str]:
-        """Order ``current_tags`` by their remembered slots, updating in place.
+    def _new_tag_auto_select_disabled() -> bool:
+        """Whether the "Do not auto-select newly added tags" setting is on."""
+        return get_settings().value(
+            'disable_new_tag_auto_select',
+            defaultValue=DEFAULT_SETTINGS['disable_new_tag_auto_select'],
+            type=bool)
 
-        Returns the display order (present tags only). Tags already in
-        ``remembered`` keep their relative position, so an edit that only
-        changes a tag's ``k/N`` count doesn't reshuffle the list. A tag not seen
-        before is placed according to ``place_new_at_end``:
+    def _assign_slot(self, tag: str, force_end: bool = False):
+        """Give ``tag`` a permanent slot. ``force_end`` (a manual/auto re-add of
+        a tag that was gone) moves it to a fresh slot at the end even if it had
+        one before."""
+        if force_end or tag not in self._slot_of:
+            self._slot_of[tag] = self._next_slot
+            self._next_slot += 1
 
-        - ``True`` (the default): appended at the end, so a freshly added tag
-          (manual add or auto-caption) lands at the bottom of the list, exactly
-          like the normal Image Tags list.
-        - ``False``: inserted at the position it occupies in ``current_tags``
-          (its natural first-appearance order) relative to the remembered tags.
-
-        ``prune_absent`` controls how ``remembered`` is updated:
-
-        - ``True`` (the default): ``remembered`` is replaced with the display
-          order, so tags no longer present drop out. Used for ordinary edits, so
-          re-adding a previously deleted tag treats it as new (goes to the end).
-        - ``False``: tags no longer present are kept in ``remembered`` at their
-          existing slots while present tags are reordered to the display order.
-          Used when restoring from the undo/redo history, so a tag that vanishes
-          on undo reclaims its exact prior slot on redo (an add -> undo -> redo
-          cycle returns the tag to where it was, not to its natural position).
-
-        Because a rename keeps the tag in ``remembered`` (the panel swaps the
-        name in place), a renamed tag also keeps its position.
-        """
-        current_set = set(current_tags)
-        natural_index = {tag: position
-                         for position, tag in enumerate(current_tags)}
-        ordered = [tag for tag in remembered if tag in current_set]
-        seen = set(ordered)
-        for tag in current_tags:
-            if tag in seen:
-                continue
-            if place_new_at_end:
-                insert_at = len(ordered)
-            else:
-                # Insert before the first already-placed tag that comes after
-                # this one in the natural order; otherwise append at the end.
-                insert_at = len(ordered)
-                for position, placed_tag in enumerate(ordered):
-                    if natural_index[placed_tag] > natural_index[tag]:
-                        insert_at = position
-                        break
-            ordered.insert(insert_at, tag)
-            seen.add(tag)
-        if prune_absent:
-            remembered[:] = ordered
+    def _refresh_view(self, prev_tags: list[str]):
+        """Apply the current filter, repopulate the model, and restore state."""
+        if self._filter_mode == 'differences':
+            displayed = [(tag, count) for tag, count in self._rows_full
+                         if count < self._total]
+        elif self._filter_mode == 'common':
+            displayed = [(tag, count) for tag, count in self._rows_full
+                         if count >= self._total]
         else:
-            # Rebuild the memory keeping absent tags anchored at their slots and
-            # substituting present tags in their new display order.
-            display_iter = iter(ordered)
-            rebuilt = []
-            for tag in remembered:
-                if tag in current_set:
-                    rebuilt.append(next(display_iter))
-                else:
-                    rebuilt.append(tag)
-            rebuilt.extend(display_iter)
-            remembered[:] = rebuilt
-        return ordered
+            displayed = list(self._rows_full)
+        self._model.set_rows(displayed, self._total)
+        self._refresh_summary()
+        displayed_tags = [tag for tag, _ in displayed]
+        # A pending re-added-tag selection (undo/redo) takes precedence over
+        # restoring the cursor row or the prior selection.
+        if self._pending_select_tags:
+            wanted = self._pending_select_tags
+            self._pending_select_tags = []
+            self._pending_anchor = None
+            self._reselect_tags(self.tag_list, displayed_tags, wanted)
+            self.partial_focus_changed.emit(self._selected_difference_tags())
+            return
+        # Resetting the model above clears any selection. If an edit was just
+        # made, restore the cursor to the same row so the position is preserved
+        # (consistent with the normal Image Tags list).
+        self._restore_anchor(self.tag_list, self._model, self._pending_anchor)
+        self._pending_anchor = None
+        # For external edits (or a filter toggle), reselect the previously
+        # selected tags by name so the user's selection is maintained.
+        if prev_tags:
+            self._reselect_tags(self.tag_list, displayed_tags, prev_tags)
+        # Honor "Do not auto-select newly added tags" on undo/redo: don't move
+        # the selection, but scroll the re-added tag into view so the change is
+        # still visible.
+        if self._pending_scroll_tag is not None:
+            tag = self._pending_scroll_tag
+            self._pending_scroll_tag = None
+            if tag in displayed_tags:
+                self.tag_list.scrollTo(
+                    self._model.index(displayed_tags.index(tag)))
+        # Report the (possibly restored) difference selection so the grid split
+        # stays in sync.
+        self.partial_focus_changed.emit(self._selected_difference_tags())
+
+    def _difference_tag_set(self) -> set[str]:
+        return {tag for tag, count in self._rows_full if count < self._total}
+
+    def _selected_difference_tags(self) -> list[str]:
+        """The selected tags that are not on every image (drive the grid split).
+
+        Selecting a common tag alone yields an empty list, so the grid reverts
+        to its normal (unsplit) layout.
+        """
+        differences = self._difference_tag_set()
+        return [tag for tag in self.tag_list.selected_tags()
+                if tag in differences]
 
     @staticmethod
     def _anchor_row(list_view: '_TagListView') -> int | None:
@@ -589,26 +680,23 @@ class GroupTagsPanel(QWidget):
         return min(rows) if rows else None
 
     def remember_anchor_for_add(self, list_view: '_TagListView'):
-        """Stash ``list_view``'s selected row so it is restored on the next
+        """Stash the tag list's selected row so it is restored on the next
         refresh.
 
-        Used when typing on a Common/Differences list auto-focuses the Add Tag
-        box: after the tag is added (which resets the models and clears the
-        selection), the previously selected tag is reselected, matching the
-        normal Image Tags list.
+        Used when typing on the tag list auto-focuses the Add Tag box: after the
+        tag is added (which resets the model and clears the selection), the
+        previously selected tag is reselected, matching the normal Image Tags
+        list.
         """
-        if list_view is self.common_list:
-            self._pending_common_anchor = self._anchor_row(self.common_list)
-        elif list_view is self.partial_list:
-            self._pending_partial_anchor = self._anchor_row(self.partial_list)
+        self._pending_anchor = self._anchor_row(self.tag_list)
 
     @staticmethod
     def _restore_anchor(list_view: '_TagListView',
                         model: QAbstractListModel, anchor: int | None):
         """Reselect the tag now at ``anchor`` after a refresh.
 
-        Matches the normal Image Tags list: select the row that took the
-        deleted row's place, or the last row if the list got shorter.
+        Matches the normal Image Tags list: select the row that took the deleted
+        row's place, or the last row if the list got shorter.
         """
         if anchor is None:
             return
@@ -627,10 +715,8 @@ class GroupTagsPanel(QWidget):
         """Reselect the given tags by name after a refresh.
 
         Used to preserve the user's selection across an external tag change
-        (auto-captioning, undo/redo) that resets the models: any of
-        ``wanted_tags`` still present is reselected at its new row, mirroring the
-        normal Image Tags list keeping its selection. Tags that no longer exist
-        are ignored.
+        (auto-captioning, undo/redo) or a filter toggle that resets the model:
+        any of ``wanted_tags`` still present is reselected at its new row.
         """
         row_by_tag = {tag: row for row, tag in enumerate(ordered_tags)}
         rows = sorted(row_by_tag[tag] for tag in wanted_tags
@@ -644,35 +730,84 @@ class GroupTagsPanel(QWidget):
             selection_model.select(
                 model.index(row), QItemSelectionModel.SelectionFlag.Select)
         # Set the current (cursor) row WITHOUT disturbing the selection just
-        # built above. Using ``list_view.setCurrentIndex`` here issues a
-        # clear-and-select command in the real windowed app, which wipes the
-        # multi-row selection; ``NoUpdate`` moves only the cursor.
+        # built above. ``setCurrentIndex`` issues a clear-and-select command in
+        # the real windowed app, which wipes the multi-row selection;
+        # ``NoUpdate`` moves only the cursor.
         selection_model.setCurrentIndex(
             model.index(rows[0]), QItemSelectionModel.SelectionFlag.NoUpdate)
 
+    # ------------------------------------------------------------------
+    # Selection / navigation
+    # ------------------------------------------------------------------
     @Slot()
-    def _on_partial_selection_changed(self, *args):
-        self.partial_focus_changed.emit(self.partial_list.selected_tags())
+    def _on_selection_changed(self, *args):
+        # Once the user acts on a captioned-tag marker (selects/clicks it), it
+        # has served its "review me" purpose, so drop the marker for any tag now
+        # selected and repaint just those rows.
+        if self._recently_captioned:
+            selected = set(self.tag_list.selected_tags())
+            newly_cleared = self._recently_captioned & selected
+            if newly_cleared:
+                self._recently_captioned -= newly_cleared
+                self.tag_list.viewport().update()
+        self.partial_focus_changed.emit(self._selected_difference_tags())
+
+    def begin_auto_caption_run(self):
+        """Snapshot the current per-tag image counts so the next
+        end_auto_caption_run() can flag which tags the run added or grew.
+
+        Called when the Auto-Captioner starts while the grouped view is active.
+        """
+        self._auto_caption_counts = {tag: count
+                                     for tag, count in self._rows_full}
+
+    def end_auto_caption_run(self):
+        """Mark every tag the just-finished auto-caption run added or increased
+        the image count of, so the user can review them at a glance."""
+        if self._auto_caption_counts is None:
+            return
+        before = self._auto_caption_counts
+        self._auto_caption_counts = None
+        touched = {tag for tag, count in self._rows_full
+                   if count > before.get(tag, 0)}
+        if touched != self._recently_captioned:
+            self._recently_captioned = touched
+            self.tag_list.viewport().update()
+
+    @Slot(str)
+    def _on_summary_half_clicked(self, half: str):
+        # Clicking a half activates that filter; clicking the active half again
+        # returns to 'all'. The filter drives the tag list; the editor listens
+        # to filter_mode_changed to auto-set the Add Tag scope button.
+        new_mode = 'all' if self._filter_mode == half else half
+        if new_mode == self._filter_mode:
+            return
+        self._filter_mode = new_mode
+        self._refresh_view(self.tag_list.selected_tags())
+        self.filter_mode_changed.emit(new_mode)
+
+    def reset_filter(self):
+        """Return the tag-list filter to 'all' without emitting a change (used
+        when entering the grouped view for a fresh selection)."""
+        if self._filter_mode == 'all':
+            return
+        self._filter_mode = 'all'
+        self._refresh_view(self.tag_list.selected_tags())
 
     def focus_first_tag(self) -> bool:
-        """Focus the first available tag list and select its first tag.
+        """Focus the tag list and select its first tag.
 
-        Prefers the Common list (when expanded and non-empty), otherwise the
-        Differences list. Used by the "Focus Image Tags List" shortcut while the
-        grouped view is showing. Returns False when there is no tag to focus.
+        Used by the "Focus Image Tags List" shortcut while the grouped view is
+        showing. Returns False when there is no tag to focus.
         """
-        if self._focus_list_edge(self.common_list, self._common_model,
-                                 at_top=True):
-            return True
-        return self._focus_list_edge(self.partial_list, self._partial_model,
-                                     at_top=True)
+        return self._focus_list_edge(self.tag_list, self._model, at_top=True)
 
     def _focus_list_edge(self, list_view: '_TagListView',
                          model: QAbstractListModel, at_top: bool) -> bool:
-        """Move keyboard focus/selection to the top or bottom of a tag list.
+        """Move keyboard focus/selection to the top or bottom of the tag list.
 
         Returns False (so the caller can fall back to cycling images) when the
-        target list is hidden or empty.
+        list is hidden or empty.
         """
         if not list_view.isVisible() or model.rowCount() == 0:
             return False
@@ -685,51 +820,29 @@ class GroupTagsPanel(QWidget):
         return True
 
     @Slot(int)
-    def _on_common_edge(self, direction: int):
-        # Up past the top of Common leaves the tag lists entirely -> prev image.
-        # Down past the bottom chains into Differences (if any) before images.
-        if direction > 0 and self._focus_list_edge(
-                self.partial_list, self._partial_model, at_top=True):
-            return
+    def _on_edge(self, direction: int):
+        # Arrowing past the top/bottom of the single list moves to the previous
+        # or next selected image, keeping the multi-image selection intact.
         self.cycle_image_requested.emit(direction)
 
-    @Slot(int)
-    def _on_partial_edge(self, direction: int):
-        # Up past the top of Differences chains back into Common (if visible);
-        # Down past the bottom leaves the tag lists entirely -> next image.
-        if direction < 0 and self._focus_list_edge(
-                self.common_list, self._common_model, at_top=False):
-            return
-        self.cycle_image_requested.emit(direction)
+    def _refresh_summary(self):
+        total_tags = len(self._rows_full)
+        difference_count = sum(1 for _, count in self._rows_full
+                               if count < self._total)
+        common_count = total_tags - difference_count
+        self.summary_label.set_counts(common_count, difference_count)
+        self.summary_label.set_active(self._filter_mode)
 
-    def _refresh_labels(self, common_count: int, partial_count: int):
-        arrow = '\u25b8' if self._common_collapsed else '\u25be'
-        self.common_header.setText(
-            f'{arrow} Common tags ({common_count})')
-        self.partial_label.setText(f'Differences ({partial_count})')
-
-    @Slot(bool)
-    def _on_common_header_toggled(self, checked: bool):
-        self._common_collapsed = not checked
-        self.common_list.setVisible(checked)
-        self._refresh_labels(self._common_model.rowCount(),
-                             self._partial_model.rowCount())
-
+    # ------------------------------------------------------------------
+    # Edits
+    # ------------------------------------------------------------------
     @Slot()
-    def _remove_selected_common(self):
-        tags = self.common_list.selected_tags()
+    def _remove_selected(self):
+        tags = self.tag_list.selected_tags()
         if tags:
-            self._pending_common_anchor = self._anchor_row(self.common_list)
+            self._pending_anchor = self._anchor_row(self.tag_list)
             self.remove_from_all_requested.emit(tags)
-            self._pending_common_anchor = None
-
-    @Slot()
-    def _remove_selected_partial(self):
-        tags = self.partial_list.selected_tags()
-        if tags:
-            self._pending_partial_anchor = self._anchor_row(self.partial_list)
-            self.remove_from_all_requested.emit(tags)
-            self._pending_partial_anchor = None
+            self._pending_anchor = None
 
     @staticmethod
     def _tag_at(list_view: '_TagListView', position) -> str:
@@ -743,61 +856,30 @@ class GroupTagsPanel(QWidget):
     def currently_selected_tags(self) -> list[str]:
         """Tags selected in the panel, for the grid cell context menu.
 
-        Prefers the list that currently has keyboard focus; if neither has
-        focus, returns the selection of whichever list has one (Common before
-        Differences). Returns an empty list when nothing is selected.
+        Returns an empty list when nothing is selected.
         """
-        list_view = self._active_selection_list()
-        return list_view.selected_tags() if list_view is not None else []
-
-    def _active_selection_list(self) -> '_TagListView | None':
-        """The list whose selection the grid cell context menu should use.
-
-        Prefers a focused list; otherwise the first list (Common before
-        Differences) that has any selection. Returns None if nothing is
-        selected.
-        """
-        for list_view in (self.common_list, self.partial_list):
-            if list_view.hasFocus() and list_view.selected_tags():
-                return list_view
-        for list_view in (self.common_list, self.partial_list):
-            if list_view.selected_tags():
-                return list_view
-        return None
+        return self.tag_list.selected_tags()
 
     def remember_selected_tags_anchor(self):
-        """Stash the selected list's cursor row so it survives the next refresh.
+        """Stash the tag list's cursor row so it survives the next refresh.
 
         Used before a grid cell context-menu add/remove so the Image Tags pane
-        keeps its position after the edit's model reset, mirroring the panel's
-        own Remove/Add context-menu actions.
+        keeps its position after the edit's model reset.
         """
-        list_view = self._active_selection_list()
-        if list_view is not None:
-            self.remember_anchor_for_add(list_view)
+        if self.tag_list.selected_tags():
+            self.remember_anchor_for_add(self.tag_list)
 
     def selected_tag_for_wiki(self) -> str:
         """The single tag the wiki shortcut should look up from this panel.
 
         Mirrors ImageTagsList.selected_tag_for_wiki: returns a tag only when
-        exactly one is selected, otherwise ''. If one of the lists has keyboard
-        focus, that list alone decides (so multi-selection there yields '',
-        matching the normal list). When neither list has focus (e.g. the Add Tag
-        box is focused), fall back to whichever list has a single selection,
-        preferring Common.
+        exactly one is selected, otherwise ''.
         """
-        for list_view in (self.common_list, self.partial_list):
-            if list_view.hasFocus():
-                tags = list_view.selected_tags()
-                return tags[0] if len(tags) == 1 else ''
-        for list_view in (self.common_list, self.partial_list):
-            tags = list_view.selected_tags()
-            if len(tags) == 1:
-                return tags[0]
-        return ''
+        tags = self.tag_list.selected_tags()
+        return tags[0] if len(tags) == 1 else ''
 
-    def _copy_tags(self, list_view: '_TagListView'):
-        list_view.copy_selected_tags_to_clipboard()
+    def _copy_tags(self):
+        self.tag_list.copy_selected_tags_to_clipboard()
 
     def _add_category_actions(self, menu: QMenu, tag: str) -> tuple[dict, object]:
         """Append an "Assign Category" submenu and a "Clear Category" action.
@@ -828,12 +910,10 @@ class GroupTagsPanel(QWidget):
         self._refresh_tag_colors()
 
     def _refresh_tag_colors(self):
-        """Repaint both lists so category color changes take effect."""
-        self.common_list.viewport().update()
-        self.partial_list.viewport().update()
+        """Repaint the list so category color changes take effect."""
+        self.tag_list.viewport().update()
 
-    def _on_rename_requested(self, list_view: '_TagListView',
-                             old_tag: str, new_tag: str):
+    def _on_rename_requested(self, old_tag: str, new_tag: str):
         """Defer an in-place rename until the item editor has fully closed.
 
         Performing the rename synchronously inside the model's setData would
@@ -841,53 +921,61 @@ class GroupTagsPanel(QWidget):
         we stash the cursor position and fire the rename on the next event-loop
         tick, when the editor is gone.
         """
-        is_common = list_view is self.common_list
-        anchor = self._anchor_row(list_view)
+        anchor = self._anchor_row(self.tag_list)
         QTimer.singleShot(
-            0, lambda: self._emit_rename(is_common, anchor, old_tag, new_tag))
+            0, lambda: self._emit_rename(anchor, old_tag, new_tag))
 
-    def _emit_rename(self, is_common: bool, anchor: int | None,
-                     old_tag: str, new_tag: str):
-        # Keep the renamed tag in its slot. New tags default to the end of the
-        # list, so a rename must swap the name in the remembered order in place
-        # (rather than letting the new name be treated as a brand-new tag and
-        # appended). The pending anchor then restores the cursor to that row.
-        self._rename_in_remembered_order(self._common_order, old_tag, new_tag)
-        self._rename_in_remembered_order(self._partial_order, old_tag, new_tag)
-        if is_common:
-            self._pending_common_anchor = anchor
-        else:
-            self._pending_partial_anchor = anchor
+    def _emit_rename(self, anchor: int | None, old_tag: str, new_tag: str):
+        # Keep the renamed tag in its slot. A new name would otherwise be
+        # treated as a brand-new tag and sent to the end, so move the old name's
+        # permanent slot to the new name in place. The pending anchor then
+        # restores the cursor to that row.
+        self._rename_slot(old_tag, new_tag)
+        self._pending_anchor = anchor
         self.rename_tag_requested.emit(old_tag, new_tag)
-        self._pending_common_anchor = None
-        self._pending_partial_anchor = None
+        self._pending_anchor = None
 
-    @staticmethod
-    def _rename_in_remembered_order(remembered: list[str], old_tag: str,
-                                    new_tag: str):
-        """Replace ``old_tag`` with ``new_tag`` in a remembered order list.
+    def _rename_slot(self, old_tag: str, new_tag: str):
+        """Move ``old_tag``'s permanent slot to ``new_tag`` so a rename keeps the
+        tag's position. If ``new_tag`` already has a slot (the rename merges into
+        an existing tag), keep that slot and just drop ``old_tag``. Also updates
+        the "present at last refresh" set so the follow-up refresh doesn't treat
+        ``new_tag`` as a freshly (re)appeared tag and bump it to the end."""
+        if old_tag in self._slot_of:
+            slot = self._slot_of.pop(old_tag)
+            if new_tag not in self._slot_of:
+                self._slot_of[new_tag] = slot
+        if old_tag in self._present_prev:
+            self._present_prev.discard(old_tag)
+            self._present_prev.add(new_tag)
+        if old_tag in self._recently_captioned:
+            self._recently_captioned.discard(old_tag)
+            self._recently_captioned.add(new_tag)
 
-        If ``new_tag`` already exists (the rename merges into an existing tag),
-        just drop ``old_tag`` so the merged tag keeps its own slot.
-        """
-        if old_tag not in remembered:
-            return
-        index = remembered.index(old_tag)
-        if new_tag in remembered:
-            remembered.pop(index)
-        else:
-            remembered[index] = new_tag
-
-    def _show_common_context_menu(self, position):
-        tags = self.common_list.selected_tags()
+    def _show_context_menu(self, position):
+        tags = self.tag_list.selected_tags()
         if not tags:
             return
-        clicked_tag = self._tag_at(self.common_list, position)
+        clicked_tag = self._tag_at(self.tag_list, position)
+        differences = self._difference_tag_set()
+        # "Add" only makes sense for tags missing from some images; offer it
+        # when any selected tag is a difference (adding a common tag is a no-op).
+        any_difference = any(tag in differences for tag in tags)
         menu = QMenu(self)
         copy_action = menu.addAction(
             'Copy Tags' if len(tags) > 1 else 'Copy Tag')
         menu.addSeparator()
+        add_all_action = None
+        add_current_action = None
+        # Group by scope (all selected vs. current image) so choosing a scope is
+        # a deliberate top-block vs. bottom-block decision, with a separator to
+        # make the boundary unmistakable. Add sits before Remove within each.
+        if any_difference:
+            add_all_action = menu.addAction('Add to all selected')
         remove_all_action = menu.addAction('Remove from all selected')
+        menu.addSeparator()
+        if any_difference:
+            add_current_action = menu.addAction('Add to current image')
         remove_current_action = menu.addAction('Remove from current image')
         view_danbooru_action = None
         view_gelbooru_action = None
@@ -900,12 +988,12 @@ class GroupTagsPanel(QWidget):
             menu.addSeparator()
             category_actions, clear_action = self._add_category_actions(
                 menu, clicked_tag)
-        chosen = menu.exec(self.common_list.viewport().mapToGlobal(position))
+        chosen = menu.exec(self.tag_list.viewport().mapToGlobal(position))
         if chosen is None:
             return
         # These actions don't reorder the list, so don't touch the anchor.
         if chosen == copy_action:
-            self._copy_tags(self.common_list)
+            self._copy_tags()
             return
         if chosen == view_danbooru_action:
             self.danbooru_wiki_requested.emit(clicked_tag)
@@ -920,59 +1008,7 @@ class GroupTagsPanel(QWidget):
             self._assign_category(clicked_tag, category_actions[chosen])
             return
         # Preserve the cursor position across the refresh the edit triggers.
-        self._pending_common_anchor = self._anchor_row(self.common_list)
-        if chosen == remove_all_action:
-            self.remove_from_all_requested.emit(tags)
-        elif chosen == remove_current_action:
-            self.remove_from_current_requested.emit(tags)
-        # Clear if the edit was a no-op (no refresh consumed the anchor).
-        self._pending_common_anchor = None
-
-    def _show_partial_context_menu(self, position):
-        tags = self.partial_list.selected_tags()
-        if not tags:
-            return
-        clicked_tag = self._tag_at(self.partial_list, position)
-        menu = QMenu(self)
-        copy_action = menu.addAction(
-            'Copy Tags' if len(tags) > 1 else 'Copy Tag')
-        menu.addSeparator()
-        add_all_action = menu.addAction('Add to all selected')
-        add_current_action = menu.addAction('Add to current image')
-        remove_all_action = menu.addAction('Remove from all selected')
-        remove_current_action = menu.addAction('Remove from current image')
-        view_danbooru_action = None
-        view_gelbooru_action = None
-        category_actions = {}
-        clear_action = None
-        if clicked_tag:
-            menu.addSeparator()
-            view_danbooru_action = menu.addAction('View Danbooru Wiki')
-            view_gelbooru_action = menu.addAction('View Gelbooru Wiki')
-            menu.addSeparator()
-            category_actions, clear_action = self._add_category_actions(
-                menu, clicked_tag)
-        chosen = menu.exec(self.partial_list.viewport().mapToGlobal(position))
-        if chosen is None:
-            return
-        # These actions don't reorder the list, so don't touch the anchor.
-        if chosen == copy_action:
-            self._copy_tags(self.partial_list)
-            return
-        if chosen == view_danbooru_action:
-            self.danbooru_wiki_requested.emit(clicked_tag)
-            return
-        if chosen == view_gelbooru_action:
-            self.gelbooru_wiki_requested.emit(clicked_tag)
-            return
-        if chosen == clear_action:
-            self._clear_category(clicked_tag)
-            return
-        if chosen in category_actions:
-            self._assign_category(clicked_tag, category_actions[chosen])
-            return
-        # Preserve the cursor position across the refresh the edit triggers.
-        self._pending_partial_anchor = self._anchor_row(self.partial_list)
+        self._pending_anchor = self._anchor_row(self.tag_list)
         if chosen == add_all_action:
             self.add_to_all_requested.emit(tags)
         elif chosen == add_current_action:
@@ -982,4 +1018,4 @@ class GroupTagsPanel(QWidget):
         elif chosen == remove_current_action:
             self.remove_from_current_requested.emit(tags)
         # Clear if the edit was a no-op (no refresh consumed the anchor).
-        self._pending_partial_anchor = None
+        self._pending_anchor = None
