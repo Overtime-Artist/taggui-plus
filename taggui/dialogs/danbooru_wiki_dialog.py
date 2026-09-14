@@ -45,7 +45,12 @@ BULLETED_REFERENCE_LINE_PATTERN = re.compile(
 )
 TOKEN_PATTERN = re.compile(
     r'"[^"]+":\[https?://[^\]\s]+\]'
-    r'|"[^"]+":https?://[^\s"<\])]+'
+    r'|"[^"]+":https?://(?:[^\s"<\]()]+|\([^\s"<\]()]*\))+'
+    # Named links with a site-relative URL, e.g. "label":/pools/1725 or the
+    # bracketed form "label":[/pools/1725]. Resolved against the Danbooru base
+    # URL in build_link_html.
+    r'|"[^"]+":\[/[^\]\s]+\]'
+    r'|"[^"]+":/[^\s"<\])]+'
     r'|https?://\S+|\[\[[^\]]+\]\]|\{\{[^}]+\}\}|pool\s+#\d+'
     r'|!?(?:post|asset)\s+#\d+|"[^"]+":#[A-Za-z0-9_-]+',
     re.IGNORECASE
@@ -53,7 +58,16 @@ TOKEN_PATTERN = re.compile(
 NAMED_EXTERNAL_LINK_PATTERN = re.compile(
     r'^"(?P<label>[^"]+)":'
     r'(?:\[(?P<url_bracket>https?://[^\]\s]+)\]'
-    r'|(?P<url_bare>https?://[^\s"<\])]+))$',
+    r'|(?P<url_bare>https?://(?:[^\s"<\]()]+|\([^\s"<\]()]*\))+))$',
+    re.IGNORECASE
+)
+# Named links whose target is a site-relative path (starts with "/"), e.g.
+# "Pool: ...":/pools/1725. The path is resolved against DANBOORU_BASE_URL so the
+# anchor handler can route it (post/wiki links open in-app; others externally).
+NAMED_RELATIVE_LINK_PATTERN = re.compile(
+    r'^"(?P<label>[^"]+)":'
+    r'(?:\[(?P<path_bracket>/[^\]\s]+)\]'
+    r'|(?P<path_bare>/[^\s"<\])]+))$',
     re.IGNORECASE
 )
 WIKI_LINK_SUFFIX_PATTERN = re.compile(r"[A-Za-z0-9_']+")
@@ -62,12 +76,26 @@ FORMATTING_PATTERNS = (
     (re.compile(r'\[i\](.*?)\[/i\]', re.IGNORECASE | re.DOTALL), 'em'),
     (re.compile(r'\[u\](.*?)\[/u\]', re.IGNORECASE | re.DOTALL), 'u'),
     (re.compile(r'\[s\](.*?)\[/s\]', re.IGNORECASE | re.DOTALL), 's'),
+    # DText also accepts HTML-style <b>/<i>/<u>/<s> tags as equivalents of the
+    # bracket forms above. By the time these patterns run the text has already
+    # been HTML-escaped, so the angle brackets appear as &lt;.../&gt; and are
+    # matched in that escaped form here.
+    (re.compile(r'&lt;b&gt;(.*?)&lt;/b&gt;', re.IGNORECASE | re.DOTALL),
+     'strong'),
+    (re.compile(r'&lt;i&gt;(.*?)&lt;/i&gt;', re.IGNORECASE | re.DOTALL), 'em'),
+    (re.compile(r'&lt;u&gt;(.*?)&lt;/u&gt;', re.IGNORECASE | re.DOTALL), 'u'),
+    (re.compile(r'&lt;s&gt;(.*?)&lt;/s&gt;', re.IGNORECASE | re.DOTALL), 's'),
 )
 # DText spoilers: [spoiler]hidden text[/spoiler]. Rendered as a black bar that
 # hides the text (matching Danbooru's default state). QTextBrowser has no
 # :hover support, so the text is revealed by selecting/highlighting it.
 SPOILER_PATTERN = re.compile(r'\[spoiler\](.*?)\[/spoiler\]',
                              re.IGNORECASE | re.DOTALL)
+# DText inline code: [code]literal text[/code]. Rendered in a monospace font
+# with a subtle background. The content is treated literally by Danbooru, so it
+# is shielded from the other inline formatting patterns (see
+# apply_inline_formatting_tags).
+CODE_PATTERN = re.compile(r'\[code\](.*?)\[/code\]', re.IGNORECASE | re.DOTALL)
 # Anchor style attribute inside a spoiler, so links are hidden by the black bar
 # too (Qt would otherwise draw them in the visible link colour).
 SPOILER_ANCHOR_STYLE_PATTERN = re.compile(r'(<a\b[^>]*?)\s+style="[^"]*"',
@@ -99,6 +127,21 @@ TAG_CATEGORY_COLORS = {
     'general': ('#0073ff', '#6baef6'),
     'meta': ('#ea7d00', '#f0a52a'),
 }
+# Danbooru's numeric tag categories (as returned by the tags API) → the colour
+# keys above. Used to colour tag links in the wiki body by their tag type, the
+# same way Danbooru (and our post view) does.
+DANBOORU_TAG_CATEGORY_KEYS = {
+    0: 'general',
+    1: 'artist',
+    3: 'copyright',
+    4: 'character',
+    5: 'meta',
+}
+# Upper bound on how many distinct wiki-body tag links we look up categories for
+# per page, to keep the extra work bounded on very large pages. Big pages (e.g.
+# "hatsune_miku") can reference 500+ tags, so this is generous; the lookups are
+# batched and run concurrently to stay fast.
+MAX_WIKI_LINK_TAG_LOOKUPS = 1200
 
 
 def image_url_to_data_url(image_url: str, interruption_check=None) -> str:
@@ -247,6 +290,13 @@ class DanbooruWikiFetchThread(QThread):
                 asset_ids.append(asset_id)
         capped_post_ids = post_ids[:MAX_PREVIEW_POSTS]
         capped_asset_ids = asset_ids[:MAX_PREVIEW_POSTS]
+        tag_link_names = self.extract_wiki_link_tag_names(
+            str(wiki_page.get('body') or ''))
+        # Include the page's own tag so its heading can be coloured by type too.
+        own_tag_name = resolved_title.replace(' ', '_').casefold()
+        if (own_tag_name and not own_tag_name.startswith('tag_group:')
+                and own_tag_name not in tag_link_names):
+            tag_link_names.insert(0, own_tag_name)
         if self.isInterruptionRequested():
             return
         # Fetch the post details, asset details and tag-relation lookups
@@ -276,15 +326,22 @@ class DanbooruWikiFetchThread(QThread):
             # bottom of the wiki page in the same parallel batch.
             preview_posts_future = executor.submit(
                 self.fetch_preview_posts, resolved_title)
+            # Look up the tag type (category) of every tag linked in the body so
+            # those links can be coloured by type, like Danbooru and our post
+            # view. One batched request in the same parallel batch.
+            tag_categories_future = executor.submit(
+                self.fetch_tag_categories, tag_link_names)
             post_details_by_id = posts_future.result()
             asset_details_by_id = assets_future.result()
             relations = relations_future.result()
             is_deprecated = is_deprecated_future.result()
             wiki_posts = preview_posts_future.result()
+            tag_categories = tag_categories_future.result()
         wiki_page['_taggui_alias_names'] = relations['aliases']
         wiki_page['_taggui_implication_names'] = relations['implications']
         wiki_page['_taggui_implied_by_names'] = relations['implied_by']
         wiki_page['_taggui_is_deprecated'] = is_deprecated
+        wiki_page['_taggui_tag_categories'] = tag_categories
         self.fetch_succeeded.emit(self.request_key, wiki_page, post_details_by_id,
                                   asset_details_by_id, wiki_posts)
 
@@ -301,6 +358,63 @@ class DanbooruWikiFetchThread(QThread):
         posts = self.fetch_json_list(f'{DANBOORU_BASE_URL}/posts.json?{query}')
         return build_post_summaries_concurrently(
             posts, self.isInterruptionRequested)
+
+    @staticmethod
+    def extract_wiki_link_tag_names(body: str) -> list:
+        """Collect the distinct tag names linked with [[...]] in the body.
+
+        Names are lower-cased with spaces turned into underscores to match how
+        Danbooru stores tag names, so they can be looked up in the tags API.
+        The label part after "|" and any "#anchor" are dropped, and tag_group:
+        pseudo-tags (which have no tag record) are skipped."""
+        names = []
+        seen = set()
+        for inner in re.findall(r'\[\[([^\]]+)\]\]', body or ''):
+            target = inner.split('|', 1)[0].split('#', 1)[0].strip()
+            if not target:
+                continue
+            name = target.replace(' ', '_').casefold()
+            if not name or name.startswith('tag_group:') or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        return names
+
+    def fetch_tag_categories(self, tag_names: list) -> dict:
+        """Look up the Danbooru category (an int, e.g. 0=general, 4=character)
+        for each given tag name, so wiki-body links can be coloured by tag type.
+        Returns a {tag_name: category_int} map.
+
+        Large pages reference hundreds of tags, so the names are split into
+        batches and the batch requests run concurrently (like the other wiki
+        fetches) to keep loading fast."""
+        result = {}
+        names = [name for name in (tag_names or []) if name]
+        names = names[:MAX_WIKI_LINK_TAG_LOOKUPS]
+        if not names or self.isInterruptionRequested():
+            return result
+        batch_size = 100
+        batches = [names[start:start + batch_size]
+                   for start in range(0, len(names), batch_size)]
+
+        def fetch_batch(chunk: list) -> list:
+            if self.isInterruptionRequested():
+                return []
+            query = urlencode({'search[name_comma]': ','.join(chunk),
+                               'only': 'name,category', 'limit': len(chunk)})
+            return self.fetch_json_list(
+                f'{DANBOORU_BASE_URL}/tags.json?{query}')
+
+        with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
+            for tags in executor.map(fetch_batch, batches):
+                for tag in tags:
+                    if not isinstance(tag, dict):
+                        continue
+                    name = str(tag.get('name') or '')
+                    category = tag.get('category')
+                    if name and category is not None:
+                        result[name] = category
+        return result
 
     def fetch_json_list(self, api_url: str) -> list:
         try:
@@ -628,9 +742,13 @@ class DanbooruTagAutocompleteThread(QThread):
                 or (tag.get('tag') or {}).get('post_count')
                 or 0
             )
+            tag_category = tag.get('category')
+            if tag_category is None:
+                tag_category = (tag.get('tag') or {}).get('category')
             suggestions.append({
                 'name': tag_name,
-                'post_count': tag_count
+                'post_count': tag_count,
+                'category': tag_category
             })
         # The 'tag_query' autocomplete only returns tags that currently have
         # posts, so wiki-only entries (e.g. deprecated tags like "meme_attire"
@@ -765,6 +883,9 @@ class DanbooruWikiDialog(BaseWikiDialog):
         self._stored_implied_by_names = []
         self._stored_wiki_posts = []
         self._stored_is_deprecated = False
+        # {tag_name: Danbooru category int} for the tags linked in the current
+        # wiki body, used to colour those links by tag type.
+        self._stored_wiki_tag_categories = {}
         # State for the in-app post browser (posts search grid + single post
         # view). ``_active_composer`` recomposes whatever view is currently on
         # screen so a window resize can reflow it (grid columns / image size).
@@ -945,10 +1066,15 @@ class DanbooruWikiDialog(BaseWikiDialog):
             f'margin: 12px 0 0 0;"><i>This tag is {deprecated_link} and '
             f"can't be added to new posts.</i></p>")
 
+    def _muted_note_color(self) -> str:
+        """The grey used for muted note text (e.g. the alias/implication
+        footer and DText ``[tn]`` translation notes), matched to the theme."""
+        is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
+        return '#9aa0aa' if is_dark else '#777777'
+
     def _build_relations_html(self, is_dark: bool) -> str:
         note_color = '#9aa0aa' if is_dark else '#777777'
         sections = []
-
         def join_links(names: list) -> str:
             links = [self._internal_tag_link_html(name) for name in names]
             return ', '.join(link for link in links if link)
@@ -978,7 +1104,8 @@ class DanbooruWikiDialog(BaseWikiDialog):
 
     def _compose_wiki_html(self) -> str:
         is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
-        title_color = '#6baef6' if is_dark else '#0066cc'
+        title_color = (self._wiki_link_color(self._stored_wiki_title)
+                       or ('#6baef6' if is_dark else '#0066cc'))
         display_title = self._stored_wiki_title.replace('_', ' ')
         rendered_body = self.convert_dtext_to_html(self._stored_wiki_body)
         other_names_html = self._build_other_names_html(is_dark)
@@ -1567,10 +1694,15 @@ class DanbooruWikiDialog(BaseWikiDialog):
             url = (named_link_match.group('url_bracket')
                    or named_link_match.group('url_bare') or '')
             escaped_url = html.escape(url, quote=True)
-            external_marker = ('<span style="font-size: 0.8em;">'
-                               '&#8239;\u2197</span>')
-            return (f'<a href="{escaped_url}">{html.escape(label)}'
-                    f'{external_marker}</a>')
+            return f'<a href="{escaped_url}">{html.escape(label)}</a>'
+
+        relative_named_match = NAMED_RELATIVE_LINK_PATTERN.match(token)
+        if relative_named_match:
+            label = relative_named_match.group('label').strip()
+            path = (relative_named_match.group('path_bracket')
+                    or relative_named_match.group('path_bare') or '')
+            escaped_url = html.escape(f'{DANBOORU_BASE_URL}{path}', quote=True)
+            return f'<a href="{escaped_url}">{html.escape(label)}</a>'
 
         if token.startswith('http'):
             escaped_url = html.escape(token, quote=True)
@@ -1627,7 +1759,44 @@ class DanbooruWikiDialog(BaseWikiDialog):
             display_label = normalized_target.replace('_', ' ')
         link_label = display_label + link_label_suffix
         internal_url = f'{WIKI_INTERNAL_LINK_PREFIX}{quote(normalized_target)}'
-        return f'<a href="{internal_url}">{html.escape(link_label)}</a>'
+        color = self._wiki_link_color(normalized_target)
+        style = f' style="color: {color};"' if color else ''
+        return (f'<a href="{internal_url}"{style}>'
+                f'{html.escape(link_label)}</a>')
+
+    def _wiki_link_color(self, normalized_target: str) -> str:
+        """Colour for a wiki-body tag link based on its Danbooru tag type, or
+        '' when the type is unknown (leaving the default link colour)."""
+        categories = self._stored_wiki_tag_categories
+        if not categories:
+            return ''
+        category_id = categories.get(str(normalized_target).casefold())
+        if category_id is None:
+            return ''
+        try:
+            key = DANBOORU_TAG_CATEGORY_KEYS.get(int(category_id))
+        except (TypeError, ValueError):
+            return ''
+        if not key:
+            return ''
+        is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
+        return TAG_CATEGORY_COLORS[key][1 if is_dark else 0]
+
+    def suggestion_color(self, suggestion: dict) -> str:
+        """Colour an autocomplete suggestion by its Danbooru tag type. The
+        category comes back in the autocomplete response itself, so this adds no
+        extra network request."""
+        category_id = suggestion.get('category')
+        if category_id is None:
+            return ''
+        try:
+            key = DANBOORU_TAG_CATEGORY_KEYS.get(int(category_id))
+        except (TypeError, ValueError):
+            return ''
+        if not key:
+            return ''
+        is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
+        return TAG_CATEGORY_COLORS[key][1 if is_dark else 0]
 
     def normalize_heading_anchor(self, raw_anchor: str, heading_text: str) -> str:
         anchor = str(raw_anchor or '').strip()
@@ -1662,13 +1831,31 @@ class DanbooruWikiDialog(BaseWikiDialog):
         return self.apply_inline_formatting_tags(''.join(html_parts))
 
     def apply_inline_formatting_tags(self, text_html: str) -> str:
-        formatted_text = text_html
+        # [code]...[/code] is literal monospace text. Stash each span behind a
+        # placeholder so the formatting patterns below (and spoilers) can't
+        # reinterpret characters inside it, then restore it afterwards.
+        code_placeholders: list[str] = []
+
+        def stash_code(match: re.Match) -> str:
+            rendered = (
+                '<span style="font-family: monospace; '
+                'background-color: palette(alternate-base);">'
+                f'{match.group(1)}</span>')
+            placeholder = f'\x00CODE{len(code_placeholders)}\x00'
+            code_placeholders.append(rendered)
+            return placeholder
+
+        formatted_text = CODE_PATTERN.sub(stash_code, text_html)
         for pattern, html_tag in FORMATTING_PATTERNS:
             formatted_text = pattern.sub(
                 lambda match: f'<{html_tag}>{match.group(1)}</{html_tag}>',
                 formatted_text
             )
-        return self.apply_spoiler_tags(formatted_text)
+        formatted_text = self.apply_spoiler_tags(formatted_text)
+        for index, rendered in enumerate(code_placeholders):
+            formatted_text = formatted_text.replace(
+                f'\x00CODE{index}\x00', rendered)
+        return formatted_text
 
     def apply_spoiler_tags(self, text_html: str) -> str:
         """Render [spoiler]...[/spoiler] as a black bar hiding its contents.
@@ -1840,6 +2027,51 @@ class DanbooruWikiDialog(BaseWikiDialog):
             if casefolded_line == '[/quote]':
                 continue
 
+            # DText translation notes: [tn]...[/tn]. Danbooru renders these as a
+            # muted note. The markers may sit inline with the note text and the
+            # note may span several source lines. Render it like the
+            # alias/implication footer notes (small, muted grey) but WITHOUT the
+            # italics, matching the rest of the body's flow.
+            if casefolded_line.startswith('[tn]'):
+                flush_thumbnails()
+                # Sit close under a preceding heading, like normal paragraphs.
+                while html_lines and html_lines[-1] == '<br>':
+                    html_lines.pop()
+                segments = []
+                scan_index = index
+                segment = stripped_line[len('[tn]'):]
+                closing_found = False
+                while True:
+                    close_pos = segment.casefold().find('[/tn]')
+                    if close_pos != -1:
+                        segments.append(segment[:close_pos])
+                        closing_found = True
+                        break
+                    segments.append(segment)
+                    if scan_index + 1 >= len(lines):
+                        break
+                    scan_index += 1
+                    segment = lines[scan_index].strip()
+                if closing_found:
+                    skip_until = scan_index + 1
+                else:
+                    # No closing tag: consume only this line so the rest of the
+                    # page is not swallowed, and drop the stray opener marker.
+                    skip_until = index + 1
+                    segments = [stripped_line[len('[tn]'):]]
+                note_text = ' '.join(
+                    seg.strip() for seg in segments if seg.strip())
+                if note_text:
+                    note_html = self.linkify_inline_text(note_text)
+                    html_lines.append(
+                        f'<p style="margin: 0 0 0.9em 0; font-size: 0.9em; '
+                        f'color: {self._muted_note_color()}; '
+                        f'line-height: 1.2;">{note_html}</p>')
+                continue
+            # A stray closing note tag with no matching opener: drop it.
+            if casefolded_line == '[/tn]':
+                continue
+
             if casefolded_line.startswith('[expand=') and stripped_line.endswith(']'):
                 flush_thumbnails()
                 expand_title = stripped_line[len('[expand='):-1].strip()
@@ -1992,6 +2224,8 @@ class DanbooruWikiDialog(BaseWikiDialog):
             wiki_page.get('_taggui_implied_by_names') or [])
         self._stored_wiki_posts = wiki_posts or []
         self._stored_is_deprecated = bool(wiki_page.get('_taggui_is_deprecated'))
+        self._stored_wiki_tag_categories = (
+            wiki_page.get('_taggui_tag_categories') or {})
         self._active_composer = self._compose_wiki_html
         self._set_browser_html(self._compose_wiki_html())
         self.hide_loading()

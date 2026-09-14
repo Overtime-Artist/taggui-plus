@@ -130,6 +130,41 @@ class MainWindow(QMainWindow):
         self.tag_change_prompt_dispatch_scheduled = False
         self.skip_next_all_tags_removal_prompt = True
         self.should_skip_save_state_on_close = False
+        # Remember the panel (dock) layout separately for the "expanded"
+        # (maximized / full screen) window and the "normal" (restored) window.
+        # Qt only stores a single layout, so without this the panel sizes chosen
+        # while maximized are lost the moment the window is dragged out of
+        # maximized and are never restored when it is maximized again. These
+        # hold the most recent saveState() bytes for each mode and are swapped
+        # in changeEvent() whenever the window switches between the two modes.
+        self._expanded_dock_state = None
+        self._normal_dock_state = None
+        # Guard so the layout tracking below ignores the window-state changes
+        # that happen while the app is still starting up and restoring itself.
+        self._dock_state_tracking_ready = False
+        # While True, panel-layout snapshots are paused. It is turned on for the
+        # brief settling period around any main-window resize (maximize,
+        # restore, or manual drag) so the automatic panel rescaling Qt performs
+        # during that resize is NOT mistaken for a deliberate layout change.
+        self._suppress_dock_snapshot = False
+        # A layout queued to be re-applied once the window settles into its new
+        # size after a maximize/restore. Tuple of (state_bytes, expects_expanded)
+        # or None.
+        self._pending_dock_restore = None
+        # Debounced snapshot of the current mode's panel layout. Started only by
+        # dock resizes that are NOT part of a window resize (i.e. the user
+        # dragging a panel splitter), so it records deliberate layout changes.
+        self._dock_state_snapshot_timer = QTimer(self)
+        self._dock_state_snapshot_timer.setSingleShot(True)
+        self._dock_state_snapshot_timer.setInterval(300)
+        self._dock_state_snapshot_timer.timeout.connect(
+            self._snapshot_current_dock_state)
+        # Fires once the main window has stopped resizing. Re-applies any queued
+        # per-mode layout and then lifts the snapshot suppression.
+        self._dock_settle_timer = QTimer(self)
+        self._dock_settle_timer.setSingleShot(True)
+        self._dock_settle_timer.setInterval(150)
+        self._dock_settle_timer.timeout.connect(self._on_window_settled)
         # Set to True by the "Remove app data" flow so that closing the app does
         # not rewrite any of the data that was just deleted.
         self.is_removing_app_data = False
@@ -344,7 +379,22 @@ class MainWindow(QMainWindow):
         # Don't overwrite geometry/state if we're closing after importing settings
         if not self.should_skip_save_state_on_close:
             self.settings.setValue('geometry', self.saveGeometry())
-            self.settings.setValue('window_state', self.saveState())
+            current_state = self.saveState()
+            self.settings.setValue('window_state', current_state)
+            # Keep the current mode's cached per-mode layout in sync with what
+            # is on screen (the user may have resized panels without switching
+            # modes since the last swap), then persist both layouts so the
+            # maximized vs. normal panel sizes survive a restart.
+            if self.isMaximized() or self.isFullScreen():
+                self._expanded_dock_state = current_state
+            else:
+                self._normal_dock_state = current_state
+            if self._expanded_dock_state:
+                self.settings.setValue('expanded_dock_state',
+                                       self._expanded_dock_state)
+            if self._normal_dock_state:
+                self.settings.setValue('normal_dock_state',
+                                       self._normal_dock_state)
             # Persist the active image filter so the same filtered view (and
             # position within it) is restored on the next launch.
             self.settings.setValue(
@@ -377,6 +427,10 @@ class MainWindow(QMainWindow):
             QApplication.processEvents(
                 QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             self.setWindowOpacity(1.0)
+        # Begin remembering per-mode panel layouts now that the window has been
+        # shown and fully restored. Guarded so it only runs once.
+        if not self._dock_state_tracking_ready:
+            self._seed_dock_states()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -387,7 +441,100 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event):
         if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
             self.refresh_changed_image_files()
+        elif event.type() == QEvent.Type.WindowStateChange:
+            self._handle_window_state_change(event)
         super().changeEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # A change to the *main window* size (maximize, restore, or a manual
+        # drag) means Qt is about to auto-rescale the panels to fit. Pause
+        # layout snapshots and (re)start the settle timer so the rescale isn't
+        # recorded as a deliberate layout change. Note: dragging a panel
+        # splitter resizes the docks but NOT the main window, so it does not
+        # reach here and is therefore still captured normally.
+        if self._dock_state_tracking_ready:
+            self._suppress_dock_snapshot = True
+            self._dock_settle_timer.start()
+
+    @staticmethod
+    def _window_state_is_expanded(states) -> bool:
+        """Return True if the given window state is maximized or full screen."""
+        return bool(states & (Qt.WindowState.WindowMaximized
+                              | Qt.WindowState.WindowFullScreen))
+
+    def _handle_window_state_change(self, event):
+        """Queue the saved panel layout to be restored when the window switches
+        between the maximized/full-screen ("expanded") mode and the normal mode.
+
+        Qt keeps only one dock layout, so when the window leaves maximized it
+        shrinks the panels to fit and never restores the maximized sizes on the
+        way back. The actual re-apply happens in _on_window_settled(), once the
+        window has finished resizing into its new size.
+        """
+        if not self._dock_state_tracking_ready:
+            return
+        if self.isMinimized():
+            return
+        was_expanded = self._window_state_is_expanded(event.oldState())
+        is_expanded = self.isMaximized() or self.isFullScreen()
+        if was_expanded == is_expanded:
+            return
+        # Queue the layout previously saved for the mode we are entering so it
+        # is re-applied once the window settles at its new size.
+        target_state = (self._expanded_dock_state if is_expanded
+                        else self._normal_dock_state)
+        self._pending_dock_restore = (target_state, is_expanded)
+        # The resize accompanying this state change also arms these, but arm
+        # them here too in case the state change is delivered on its own.
+        self._suppress_dock_snapshot = True
+        self._dock_settle_timer.start()
+
+    def _on_window_settled(self):
+        """Run once the window has stopped resizing after a maximize/restore.
+
+        Re-applies the queued per-mode panel layout (if any) and then lifts the
+        snapshot suppression."""
+        pending = self._pending_dock_restore
+        self._pending_dock_restore = None
+        if pending is not None:
+            state, expected_expanded = pending
+            is_expanded = self.isMaximized() or self.isFullScreen()
+            if state and is_expanded == expected_expanded:
+                self.restoreState(state)
+        # Re-enable snapshots on the next event-loop pass, after the resize
+        # events caused by the restoreState() above have been processed.
+        QTimer.singleShot(
+            0, lambda: setattr(self, '_suppress_dock_snapshot', False))
+
+    def _snapshot_current_dock_state(self):
+        """Cache the current panel layout for whichever mode is active now.
+
+        Only called for deliberate panel-splitter drags (see resizeEvent)."""
+        if not self._dock_state_tracking_ready or self._suppress_dock_snapshot:
+            return
+        current_state = self.saveState()
+        if self.isMaximized() or self.isFullScreen():
+            self._expanded_dock_state = current_state
+        else:
+            self._normal_dock_state = current_state
+
+    def _seed_dock_states(self):
+        """Load the saved per-mode panel layouts and start tracking changes.
+
+        Called once, after the window is first shown and fully restored."""
+        expanded = self.settings.value('expanded_dock_state', type=bytes)
+        normal = self.settings.value('normal_dock_state', type=bytes)
+        self._expanded_dock_state = expanded or None
+        self._normal_dock_state = normal or None
+        # Make sure the current mode's cached layout matches what is on screen
+        # right now (which was just restored from the main 'window_state').
+        current_state = self.saveState()
+        if self.isMaximized() or self.isFullScreen():
+            self._expanded_dock_state = current_state
+        else:
+            self._normal_dock_state = current_state
+        self._dock_state_tracking_ready = True
 
     def eventFilter(self, obj, event):
         # Grid-view hold-to-peek robustness: the per-widget peek handlers (in
@@ -412,6 +559,15 @@ class MainWindow(QMainWindow):
                 and isinstance(obj, QDockWidget)
                 and obj.isFloating()):
             self.apply_floating_dock_title_bar_theme(obj)
+        # Record deliberate panel-splitter drags. A splitter drag resizes the
+        # docks but not the main window, so it does not trigger resizeEvent and
+        # therefore is never suppressed here.
+        if (self._dock_state_tracking_ready
+                and not self._suppress_dock_snapshot
+                and event.type() == QEvent.Type.Resize
+                and isinstance(obj, QDockWidget)
+                and obj in self.get_dock_widgets()):
+            self._dock_state_snapshot_timer.start()
         return super().eventFilter(obj, event)
 
     def set_font_size(self):
