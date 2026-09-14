@@ -1896,12 +1896,6 @@ class TagLibraryDialog(QDialog):
         implied_tags = [t.strip() for t in implied_text.split(',') if t.strip()]
         if not trigger_tags or not implied_tags:
             return
-        if any('*' in t or '?' in t for t in implied_tags):
-            QMessageBox.warning(self, 'Invalid Implication',
-                                'Implied tags cannot contain wildcards '
-                                '(* or ?). Wildcards are only allowed on the '
-                                'trigger (left) side.')
-            return
         added_any = False
         skipped_self = []
         for trigger in trigger_tags:

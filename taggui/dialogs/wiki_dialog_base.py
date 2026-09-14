@@ -2,7 +2,7 @@ import html
 import re
 
 from PySide6.QtCore import QEvent, QMimeData, Qt, QTimer, QUrl, Slot
-from PySide6.QtGui import (QPalette, QStandardItem, QStandardItemModel,
+from PySide6.QtGui import (QColor, QPalette, QStandardItem, QStandardItemModel,
                            QTextCursor)
 from PySide6.QtWidgets import (QCompleter, QDialog, QHBoxLayout, QLabel,
                                QLineEdit, QProgressBar, QPushButton,
@@ -779,10 +779,19 @@ class BaseWikiDialog(QDialog):
                 display_text = (f'{human_readable_tag} '
                                 f'({self.format_post_count(tag_count)})')
             self.autocomplete_display_to_tag[display_text] = tag_name
-            self.search_autocomplete_model.appendRow(QStandardItem(display_text))
+            item = QStandardItem(display_text)
+            color = self.suggestion_color(suggestion)
+            if color:
+                item.setForeground(QColor(color))
+            self.search_autocomplete_model.appendRow(item)
         self.search_completer.display_to_tag = self.autocomplete_display_to_tag
         if suggestions and self.search_line_edit.hasFocus():
             self.search_completer.complete()
+
+    def suggestion_color(self, suggestion: dict) -> str:
+        """Optional text colour for an autocomplete suggestion (e.g. coloured
+        by tag type). Subclasses may override; the default is no colour."""
+        return ''
 
     @Slot(str)
     def apply_autocomplete_selection(self, selected_text: str):
