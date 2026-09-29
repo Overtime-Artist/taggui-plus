@@ -59,3 +59,9 @@ class NaturalLanguagePosition(str, Enum):
 class CaptionDevice(str, Enum):
     GPU = 'GPU if available'
     CPU = 'CPU'
+
+
+class TaggerPrecision(str, Enum):
+    FP32 = 'FP32'
+    FP16 = 'FP16'
+    INT8 = 'INT8'

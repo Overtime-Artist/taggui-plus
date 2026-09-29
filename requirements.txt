@@ -11,9 +11,14 @@ transformers==4.57.6
 # Florence-2
 timm==1.0.20
 
-# WD Tagger
+# WD Tagger / PixAI Tagger (ONNX Runtime)
 huggingface-hub==0.35.3
-onnxruntime==1.23.1
+# On Windows, the DirectML build adds GPU acceleration on any DirectX 12 GPU
+# (NVIDIA, AMD, or Intel) while still including the CPU execution provider, so
+# tagging works on the GPU or the CPU depending on the "Device" setting. Other
+# platforms use the standard CPU build. (DirectML's latest release is 1.23.0.)
+onnxruntime-directml==1.23.0; platform_system == "Windows"
+onnxruntime==1.23.1; platform_system != "Windows"
 
 # Faster Hugging Face model downloads (Xet protocol)
 hf_xet==1.5.1
