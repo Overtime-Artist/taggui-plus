@@ -13,11 +13,45 @@ from onnxruntime import InferenceSession
 
 import auto_captioning.captioning_thread as captioning_thread
 from auto_captioning.auto_captioning_model import AutoCaptioningModel
+from utils.enums import CaptionDevice
 from utils.image import Image
 
 KAOMOJIS = ['0_0', '(o)_(o)', '+_+', '+_-', '._.', '<o>_<o>', '<|>_<|>', '=_=',
             '>_<', '3_3', '6_9', '>_o', '@_@', '^_^', 'o_o', 'u_u', 'x_x',
             '|_|', '||_||']
+
+
+def create_inference_session(
+        model_path, device_setting: CaptionDevice = CaptionDevice.CPU,
+        gpu_index: int = 0) -> InferenceSession:
+    """Create an ONNX Runtime inference session for a tagger model.
+
+    When the user selects ``GPU if available`` and a GPU execution provider is
+    installed, the GPU is used with an automatic fall back to the CPU provider.
+    With the default CPU-only ``onnxruntime`` package no GPU provider is
+    available, so this transparently runs on the CPU.
+    """
+    from onnxruntime import (get_available_providers, SessionOptions,
+                             ExecutionMode)
+    available_providers = set(get_available_providers())
+    session_options = SessionOptions()
+    providers = []
+    if device_setting == CaptionDevice.GPU:
+        if 'CUDAExecutionProvider' in available_providers:
+            providers.append(
+                ('CUDAExecutionProvider', {'device_id': gpu_index}))
+        elif 'DmlExecutionProvider' in available_providers:
+            # DirectML runs most reliably with memory pattern optimization
+            # disabled and sequential execution, as recommended by the
+            # onnxruntime DirectML documentation.
+            session_options.enable_mem_pattern = False
+            session_options.execution_mode = ExecutionMode.ORT_SEQUENTIAL
+            providers.append(
+                ('DmlExecutionProvider', {'device_id': gpu_index}))
+    # Always keep the CPU provider as a fall back.
+    providers.append('CPUExecutionProvider')
+    return InferenceSession(model_path, sess_options=session_options,
+                            providers=providers)
 
 
 class FilterTagMatchMode(str, Enum):
@@ -289,7 +323,9 @@ def apply_filter_tag_rules(
 
 
 class WdTaggerModel:
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str,
+                 device_setting: CaptionDevice = CaptionDevice.CPU,
+                 gpu_index: int = 0):
         model_path = Path(model_id) / 'model.onnx'
         if not model_path.is_file():
             model_path = huggingface_hub.hf_hub_download(model_id,
@@ -298,7 +334,8 @@ class WdTaggerModel:
         if not tags_path.is_file():
             tags_path = huggingface_hub.hf_hub_download(
                 model_id, filename='selected_tags.csv')
-        self.inference_session = InferenceSession(model_path)
+        self.inference_session = create_inference_session(
+            model_path, device_setting, gpu_index)
         self.tags = []
         self.rating_tags_indices = []
         self.general_tags_indices = []
@@ -366,7 +403,8 @@ class WdTagger(AutoCaptioningModel):
         return None
 
     def get_model(self):
-        return WdTaggerModel(self.model_id)
+        return WdTaggerModel(self.model_id, self.device_setting,
+                             self.caption_settings.get('gpu_index', 0))
 
     def get_captioning_message(self, are_multiple_images_selected: bool,
                                captioning_start_datetime: datetime) -> str:

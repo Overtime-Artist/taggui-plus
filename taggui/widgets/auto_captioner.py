@@ -13,14 +13,15 @@ from PySide6.QtWidgets import (QComboBox, QDockWidget, QFormLayout,
 from auto_captioning.auto_captioning_model import release_memory
 from auto_captioning.captioning_thread import CaptioningThread
 from auto_captioning.models.wd_tagger import WdTagger
-from auto_captioning.models.pixai_tagger import PixAiTagger
+from auto_captioning.models.pixai_tagger import (PixAiTagger,
+                                                 supports_precision_selection)
 from auto_captioning.models_list import MODELS, get_model_class
 from dialogs.caption_multiple_images_dialog import CaptionMultipleImagesDialog
 from models.image_list_model import ImageListModel
 from models.tag_library_model import TagLibraryModel
 from utils.big_widgets import TallPushButton
 from utils.enums import (CaptionDestination, CaptionDevice, CaptionPosition,
-                         NaturalLanguagePosition)
+                         NaturalLanguagePosition, TaggerPrecision)
 from utils.settings import (DEFAULT_SETTINGS, get_settings, get_tag_separator,
                             get_hidden_model_ids)
 from utils.settings_widgets import (FocusedScrollSettingsComboBox,
@@ -121,7 +122,8 @@ class CaptionSettingsForm(QVBoxLayout):
         basic_settings_form.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self.model_combo_box = FocusedScrollSettingsComboBox(
-            key='model_id', default='deepghs/pixai-tagger-v0.9-onnx')
+            key='model_id',
+            default='Mexes/pixai-tagger-v1.0-onnx-fp32-fp16-int8')
         # `setEditable()` must be called before `addItems()` to preserve any
         # custom model that was set.
         self.model_combo_box.setEditable(True)
@@ -206,6 +208,10 @@ class CaptionSettingsForm(QVBoxLayout):
         self.min_probability_spin_box.setSingleStep(0.01)
         self.max_tags_spin_box = FocusedScrollSettingsSpinBox(
             key='wd_tagger_max_tags', default=30, minimum=1, maximum=999)
+        self.precision_combo_box = FocusedScrollSettingsComboBox(
+            key='wd_tagger_precision', default=TaggerPrecision.FP32.value)
+        self.precision_combo_box.addItems(list(TaggerPrecision))
+        self.precision_label = QLabel('Precision')
         tag_filters_form = QFormLayout()
         tag_filters_form.setRowWrapPolicy(
             QFormLayout.RowWrapPolicy.WrapAllRows)
@@ -221,6 +227,8 @@ class CaptionSettingsForm(QVBoxLayout):
         wd_tagger_settings_form.addRow('Minimum probability',
                                        self.min_probability_spin_box)
         wd_tagger_settings_form.addRow('Maximum tags', self.max_tags_spin_box)
+        wd_tagger_settings_form.addRow(self.precision_label,
+                                       self.precision_combo_box)
         wd_tagger_settings_form.addRow(tag_filters_form)
 
         self.toggle_advanced_settings_form_button = TallPushButton(
@@ -414,8 +422,6 @@ class CaptionSettingsForm(QVBoxLayout):
             self.prompt_text_edit,
             self.caption_start_label,
             self.caption_start_line_edit,
-            self.device_label,
-            self.device_combo_box,
             self.load_in_4_bit_container,
             self.remove_tag_separators_container,
             self.horizontal_line,
@@ -428,6 +434,16 @@ class CaptionSettingsForm(QVBoxLayout):
             widget.setVisible(is_wd_tagger_model)
         for widget in non_wd_tagger_widgets:
             widget.setVisible(not is_wd_tagger_model)
+        # The Device dropdown applies to every model (including the ONNX
+        # taggers), so it stays visible regardless of the selected model.
+        self.device_label.setVisible(True)
+        self.device_combo_box.setVisible(True)
+        # The precision dropdown is only meaningful for tagger repositories
+        # that ship multiple precision weight files (e.g. PixAI Tagger v1.0).
+        supports_precision = (is_wd_tagger_model
+                              and supports_precision_selection(model_id))
+        self.precision_label.setVisible(supports_precision)
+        self.precision_combo_box.setVisible(supports_precision)
         # Only show the "Max image tokens" row for models whose processor
         # supports capping the number of image patches (e.g. Qwen models).
         supports_image_token_limit = getattr(
@@ -512,6 +528,7 @@ class CaptionSettingsForm(QVBoxLayout):
                     self.show_probabilities_check_box.isChecked(),
                 'min_probability': self.min_probability_spin_box.value(),
                 'max_tags': self.max_tags_spin_box.value(),
+                'precision': self.precision_combo_box.currentText(),
                 'tags_to_exclude':
                     self.tags_to_exclude_text_edit.toPlainText()
             }

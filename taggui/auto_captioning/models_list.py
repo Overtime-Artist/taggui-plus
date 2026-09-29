@@ -44,6 +44,7 @@ MODELS = [
     'SmilingWolf/wd-convnext-tagger-v3',
     'SmilingWolf/wd-vit-tagger-v3',
     'deepghs/pixai-tagger-v0.9-onnx',
+    'Mexes/pixai-tagger-v1.0-onnx-fp32-fp16-int8',
     'llava-hf/llava-1.5-7b-hf',
     'llava-hf/llava-1.5-13b-hf',
     'llava-hf/bakLlava-v1-hf'

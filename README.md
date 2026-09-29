@@ -48,7 +48,8 @@ captioning.
   them in a **synchronized zoom grid** and edit their shared **Common** tags and
   per-image **Differences** together.
 - **Automatic captioning and tagging** using a range of local vision models,
-  including **Qwen3-VL** caption models and the **PixAI v0.9** tagger.
+  including **Qwen3-VL** caption models and the **PixAI** tagger
+  (**v0.9** and **v1.0**).
 - **Batch tag operations** — find and replace, sort, shuffle, reverse, and
   reorder tags across many images at once.
 - **Advanced filtering** for both images and tags, with prefixes, wildcards,
@@ -140,6 +141,13 @@ have to activate it every time. **On Windows you can also just double-click
 > GPU, but CPU generation also works. On Linux you may also need to install the
 > system package `libxcb-cursor0`
 > (see [this Stack Overflow answer](https://stackoverflow.com/a/75941575)).
+>
+> **Tagger GPU acceleration:** On Windows the ONNX taggers (WD / PixAI) can also
+> run on the GPU via **DirectML** (any DirectX 12 GPU) — set **`Device`** to
+> `GPU if available` in the auto-captioning panel. If you are upgrading an
+> existing install, re-run `pip install -r requirements.txt` (with your `venv`
+> activated) so the DirectML runtime replaces the old CPU-only one. CPU tagging
+> keeps working either way.
 
 ## Uninstalling / removing
 
@@ -649,7 +657,10 @@ TagGUI Plus supports two kinds of models:
   `Instruct` and `Thinking` variants).
 - **Tagger models** produce booru-style tags: the **WD (Waifu Diffusion)
   Tagger** family and the **PixAI Tagger** — including **PixAI v0.9**
-  (`deepghs/pixai-tagger-v0.9-onnx`).
+  (`deepghs/pixai-tagger-v0.9-onnx`) and **PixAI v1.0**
+  (`Mexes/pixai-tagger-v1.0-onnx-fp32-fp16-int8`). The v1.0 repository ships
+  FP32, FP16, and INT8 weights; the **Precision** setting picks which to use
+  (default **FP32** for the best accuracy).
 
 > Qwen3-VL requires a recent Transformers version, which the pinned
 > `requirements.txt` already provides.
@@ -685,9 +696,31 @@ TagGUI Plus supports two kinds of models:
 <summary>Tagger options and tag-filter rules (WD / PixAI taggers)</summary>
 
 Tagger models add extra options: **show probabilities**, a **minimum
-probability** threshold, a **maximum number of tags**, and **`Tag filters`** —
-comma-separated rules to exclude or rewrite generated tags. Each comma-separated
-item is one rule.
+probability** threshold, a **maximum number of tags**, a **`Precision`**
+selector (see below), and **`Tag filters`**.
+
+**Precision (PixAI v1.0)** — the **`Precision`** dropdown appears for taggers
+that publish multiple weight files (currently PixAI Tagger v1.0) and chooses
+which to load:
+
+- **FP32** (default) — full precision, best accuracy, largest download
+  (~1.9 GB) and highest memory use.
+- **FP16** — half precision, meant for the GPU. On the GPU it is smaller and
+  faster with essentially the same tags; on the CPU it is *slower* than FP32
+  (CPUs have no native FP16 math), so use it with the GPU.
+- **INT8** — 8-bit quantized, the smallest and a good fast option on the CPU;
+  its tags differ very slightly from FP32.
+
+**Device (CPU / GPU)** — the **`Device`** dropdown also applies to the taggers.
+Choosing **`GPU if available`** runs tagging on the GPU when a GPU-capable ONNX
+Runtime is installed, and automatically falls back to the CPU otherwise. On
+Windows the pinned `requirements.txt` installs the **DirectML** build of ONNX
+Runtime, which enables any DirectX 12 GPU (NVIDIA, AMD, or Intel) while keeping
+full CPU support; other platforms use the CPU build. A sensible pairing is
+**GPU + FP16** or **CPU + FP32/INT8**.
+
+**`Tag filters`** are comma-separated rules to exclude or rewrite generated
+tags. Each comma-separated item is one rule.
 
 - `solo` — remove the exact tag `solo`
 - `1girl:person` — replace the exact tag `1girl` with `person`
@@ -715,9 +748,11 @@ item is one rule.
 
 Word boundaries are any non-alphanumeric character (spaces, `+`, `-`, etc.).
 Exact rules run before wildcard rules, and replace rules run before exclude
-rules. To use a literal comma or colon, wrap that side in double quotes (e.g.
-`smile:":)"`). If a replacement contains commas, it is inserted as multiple
-tags.
+rules. To use a literal comma or colon, wrap **that whole side** in double
+quotes. Quote the **target** for a colon in the replacement (e.g.
+`smile:":)"`), or quote the **source** when the tag itself contains a colon
+(e.g. `"rating:e":explicit`). If a replacement contains commas, it is inserted
+as multiple tags.
 
 </details>
 
