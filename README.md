@@ -72,6 +72,14 @@ captioning.
 Install **Python 3.12** (recommended; 3.11 also works) from
 [python.org](https://www.python.org/downloads/).
 
+> **Important — avoid the newest Python.** Use **Python 3.12** (or 3.11). Do
+> **not** use Python 3.13 or newer (3.14, etc.). The pinned libraries only
+> publish prebuilt packages for 3.12/3.11, so a newer Python causes errors like
+> `Could not find a version that satisfies the requirement ...` during the
+> install step below. On Linux distributions that ship a very new Python by
+> default (for example Arch Linux), install a 3.12 package explicitly and create
+> the virtual environment with it — for example `python3.12 -m venv venv`.
+
 - **On Windows:** during installation, tick the box that says **"Add Python to
   PATH"** before clicking Install. This lets you run `python` from any
   terminal.
@@ -124,6 +132,25 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+> On Linux, replace `python3` with `python3.12` if your system's default
+> `python3` is newer than 3.12 (see the Python version note above).
+
+> **Optional — FlashAttention on Linux:** FlashAttention is an optional speed-up
+> for a couple of the vision models (Florence-2, Phi-3-Vision). It is **not**
+> required — TagGUI Plus runs without it. On Windows the correct wheel is
+> installed automatically by the command above. On Linux there is no ready-made
+> package, so installing it means compiling from source, which needs the NVIDIA
+> CUDA toolkit (the `nvcc` compiler). If you have an NVIDIA GPU and want the
+> extra speed, install it **after** the command above (so `torch` is already
+> present) with:
+>
+> ```bash
+> pip install -r requirements-flash-attn.txt --no-build-isolation
+> ```
+>
+> The `--no-build-isolation` flag is required — without it the build fails with
+> `No module named 'torch'`.
 
 ### 4. Run the app
 

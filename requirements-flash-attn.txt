@@ -1,0 +1,19 @@
+# Optional: FlashAttention for Linux
+#
+# FlashAttention is an OPTIONAL speed-up for a couple of the vision models
+# (Florence-2, Phi-3-Vision). TagGUI Plus runs fine without it - Transformers
+# automatically falls back to a slower built-in attention backend, so you only
+# need this file if you specifically want the extra speed on an NVIDIA GPU.
+#
+# There is no prebuilt flash-attn wheel on PyPI for Linux, so pip has to COMPILE
+# it from source. That build:
+#   * needs the NVIDIA CUDA toolkit (the `nvcc` compiler) installed, and
+#   * must be run with --no-build-isolation so the build can see your already
+#     installed `torch` (otherwise it fails with "No module named 'torch'").
+#
+# Install it AFTER you have already run `pip install -r requirements.txt`
+# (so torch is present), with your virtual environment activated:
+#
+#     pip install -r requirements-flash-attn.txt --no-build-isolation
+#
+flash-attn==2.8.3; platform_system == "Linux"
