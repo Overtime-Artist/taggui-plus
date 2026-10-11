@@ -1031,6 +1031,10 @@ class ImageTagsEditor(QDockWidget):
         self._group_mode = False
         self._group_source_indices: list[QModelIndex] = []
         self._group_current_index: Optional[QModelIndex] = None
+        # Widget that held focus when NL mode was entered via the keyboard
+        # shortcut, so the same shortcut can hand focus back on exit. Only set
+        # on the keybind-enter path; see toggle_editor_mode.
+        self._pre_nl_focus_widget: Optional[QWidget] = None
         self.tag_input_box.target_indices_provider = \
             self._group_add_target_indices
         # Keep Left/Right variant cycling working while the user is interacting
@@ -1444,6 +1448,64 @@ class ImageTagsEditor(QDockWidget):
         Ctrl+Enter) targets only the current image; unchecked targets all
         selected. Does not touch the tag-list filter."""
         self.tag_input_box.pending_scope_current = bool(checked)
+
+    @Slot()
+    def toggle_editor_mode(self):
+        """Toggle whichever mode button occupies the editor's top slot.
+
+        The "Natural language mode" button and the "Current image only" scope
+        button share that slot and are mutually exclusive: the former shows for
+        a single image, the latter in the grouped multi-image view. This flips
+        whichever one is currently active. Bound to a configurable shortcut
+        (Ctrl+Space by default).
+
+        When it switches Natural language mode on, focus moves into the prompt
+        box so the user can start typing immediately. That focus happens only on
+        this keyboard-driven path (not inside ``set_natural_language_mode``) so
+        routine mode restores — e.g. when loading an image — never steal focus.
+
+        When it switches Natural language mode off, focus is handed back to
+        whatever held it when NL mode was entered, but only for a clean
+        excursion: the prompt box must still have focus at exit time. If focus
+        has since moved elsewhere (e.g. via another shortcut), that choice is
+        respected and nothing is restored.
+        """
+        if self._group_mode:
+            self.scope_button.setChecked(not self.scope_button.isChecked())
+            return
+        entering_nl_mode = not self.natural_language_mode_check_box.isChecked()
+        restore_target: Optional[QWidget] = None
+        if entering_nl_mode:
+            # Remember the current focus so it can be restored on exit.
+            self._pre_nl_focus_widget = QApplication.focusWidget()
+        else:
+            # Leaving NL mode: flush the prompt to the model now so the Images
+            # pane "[NL]" badge updates immediately. Hiding the text box from
+            # the keyboard doesn't reliably fire its focus-out save the way
+            # clicking elsewhere (e.g. onto the button) does. Safe to call
+            # unconditionally — it no-ops when the prompt is unchanged.
+            self.save_natural_language_prompt()
+            # Only restore focus for a clean round-trip: the prompt box still
+            # holds focus (the user never navigated away). Otherwise leave focus
+            # wherever it has moved.
+            if self.natural_language_text_edit.hasFocus():
+                restore_target = self._pre_nl_focus_widget
+            self._pre_nl_focus_widget = None
+        # Flipping the check state fires its toggled signal, which runs
+        # set_natural_language_mode and makes the prompt box visible before we
+        # focus it below.
+        self.natural_language_mode_check_box.setChecked(entering_nl_mode)
+        if entering_nl_mode:
+            self.raise_()
+            self.natural_language_text_edit.setFocus()
+        elif restore_target is not None:
+            try:
+                if restore_target.isVisible():
+                    restore_target.setFocus()
+            except RuntimeError:
+                # The remembered widget was destroyed (e.g. a directory reload
+                # rebuilt the view) between entering and exiting NL mode.
+                pass
 
     @Slot(str)
     def _on_filter_mode_changed(self, mode: str):

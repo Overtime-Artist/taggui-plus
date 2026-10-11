@@ -886,6 +886,7 @@ shortcuts`**; the defaults are listed below.
 | Danbooru / Gelbooru Wiki | `Ctrl`+`D` / `Ctrl`+`G` |
 | Previous / next image | `Ctrl`+`Up` / `Ctrl`+`Down` |
 | Jump to first untagged / incomplete image | `Ctrl`+`J` / `Ctrl`+`Shift`+`J` |
+| Toggle `Natural language mode` / `Current image only` (mode button) | `Ctrl`+`Space` |
 
 ### Focus shortcuts
 

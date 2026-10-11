@@ -283,14 +283,27 @@ _EXPORT_DEFAULTS = {**DEFAULT_SETTINGS, **AUTO_CAPTIONER_DEFAULTS}
 
 
 def _sanitize_keyboard_shortcuts(value) -> dict:
-    """Keep only string-to-string entries from an imported shortcuts map."""
+    """Keep only valid entries from an imported shortcuts map.
+
+    A binding may be a single key sequence (string) or several (a list of
+    strings), matching how the Keyboard Shortcuts dialog stores them. List
+    values are filtered down to their string members so a multi-binding
+    shortcut survives an export/import round-trip; entries that end up empty
+    are dropped.
+    """
     if not isinstance(value, dict):
         return {}
-    return {
-        action: shortcut
-        for action, shortcut in value.items()
-        if isinstance(action, str) and isinstance(shortcut, str)
-    }
+    sanitized = {}
+    for action, shortcut in value.items():
+        if not isinstance(action, str):
+            continue
+        if isinstance(shortcut, str):
+            sanitized[action] = shortcut
+        elif isinstance(shortcut, (list, tuple)):
+            sequences = [item for item in shortcut if isinstance(item, str)]
+            if sequences:
+                sanitized[action] = sequences
+    return sanitized
 
 
 def _make_json_serializable(obj):

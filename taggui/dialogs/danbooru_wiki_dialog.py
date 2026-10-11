@@ -617,7 +617,7 @@ class DanbooruWikiFetchThread(QThread):
 
 class DanbooruPostsSearchThread(QThread):
     """Fetches one page of a tag search and its thumbnails for the grid view."""
-    posts_ready = Signal(str, str, int, list)
+    posts_ready = Signal(str, str, int, list, object)
     posts_failed = Signal(str, str)
 
     def __init__(self, request_key: str, tags: str, page: int):
@@ -625,6 +625,34 @@ class DanbooruPostsSearchThread(QThread):
         self.request_key = request_key
         self.tags = str(tags or '').strip()
         self.page = max(1, int(page or 1))
+
+    def fetch_single_tag_category(self):
+        """Look up the Danbooru category (an int) for a single-tag search so the
+        "Posts: <tag>" heading can be coloured by tag type, matching how tags
+        are coloured elsewhere. Returns None for multi-tag searches or on any
+        failure (the heading then falls back to its default colour)."""
+        tag = self.tags
+        if not tag or ' ' in tag or self.isInterruptionRequested():
+            return None
+        query = urlencode({'search[name_comma]': tag,
+                           'only': 'name,category', 'limit': 1})
+        try:
+            with urlopen(f'{DANBOORU_BASE_URL}/tags.json?{query}',
+                         timeout=10) as response:
+                if response.status != 200:
+                    return None
+                data = json.loads(
+                    response.read().decode('utf-8', errors='replace'))
+        except Exception:
+            return None
+        if not isinstance(data, list):
+            return None
+        for entry in data:
+            if (isinstance(entry, dict)
+                    and str(entry.get('name') or '').casefold()
+                    == tag.casefold()):
+                return entry.get('category')
+        return None
 
     def run(self):
         query = urlencode({'tags': self.tags, 'page': self.page,
@@ -651,7 +679,9 @@ class DanbooruPostsSearchThread(QThread):
             posts = []
         summaries = build_post_summaries_concurrently(
             posts, self.isInterruptionRequested)
-        self.posts_ready.emit(self.request_key, self.tags, self.page, summaries)
+        category = self.fetch_single_tag_category()
+        self.posts_ready.emit(self.request_key, self.tags, self.page,
+                              summaries, category)
 
 
 class DanbooruPostViewThread(QThread):
@@ -1414,9 +1444,9 @@ class DanbooruWikiDialog(BaseWikiDialog):
         posts_thread.finished.connect(self.handle_posts_thread_finished)
         posts_thread.start()
 
-    @Slot(str, str, int, list)
+    @Slot(str, str, int, list, object)
     def display_posts_search(self, request_key: str, tags: str, page: int,
-                             posts: list):
+                             posts: list, category=None):
         if request_key != self.current_request_key:
             return
         # A single tag whose posts search returned results is a real Danbooru
@@ -1426,11 +1456,26 @@ class DanbooruWikiDialog(BaseWikiDialog):
         normalized_tags = str(tags or '').strip()
         if posts and normalized_tags and ' ' not in normalized_tags:
             self._valid_posts_tags.add(normalized_tags)
-        self._posts_view_state = {'tags': tags, 'page': page, 'posts': posts}
+        self._posts_view_state = {'tags': tags, 'page': page, 'posts': posts,
+                                  'category': category}
         self._active_composer = self._compose_posts_html
         self._set_browser_html(self._compose_posts_html())
         self.hide_loading()
         self.update_add_to_library_button_state()
+
+    def _category_id_to_color(self, category_id) -> str:
+        """Colour for a Danbooru numeric tag category, or '' when the category
+        is unknown (leaving the default colour)."""
+        if category_id is None:
+            return ''
+        try:
+            key = DANBOORU_TAG_CATEGORY_KEYS.get(int(category_id))
+        except (TypeError, ValueError):
+            return ''
+        if not key:
+            return ''
+        is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
+        return TAG_CATEGORY_COLORS[key][1 if is_dark else 0]
 
     def _compose_posts_html(self) -> str:
         state = self._posts_view_state or {}
@@ -1440,6 +1485,12 @@ class DanbooruWikiDialog(BaseWikiDialog):
         is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
         heading_color = '#6baef6' if is_dark else '#0066cc'
         link_color = heading_color
+        # Colour the "Posts: <tag>" heading by the tag's Danbooru category (same
+        # as a wiki page's title), falling back to the default blue for
+        # multi-tag searches or when the category is unknown.
+        category_color = self._category_id_to_color(state.get('category'))
+        if category_color:
+            heading_color = category_color
         display_tags = tags.replace('_', ' ')
         # Record the ordered ids so a post opened from this grid can offer
         # prev/next and a link back to this search page.
@@ -1770,33 +1821,14 @@ class DanbooruWikiDialog(BaseWikiDialog):
         categories = self._stored_wiki_tag_categories
         if not categories:
             return ''
-        category_id = categories.get(str(normalized_target).casefold())
-        if category_id is None:
-            return ''
-        try:
-            key = DANBOORU_TAG_CATEGORY_KEYS.get(int(category_id))
-        except (TypeError, ValueError):
-            return ''
-        if not key:
-            return ''
-        is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
-        return TAG_CATEGORY_COLORS[key][1 if is_dark else 0]
+        return self._category_id_to_color(
+            categories.get(str(normalized_target).casefold()))
 
     def suggestion_color(self, suggestion: dict) -> str:
         """Colour an autocomplete suggestion by its Danbooru tag type. The
         category comes back in the autocomplete response itself, so this adds no
         extra network request."""
-        category_id = suggestion.get('category')
-        if category_id is None:
-            return ''
-        try:
-            key = DANBOORU_TAG_CATEGORY_KEYS.get(int(category_id))
-        except (TypeError, ValueError):
-            return ''
-        if not key:
-            return ''
-        is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
-        return TAG_CATEGORY_COLORS[key][1 if is_dark else 0]
+        return self._category_id_to_color(suggestion.get('category'))
 
     def normalize_heading_anchor(self, raw_anchor: str, heading_text: str) -> str:
         anchor = str(raw_anchor or '').strip()
