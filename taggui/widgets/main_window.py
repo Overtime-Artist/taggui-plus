@@ -350,6 +350,14 @@ class MainWindow(QMainWindow):
             QKeySequence('Alt+Down'), self)
         self.pan_image_down_shortcut.activated.connect(
             self.image_viewer.pan_down)
+        # Defaults to Ctrl+Space; toggles whichever mode button sits in the
+        # editor's top slot — Natural language mode for a single image, or the
+        # "Current image only" scope in the grouped multi-image view.
+        # Reconfigurable via the Keyboard Shortcuts dialog.
+        self.toggle_editor_mode_shortcut = QShortcut(
+            QKeySequence('Ctrl+Space'), self)
+        self.toggle_editor_mode_shortcut.activated.connect(
+            self.image_tags_editor.toggle_editor_mode)
         self.apply_configured_shortcuts()
         self.restore()
         # Show the window once the first image has been rendered.  Fires via
@@ -1113,7 +1121,9 @@ class MainWindow(QMainWindow):
             ('focus_add_tag_box', 'Focus Add Tag Box', 'Alt+A'),
             ('focus_image_tags_list', 'Focus Image Tags List', 'Alt+I'),
             ('focus_all_tags_search', 'Focus All Tags Search Box', 'Alt+S'),
-            ('focus_auto_caption_button', 'Focus Auto-Caption Button', 'Alt+C')
+            ('focus_auto_caption_button', 'Focus Auto-Caption Button', 'Alt+C'),
+            ('toggle_editor_mode',
+             'Toggle Natural Language Mode / Current Image Only', 'Ctrl+Space')
         ]
 
     def get_shortcut_action_map(self) -> dict[str, QAction]:
@@ -1155,6 +1165,7 @@ class MainWindow(QMainWindow):
             'focus_image_tags_list': self.focus_image_tags_list_shortcut,
             'focus_all_tags_search': self.focus_search_tags_box_shortcut,
             'focus_auto_caption_button': self.focus_caption_button_shortcut,
+            'toggle_editor_mode': self.toggle_editor_mode_shortcut,
             **image_list_shortcuts
         }
 
@@ -1193,6 +1204,8 @@ class MainWindow(QMainWindow):
             'pan_image_right': [self.image_viewer.pan_right],
             'pan_image_up': [self.image_viewer.pan_up],
             'pan_image_down': [self.image_viewer.pan_down],
+            'toggle_editor_mode': [
+                self.image_tags_editor.toggle_editor_mode],
         }
 
     def apply_configured_shortcuts(self):
