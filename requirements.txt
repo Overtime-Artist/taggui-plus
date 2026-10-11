@@ -29,7 +29,13 @@ https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp312-cp312-win_amd64
 https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-win_amd64.whl; platform_system == "Windows" and python_version == "3.11"
 
 # FlashAttention (Florence-2, Phi-3-Vision)
-flash-attn==2.8.3; platform_system == "Linux"
+# On Windows we install a prebuilt wheel, so it "just works". On Linux there is
+# no prebuilt wheel on PyPI, so pip would have to compile flash-attn from source
+# (which needs the CUDA toolchain and fails under pip's default build
+# isolation). FlashAttention is only an optional speed-up, so Linux users who
+# want it should install it separately with:
+#     pip install -r requirements-flash-attn.txt
+# See that file and the README ("FlashAttention on Linux") for details.
 https://github.com/kingbri1/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSE-cp312-cp312-win_amd64.whl; platform_system == "Windows" and python_version == "3.12"
 https://github.com/kingbri1/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSE-cp311-cp311-win_amd64.whl; platform_system == "Windows" and python_version == "3.11"
 
