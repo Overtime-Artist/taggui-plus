@@ -22,7 +22,15 @@ QT_MESSAGES_TO_SUPPRESS = (
     '%c%d font-size:0;color:transparent NaN',
     'Failed to parse audio contentType:',
     'Failed to parse video contentType:',
-    'challenges.cloudflare.com/cdn-cgi/challenge-platform/'
+    'challenges.cloudflare.com/cdn-cgi/challenge-platform/',
+    # Benign noise emitted by Cloudflare's own "managed challenge" page while
+    # it verifies the browser (its own CSP blocks a probe to 'data:,', and it
+    # ships a web font the engine dislikes). None of this affects clearing the
+    # challenge or fetching the wiki afterwards.
+    'OTS parsing error:',
+    "Refused to connect to 'data:,'",
+    'Fetch API cannot load data:,',
+    '[Cloudflare Turnstile]'
 )
 _previous_qt_message_handler = None
 
@@ -52,6 +60,13 @@ def configure_embedded_browser_runtime():
         '--log-level=3',
         '--disable-gpu',
         '--disable-features=WebGPU',
+        # The embedded browser runs with the GPU disabled (above) for stability
+        # across the wide range of user hardware. Cloudflare's "managed
+        # challenge" (used by the Danbooru wiki) fingerprints the browser with
+        # WebGL, which is otherwise unavailable without a GPU; this flag lets
+        # Chromium satisfy those WebGL calls with its software renderer so the
+        # challenge can actually complete.
+        '--enable-unsafe-swiftshader',
         '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'
     ]
     for flag in required_flags:

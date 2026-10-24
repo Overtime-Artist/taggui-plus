@@ -48,6 +48,8 @@ class RemoveAppDataDialog(QDialog):
                        if models_dir is not None else 0)
         hf_dir = app_data.get_hugging_face_cache_directory()
         hf_size = app_data.get_directory_size_bytes(hf_dir)
+        browser_dirs = app_data.get_browser_profile_directories()
+        browser_size = app_data.get_browser_profile_size_bytes()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -70,13 +72,14 @@ class RemoveAppDataDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        # --- Caches (thumbnails + all scan/completion/duplicate caches) ---
+        # --- Caches (thumbnails + scan caches + Danbooru wiki browser data) ---
         self.caches_check_box = QCheckBox(
-            f'Caches (thumbnails and scan data) \u2013 '
-            f'{app_data.format_size(cache_size)}')
+            f'Caches (thumbnails, scan data, and Danbooru wiki browser data) '
+            f'\u2013 {app_data.format_size(cache_size + browser_size)}')
         self.caches_check_box.setChecked(True)
         layout.addWidget(self.caches_check_box)
-        layout.addWidget(self._hint(str(cache_dir)))
+        cache_paths = [str(cache_dir)] + [str(d) for d in browser_dirs]
+        layout.addWidget(self._hint('\n'.join(cache_paths)))
 
         # --- Settings ---
         self.settings_check_box = QCheckBox(
