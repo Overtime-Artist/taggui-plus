@@ -43,7 +43,13 @@ class AllTagsList(ElidedToolTipListView):
         self.all_tags_editor = all_tags_editor
         self.suppress_filter_on_selection_change = False
         self.setItemDelegate(TextEditItemDelegate(self))
-        self.setWordWrap(True)
+        # Word wrap is deliberately disabled here: with the All Tags list
+        # commonly holding thousands of rows, wrapping forces Qt to recompute
+        # every row's height on each width change, making the pane divider very
+        # sluggish to drag. Disabling wrap plus uniform item sizes keeps resizes
+        # fast; long tags elide and still show in full via the hover tooltip.
+        self.setWordWrap(False)
+        self.setUniformItemSizes(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
         # `selectionChanged` must be used and not `currentChanged` because
