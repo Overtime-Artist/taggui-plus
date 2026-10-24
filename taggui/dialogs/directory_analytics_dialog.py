@@ -93,7 +93,7 @@ class DirectoryAnalyticsDialog(QDialog):
         self._report: AnalyticsReport | None = None
 
         self.setWindowTitle('Directory Analytics')
-        self.resize(760, 620)
+        self.resize(960, 640)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -336,14 +336,48 @@ class DirectoryAnalyticsDialog(QDialog):
 
     def _subfolders_html(self, report: AnalyticsReport) -> str:
         parts = ['<h2>Per-subfolder</h2>']
-        rows = [[sub.name, sub.image_count, format_size(sub.total_size_bytes),
-                 f'{sub.average_megapixels:.2f}',
-                 f'{sub.caption_coverage_percent:.1f}%',
-                 f'{sub.completion_percent:.1f}%']
-                for sub in report.subfolders]
-        parts.append(_table(
-            ['Folder', 'Images', 'Size', 'Avg MP', 'Caption %', 'Complete %'],
-            rows))
+        headers = ['Folder', 'Images', 'Size', 'Avg MP', 'Caption %',
+                   'Complete %']
+        head_cells = ''.join(
+            f'<th style="text-align:{"left" if column == 0 else "right"}; '
+            f'padding:2px 10px; white-space:nowrap;">{escape(header)}</th>'
+            for column, header in enumerate(headers))
+        # Display subfolders as a tree: order by path components so each child
+        # sits directly beneath its parent, indent by depth, and show only the
+        # leaf folder name (the indentation conveys the parent). The underlying
+        # data and the CSV/Markdown exports keep the full relative path.
+        ordered = sorted(
+            report.subfolders,
+            key=lambda sub: () if sub.name == '.' else Path(sub.name).parts)
+        body = []
+        for sub in ordered:
+            name_parts = Path(sub.name).parts
+            if sub.name == '.' or not name_parts:
+                depth = 0
+                root_name = (Path(report.root_directory).name
+                             or report.root_directory or '.')
+                leaf = f'{root_name} (root)'
+            else:
+                depth = len(name_parts) - 1
+                leaf = name_parts[-1]
+            indent = '&nbsp;' * (4 * depth)
+            connector = ('<span style="color:gray;">\u2514</span>&nbsp;'
+                         if depth > 0 else '')
+            folder_cell = (f'<td style="text-align:left; padding:2px 10px; '
+                           f'white-space:nowrap;">'
+                           f'{indent}{connector}{escape(leaf)}</td>')
+            values = [sub.image_count, format_size(sub.total_size_bytes),
+                      f'{sub.average_megapixels:.2f}',
+                      f'{sub.caption_coverage_percent:.1f}%',
+                      f'{sub.completion_percent:.1f}%']
+            value_cells = ''.join(
+                f'<td style="text-align:right; padding:2px 10px; '
+                f'white-space:nowrap;">{escape(str(value))}</td>'
+                for value in values)
+            body.append(f'<tr>{folder_cell}{value_cells}</tr>')
+        parts.append(
+            f'<table cellspacing="0" style="border-collapse:collapse;">'
+            f'<tr>{head_cells}</tr>{"".join(body)}</table>')
         return ''.join(parts)
 
     def _examples_html(self, title: str, examples: list[str]) -> str:
