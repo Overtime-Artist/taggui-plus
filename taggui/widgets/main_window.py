@@ -1757,11 +1757,41 @@ class MainWindow(QMainWindow):
             return
         if chosen == add_action and missing_tags:
             self.image_tags_editor.remember_group_tag_anchor()
-            self.image_list_model.add_tags(missing_tags, [source_index])
+            tags_to_add = self._apply_implications_for_grid_add(missing_tags,
+                                                                image)
+            self.image_list_model.add_tags(tags_to_add, [source_index])
         elif chosen == remove_action and present_tags:
             self.image_tags_editor.remember_group_tag_anchor()
             self.image_list_model.remove_tags_from_images(present_tags,
                                                           [source_index])
+
+    def _apply_implications_for_grid_add(self, tags_to_add: list[str],
+                                         image: Image) -> list[str]:
+        """Expand the grid-cell add with implied tags, honoring the setting.
+
+        The grid cell context menu adds tags to a single image, so it mirrors
+        the Image Tags pane's single-image add path: when the
+        ``auto_apply_implications`` setting is enabled, any tags implied by the
+        tags being added are appended (skipping ones already on the image or
+        already queued) and registered in the tag library.
+        """
+        apply_mode = get_settings().value(
+            'auto_apply_implications',
+            defaultValue=DEFAULT_SETTINGS['auto_apply_implications'])
+        if isinstance(apply_mode, bool):
+            apply_mode = 'Single image only' if apply_mode else 'Off'
+        if apply_mode not in ('Single image only', 'All selected images'):
+            return tags_to_add
+        implied = self.tag_library_model.get_implied_tags(tags_to_add)
+        existing = set(image.tags)
+        queued = set(tags_to_add)
+        new_implied = [tag for tag in implied
+                       if tag not in existing and tag not in queued]
+        if not new_implied:
+            return tags_to_add
+        self.image_tags_editor.tag_input_box.add_new_tags_to_library(
+            new_implied)
+        return tags_to_add + new_implied
 
     @Slot()
     def _sync_variant_group_view(self, *args):
