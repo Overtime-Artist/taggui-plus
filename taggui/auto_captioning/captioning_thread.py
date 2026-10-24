@@ -87,6 +87,10 @@ class CaptioningThread(QThread):
     # `list[str]` for it to work.
     caption_generated = Signal(QModelIndex, str, list, str)
     progress_bar_update_requested = Signal(int)
+    # Emitted once at the start of a run when the user selected "GPU if
+    # available" but captioning will actually run on the CPU, so the main
+    # thread can show a warning dialog.
+    device_warning_requested = Signal(str)
 
     def __init__(self, parent, image_list_model: ImageListModel,
                  selected_image_indices: list[QModelIndex],
@@ -112,6 +116,11 @@ class CaptioningThread(QThread):
             self.clear_console_text_edit_requested.emit()
             print(error_message)
             return
+        # Warn (once, on the main thread) if the user asked for the GPU but
+        # captioning will actually run on the CPU.
+        device_warning = model.get_device_warning()
+        if device_warning:
+            self.device_warning_requested.emit(device_warning)
         model.load_processor_and_model()
         model.monkey_patch_after_loading()
         if self.is_canceled:
@@ -124,6 +133,8 @@ class CaptioningThread(QThread):
         captioning_message = model.get_captioning_message(
             are_multiple_images_selected, captioning_start_datetime)
         print(captioning_message)
+        if device_warning:
+            print(f'Warning: {device_warning}')
         caption_destination = self.caption_settings['caption_destination']
         caption_position = self.caption_settings['caption_position']
         natural_language_position = self.caption_settings[

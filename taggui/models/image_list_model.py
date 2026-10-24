@@ -885,6 +885,28 @@ class ImageListModel(QAbstractListModel):
                     (snapshot_mtime, new_mtime, tags,
                      natural_language_prompt) = entry['caption']
                     if image.caption_file_modified_time_ns == snapshot_mtime:
+                        # Guard against a mid-write race: the background scan
+                        # reads caption files on a worker thread, so it can read
+                        # a file in the instant it is being rewritten and see it
+                        # momentarily empty. Before letting an empty read replace
+                        # a caption that currently has content, re-read the file
+                        # synchronously here (on the main thread) to confirm it
+                        # is really empty. This never blocks a genuinely emptied
+                        # or deleted file (an intentional clear still applies),
+                        # it only rejects the transient empty read that would
+                        # otherwise wipe a saved caption.
+                        if (not tags and not natural_language_prompt
+                                and (image.tags
+                                     or image.natural_language_prompt)):
+                            text_file_path = image.path.with_suffix('.txt')
+                            (reread_tags, reread_prompt,
+                             reread_mtime) = read_caption_file(
+                                text_file_path, self.tag_separator)
+                            if reread_tags or reread_prompt:
+                                tags = reread_tags
+                                natural_language_prompt = reread_prompt
+                                if reread_mtime is not None:
+                                    new_mtime = reread_mtime
                         image.caption_file_modified_time_ns = new_mtime
                         image.tags = tags
                         image.natural_language_prompt = natural_language_prompt

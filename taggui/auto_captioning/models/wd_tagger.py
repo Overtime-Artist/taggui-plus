@@ -399,6 +399,33 @@ class WdTagger(AutoCaptioningModel):
     def get_error_message(self) -> str | None:
         return None
 
+    def get_device_warning(self) -> str | None:
+        """Warn only when the tagger will truly run on the CPU.
+
+        Unlike the PyTorch models, the ONNX taggers can use a GPU execution
+        provider that is not CUDA. On Windows the DirectML build of
+        `onnxruntime` accelerates any DirectX 12 GPU (NVIDIA, AMD, or Intel),
+        so an AMD/Intel user still gets GPU tagging and must not be warned.
+        Only warn when "GPU if available" is selected but neither a CUDA nor a
+        DirectML execution provider is installed.
+        """
+        if self.device_setting != CaptionDevice.GPU:
+            return None
+        try:
+            from onnxruntime import get_available_providers
+            providers = set(get_available_providers())
+        except Exception:
+            providers = set()
+        if ('CUDAExecutionProvider' in providers
+                or 'DmlExecutionProvider' in providers):
+            return None
+        return (
+            '"GPU if available" is selected, but no GPU execution provider was '
+            'found for the tagger, so it will run on the CPU. This is usually '
+            'much slower. On Windows the DirectML build of onnxruntime '
+            '(onnxruntime-directml) enables GPU tagging on any DirectX 12 GPU; '
+            'reinstall the requirements if it is missing.')
+
     def get_processor(self):
         return None
 
