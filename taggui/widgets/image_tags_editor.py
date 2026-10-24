@@ -1631,7 +1631,13 @@ class ImageTagsEditor(QDockWidget):
     def _add_group_tags_to_all(self, tags: list[str]):
         if not self._group_source_indices or not tags:
             return
-        self.image_list_model.add_tags(tags, list(self._group_source_indices))
+        # Snapshot the targets before expanding implications: registering new
+        # library tags can trigger a refresh that invalidates the stored
+        # indices.
+        target_indices = list(self._group_source_indices)
+        tags_to_add = self._expand_group_add_with_implications(
+            tags, all_selected_scope=True)
+        self.image_list_model.add_tags(tags_to_add, target_indices)
 
     @Slot(list)
     def _remove_group_tags_from_current(self, tags: list[str]):
@@ -1644,7 +1650,47 @@ class ImageTagsEditor(QDockWidget):
     def _add_group_tags_to_current(self, tags: list[str]):
         if self._group_current_index is None or not tags:
             return
-        self.image_list_model.add_tags(tags, [self._group_current_index])
+        # Snapshot the target before expanding implications: registering new
+        # library tags can trigger a refresh that invalidates the stored index.
+        target_index = self._group_current_index
+        image = self.image_list_model.data(target_index,
+                                           Qt.ItemDataRole.UserRole)
+        existing_tags = set(image.tags) if image is not None else set()
+        tags_to_add = self._expand_group_add_with_implications(
+            tags, all_selected_scope=False, existing_tags=existing_tags)
+        self.image_list_model.add_tags(tags_to_add, [target_index])
+
+    def _expand_group_add_with_implications(
+            self, tags: list[str], all_selected_scope: bool,
+            existing_tags: set[str] | None = None) -> list[str]:
+        """Append implied tags to a grouped-view add, honoring the setting.
+
+        Mirrors the Image Tags pane and grid-cell add paths so the grouped
+        right-click menu stays consistent with the ``auto_apply_implications``
+        setting. ``all_selected_scope`` is True for "Add to all selected" (a
+        multi-image add, which only expands implications in "All selected
+        images" mode) and False for "Add to current image" (a single-image
+        add, which also expands in "Single image only" mode). Implied tags
+        already being added, or already on the target image (via
+        ``existing_tags``), are skipped, and any genuinely new implied tags are
+        registered in the tag library.
+        """
+        apply_mode = get_settings().value(
+            'auto_apply_implications',
+            defaultValue=DEFAULT_SETTINGS['auto_apply_implications'])
+        if isinstance(apply_mode, bool):
+            apply_mode = 'Single image only' if apply_mode else 'Off'
+        allowed = (('All selected images',) if all_selected_scope
+                   else ('Single image only', 'All selected images'))
+        if apply_mode not in allowed:
+            return tags
+        implied = self.tag_input_box.tag_library_model.get_implied_tags(tags)
+        skip = set(tags) | (existing_tags or set())
+        new_implied = [tag for tag in implied if tag not in skip]
+        if not new_implied:
+            return tags
+        self.tag_input_box.add_new_tags_to_library(new_implied)
+        return tags + new_implied
 
     @Slot(str, str)
     def _rename_group_tag(self, old_tag: str, new_tag: str):

@@ -20,6 +20,9 @@ import shutil
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QStandardPaths
+
+from utils.danbooru_session import DANBOORU_PROFILE_NAME
 from utils.scan_cache import _get_cache_dir
 from utils.settings import DEFAULT_SETTINGS, get_settings
 
@@ -28,6 +31,37 @@ def get_cache_directory() -> Path:
     """Return the ``<cache>/taggui`` folder that holds thumbnails and all
     scan/completion/duplicate caches."""
     return _get_cache_dir()
+
+
+def get_browser_profile_directories() -> list[Path]:
+    """Return the on-disk folders QtWebEngine uses for the Danbooru wiki profile.
+
+    The Danbooru wiki clears a Cloudflare challenge in an embedded browser and
+    stores the resulting cookies (plus a small cache) in a dedicated QtWebEngine
+    profile. QtWebEngine places these under the platform's app-data and cache
+    locations, so they live outside the normal ``taggui`` cache folder and must
+    be removed separately during uninstall cleanup. Resolved via QStandardPaths
+    so the correct per-platform paths (Windows/macOS/Linux) are used.
+    """
+    directories = []
+    for location in (QStandardPaths.StandardLocation.AppDataLocation,
+                     QStandardPaths.StandardLocation.CacheLocation):
+        base = QStandardPaths.writableLocation(location)
+        if base:
+            directories.append(
+                Path(base) / 'QtWebEngine' / DANBOORU_PROFILE_NAME)
+    # De-duplicate while preserving order (some platforms may coincide).
+    unique = []
+    for directory in directories:
+        if directory not in unique:
+            unique.append(directory)
+    return unique
+
+
+def get_browser_profile_size_bytes() -> int:
+    """Return the combined size of the Danbooru wiki browser profile folders."""
+    return sum(get_directory_size_bytes(directory)
+               for directory in get_browser_profile_directories())
 
 
 def get_models_directory() -> Path | None:
@@ -116,8 +150,13 @@ def remove_directory(path: Path) -> bool:
 
 def remove_caches() -> bool:
     """Delete the thumbnail cache and all scan/completion/duplicate caches by
-    removing the whole ``<cache>/taggui`` folder."""
-    return remove_directory(get_cache_directory())
+    removing the whole ``<cache>/taggui`` folder, plus the Danbooru wiki browser
+    profile (Cloudflare clearance cookies and its small cache)."""
+    ok = remove_directory(get_cache_directory())
+    for directory in get_browser_profile_directories():
+        if not remove_directory(directory):
+            ok = False
+    return ok
 
 
 def remove_settings() -> bool:

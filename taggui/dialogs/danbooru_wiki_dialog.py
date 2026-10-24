@@ -4,7 +4,6 @@ import re
 from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlencode
-from urllib.request import urlopen
 
 from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QThread, Qt,
                             QTimer, QUrl, Signal, Slot)
@@ -16,6 +15,8 @@ from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel,
                                QVBoxLayout)
 
 from models.tag_library_model import TagLibraryModel
+from utils.danbooru_session import (cancel_pending_fetches, danbooru_urlopen,
+                                    initialize_on_main_thread)
 from dialogs.wiki_dialog_base import (AUTOCOMPLETE_ANY_SUFFIX_PATTERN, AUTOCOMPLETE_COUNT_SUFFIX_PATTERN,
                                      BaseWikiDialog, TAG_GROUP_NORMALIZED_PREFIX,
                                      TAG_GROUP_SEARCH_PREFIX)
@@ -160,7 +161,7 @@ def image_url_to_data_url(image_url: str, interruption_check=None) -> str:
     elif not image_url.startswith('http://') and not image_url.startswith('https://'):
         image_url = f'{DANBOORU_BASE_URL}/{image_url}'
     try:
-        with urlopen(image_url, timeout=10) as response:
+        with danbooru_urlopen(image_url, timeout=10) as response:
             if response.status != 200:
                 return ''
             image_bytes = response.read()
@@ -228,7 +229,7 @@ class DanbooruWikiFetchThread(QThread):
         query = urlencode({'search[title]': self.normalized_tag, 'limit': 1})
         api_url = f'{DANBOORU_BASE_URL}/wiki_pages.json?{query}'
         try:
-            with urlopen(api_url, timeout=10) as response:
+            with danbooru_urlopen(api_url, timeout=10) as response:
                 if response.status != 200:
                     self.fetch_failed.emit(
                         self.request_key,
@@ -253,7 +254,7 @@ class DanbooruWikiFetchThread(QThread):
     def fetch_wiki_page_by_id(self):
         api_url = f'{DANBOORU_BASE_URL}/wiki_pages/{quote(self.wiki_page_id)}.json'
         try:
-            with urlopen(api_url, timeout=10) as response:
+            with danbooru_urlopen(api_url, timeout=10) as response:
                 if response.status != 200:
                     self.fetch_failed.emit(
                         self.request_key,
@@ -418,7 +419,7 @@ class DanbooruWikiFetchThread(QThread):
 
     def fetch_json_list(self, api_url: str) -> list:
         try:
-            with urlopen(api_url, timeout=10) as response:
+            with danbooru_urlopen(api_url, timeout=10) as response:
                 if response.status != 200:
                     return []
                 data = json.loads(response.read().decode('utf-8', errors='replace'))
@@ -534,7 +535,7 @@ class DanbooruWikiFetchThread(QThread):
                                'limit': batch_size})
             posts_url = f'{DANBOORU_BASE_URL}/posts.json?{query}'
             try:
-                with urlopen(posts_url, timeout=15) as response:
+                with danbooru_urlopen(posts_url, timeout=15) as response:
                     if response.status != 200:
                         continue
                     posts = json.loads(
@@ -581,7 +582,7 @@ class DanbooruWikiFetchThread(QThread):
                                'limit': batch_size})
             assets_url = f'{DANBOORU_BASE_URL}/media_assets.json?{query}'
             try:
-                with urlopen(assets_url, timeout=15) as response:
+                with danbooru_urlopen(assets_url, timeout=15) as response:
                     if response.status != 200:
                         continue
                     assets = json.loads(
@@ -637,7 +638,7 @@ class DanbooruPostsSearchThread(QThread):
         query = urlencode({'search[name_comma]': tag,
                            'only': 'name,category', 'limit': 1})
         try:
-            with urlopen(f'{DANBOORU_BASE_URL}/tags.json?{query}',
+            with danbooru_urlopen(f'{DANBOORU_BASE_URL}/tags.json?{query}',
                          timeout=10) as response:
                 if response.status != 200:
                     return None
@@ -659,7 +660,7 @@ class DanbooruPostsSearchThread(QThread):
                            'limit': POSTS_PER_PAGE})
         posts_url = f'{DANBOORU_BASE_URL}/posts.json?{query}'
         try:
-            with urlopen(posts_url, timeout=10) as response:
+            with danbooru_urlopen(posts_url, timeout=10) as response:
                 if response.status != 200:
                     self.posts_failed.emit(
                         self.request_key,
@@ -697,7 +698,7 @@ class DanbooruPostViewThread(QThread):
     def run(self):
         post_url = f'{DANBOORU_BASE_URL}/posts/{quote(self.post_id)}.json'
         try:
-            with urlopen(post_url, timeout=10) as response:
+            with danbooru_urlopen(post_url, timeout=10) as response:
                 if response.status != 200:
                     self.post_failed.emit(
                         self.request_key,
@@ -753,7 +754,7 @@ class DanbooruTagAutocompleteThread(QThread):
         })
         tags_url = f'{DANBOORU_BASE_URL}/autocomplete.json?{query}'
         try:
-            with urlopen(tags_url, timeout=8) as response:
+            with danbooru_urlopen(tags_url, timeout=8) as response:
                 if response.status != 200:
                     self.suggestions_ready.emit(self.query_text, [])
                     return
@@ -802,7 +803,7 @@ class DanbooruTagAutocompleteThread(QThread):
         })
         wiki_url = f'{DANBOORU_BASE_URL}/autocomplete.json?{query}'
         try:
-            with urlopen(wiki_url, timeout=8) as response:
+            with danbooru_urlopen(wiki_url, timeout=8) as response:
                 if response.status != 200:
                     return []
                 entries = json.loads(
@@ -858,7 +859,7 @@ class DanbooruTagAutocompleteThread(QThread):
             return DanbooruTagAutocompleteThread.tag_group_titles_cache
         url = f'{DANBOORU_BASE_URL}/wiki_pages/tag_groups'
         try:
-            with urlopen(url, timeout=10) as response:
+            with danbooru_urlopen(url, timeout=10) as response:
                 if response.status != 200:
                     DanbooruTagAutocompleteThread.tag_group_titles_cache = []
                     return []
@@ -898,6 +899,10 @@ class DanbooruWikiDialog(BaseWikiDialog):
                  add_to_current_image_callback=None,
                  current_image_has_tag_callback=None):
         super().__init__(parent)
+        # Prepare the Cloudflare-challenge solver on the GUI thread before any
+        # background fetch worker starts; the first Danbooru request transparently
+        # clears the challenge and caches the cf_clearance cookie for reuse.
+        initialize_on_main_thread()
         self._init_wiki_state(tag_library_model, add_to_library_callback,
                               add_to_selected_images_callback,
                               selected_images_have_tag_callback,
@@ -950,6 +955,10 @@ class DanbooruWikiDialog(BaseWikiDialog):
         if self._torn_down:
             return
         self._torn_down = True
+        # Release any worker blocked on an in-flight browser page fetch so the
+        # thread joins below return promptly instead of waiting out the fetch
+        # timeout.
+        cancel_pending_fetches()
         # Stop the animated (indeterminate) loading bar first, on the GUI
         # thread. That bar runs an internal timer; switching it off here means
         # no timer is left running while we block below waiting for the worker

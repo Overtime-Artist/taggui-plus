@@ -129,6 +129,24 @@ class AutoCaptioningModel:
             device = torch.device('cpu')
         return device
 
+    def get_device_warning(self) -> str | None:
+        """Return a message if the user asked for the GPU but captioning will
+        actually run on the CPU, or `None` when there is nothing to warn about.
+
+        This catches the common case where PyTorch was installed without CUDA
+        support (or without support for the installed GPU), so `torch.cuda.
+        is_available()` is `False` and the model silently falls back to the CPU.
+        """
+        if (self.device_setting == CaptionDevice.GPU
+                and self.device.type != 'cuda'):
+            return (
+                '"GPU if available" is selected, but no CUDA-capable GPU was '
+                'detected, so captioning will run on the CPU. This is usually '
+                'much slower. CUDA requires an NVIDIA GPU together with a '
+                'matching CUDA build of PyTorch; see the README for how to '
+                'install the correct PyTorch build for your GPU.')
+        return None
+
     def get_additional_error_message(self) -> str | None:
         return None
 

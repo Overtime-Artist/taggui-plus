@@ -839,6 +839,16 @@ class AutoCaptioner(QDockWidget):
         alert.setText(text)
         alert.exec()
 
+    @Slot(str)
+    def show_device_warning(self, message: str):
+        # Only surface the GPU-fell-back-to-CPU dialog once per app session so a
+        # large batch (or repeated runs) does not nag the user. The warning is
+        # also printed to the console on every run that hits the condition.
+        if getattr(self, '_has_shown_device_warning', False):
+            return
+        self._has_shown_device_warning = True
+        QMessageBox.warning(self, 'Running on CPU', message)
+
     @Slot(QModelIndex, str, list, str)
     def forward_caption_generated(self, image_index: QModelIndex,
                                   caption: str, tags: list[str],
@@ -943,6 +953,8 @@ class AutoCaptioner(QDockWidget):
             self.forward_caption_generated)
         self.captioning_thread.progress_bar_update_requested.connect(
             self.progress_bar.setValue)
+        self.captioning_thread.device_warning_requested.connect(
+            self.show_device_warning)
         self.captioning_thread.finished.connect(restore_stdout_and_stderr)
         self.captioning_thread.finished.connect(self.progress_bar.hide)
         self.captioning_thread.finished.connect(

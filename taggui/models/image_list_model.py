@@ -885,6 +885,28 @@ class ImageListModel(QAbstractListModel):
                     (snapshot_mtime, new_mtime, tags,
                      natural_language_prompt) = entry['caption']
                     if image.caption_file_modified_time_ns == snapshot_mtime:
+                        # Guard against a mid-write race: the background scan
+                        # reads caption files on a worker thread, so it can read
+                        # a file in the instant it is being rewritten and see it
+                        # momentarily empty. Before letting an empty read replace
+                        # a caption that currently has content, re-read the file
+                        # synchronously here (on the main thread) to confirm it
+                        # is really empty. This never blocks a genuinely emptied
+                        # or deleted file (an intentional clear still applies),
+                        # it only rejects the transient empty read that would
+                        # otherwise wipe a saved caption.
+                        if (not tags and not natural_language_prompt
+                                and (image.tags
+                                     or image.natural_language_prompt)):
+                            text_file_path = image.path.with_suffix('.txt')
+                            (reread_tags, reread_prompt,
+                             reread_mtime) = read_caption_file(
+                                text_file_path, self.tag_separator)
+                            if reread_tags or reread_prompt:
+                                tags = reread_tags
+                                natural_language_prompt = reread_prompt
+                                if reread_mtime is not None:
+                                    new_mtime = reread_mtime
                         image.caption_file_modified_time_ns = new_mtime
                         image.tags = tags
                         image.natural_language_prompt = natural_language_prompt
@@ -1064,6 +1086,46 @@ class ImageListModel(QAbstractListModel):
                 else:
                     match_count += caption.count(text)
         return match_count
+
+    def get_text_matches(self, text: str, scope: Scope | str,
+                         whole_tags_only: bool, use_regex: bool
+                         ) -> tuple[int, list[tuple[str, int]]]:
+        """Return the total instance count and a per-tag breakdown in one pass.
+
+        The first value mirrors ``get_text_match_count`` exactly. The second is
+        a list of ``(tag, occurrences)`` for every distinct tag that contains a
+        match, ordered most frequent first (ties broken alphabetically), so the
+        Find and Replace dialog can preview which tags will be affected. The
+        regex is compiled once up front; an invalid pattern raises ``re.error``
+        for the caller to handle, matching ``get_text_match_count``.
+        """
+        match_count = 0
+        tag_counts: dict[str, int] = {}
+        pattern = re.compile(text) if use_regex else None
+        for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
+            if whole_tags_only:
+                for tag in image.tags:
+                    if (pattern.fullmatch(tag) if use_regex
+                            else tag == text):
+                        match_count += 1
+                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            else:
+                caption = self.tag_separator.join(image.tags)
+                if use_regex:
+                    match_count += len(pattern.findall(caption))
+                else:
+                    match_count += caption.count(text)
+                for tag in image.tags:
+                    occurrences = (len(pattern.findall(tag)) if use_regex
+                                   else tag.count(text))
+                    if occurrences:
+                        tag_counts[tag] = (tag_counts.get(tag, 0)
+                                           + occurrences)
+        ordered = sorted(tag_counts.items(),
+                         key=lambda item: (-item[1], item[0]))
+        return match_count, ordered
 
     def find_and_replace(self, find_text: str, replace_text: str,
                          scope: Scope | str, use_regex: bool):
