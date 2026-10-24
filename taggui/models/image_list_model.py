@@ -1087,6 +1087,46 @@ class ImageListModel(QAbstractListModel):
                     match_count += caption.count(text)
         return match_count
 
+    def get_text_matches(self, text: str, scope: Scope | str,
+                         whole_tags_only: bool, use_regex: bool
+                         ) -> tuple[int, list[tuple[str, int]]]:
+        """Return the total instance count and a per-tag breakdown in one pass.
+
+        The first value mirrors ``get_text_match_count`` exactly. The second is
+        a list of ``(tag, occurrences)`` for every distinct tag that contains a
+        match, ordered most frequent first (ties broken alphabetically), so the
+        Find and Replace dialog can preview which tags will be affected. The
+        regex is compiled once up front; an invalid pattern raises ``re.error``
+        for the caller to handle, matching ``get_text_match_count``.
+        """
+        match_count = 0
+        tag_counts: dict[str, int] = {}
+        pattern = re.compile(text) if use_regex else None
+        for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
+            if whole_tags_only:
+                for tag in image.tags:
+                    if (pattern.fullmatch(tag) if use_regex
+                            else tag == text):
+                        match_count += 1
+                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            else:
+                caption = self.tag_separator.join(image.tags)
+                if use_regex:
+                    match_count += len(pattern.findall(caption))
+                else:
+                    match_count += caption.count(text)
+                for tag in image.tags:
+                    occurrences = (len(pattern.findall(tag)) if use_regex
+                                   else tag.count(text))
+                    if occurrences:
+                        tag_counts[tag] = (tag_counts.get(tag, 0)
+                                           + occurrences)
+        ordered = sorted(tag_counts.items(),
+                         key=lambda item: (-item[1], item[0]))
+        return match_count, ordered
+
     def find_and_replace(self, find_text: str, replace_text: str,
                          scope: Scope | str, use_regex: bool):
         """
