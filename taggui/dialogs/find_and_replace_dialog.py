@@ -114,6 +114,12 @@ class FindAndReplaceDialog(QDialog):
         layout.addWidget(self.replace_button)
         self.display_match_count()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Pre-select the remembered find text so typing replaces it.
+        self.find_text_line_edit.setFocus()
+        self.find_text_line_edit.selectAll()
+
     def disable_replace_button(self):
         self.replace_button.setText('Replace')
         self.replace_button.setEnabled(False)
