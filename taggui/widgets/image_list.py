@@ -7,9 +7,11 @@ from operator import or_
 from pathlib import Path
 
 from PySide6.QtCore import (QEvent, QFile, QItemSelection, QItemSelectionModel,
-                            QItemSelectionRange, QModelIndex, QPointF, QRectF,
-                            QSize, QUrl, Qt, Signal, Slot)
-from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QKeyEvent,
+                            QItemSelectionRange, QMimeData, QModelIndex,
+                            QPersistentModelIndex, QPointF, QRectF, QSize,
+                            QUrl, Qt, Signal, Slot)
+from PySide6.QtGui import (QAction, QColor, QDesktopServices, QDrag, QFont,
+                           QIcon, QImageReader, QKeyEvent, QMouseEvent,
                            QPainter, QPalette, QPen, QTextDocument)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget,
                                QFileDialog, QHBoxLayout, QLabel, QInputDialog,
@@ -371,6 +373,16 @@ class ImageListView(ElidedToolTipListView):
         # If the actual height of the image is greater than 3 times the width,
         # the image will be scaled down to fit.
         self.setIconSize(QSize(image_width, image_width * 3))
+        # Selected images can be dragged out of the app as files (e.g. into a
+        # chat or a web upload field). Dragging is switched on per mouse press
+        # in `mousePressEvent`, only when pressing an already selected image,
+        # so dragging across unselected images still selects a range.
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.setDragEnabled(False)
+        # Set while a toggle-mode click on a selected image is deferred until
+        # the mouse is released (see `selectionCommand`).
+        self._deferred_toggle_index = None
+        self._dragged_out_since_press = False
 
         self.invert_selection_action = self.addAction('Invert Selection')
         self.invert_selection_action.setShortcut('Ctrl+I')
@@ -400,6 +412,10 @@ class ImageListView(ElidedToolTipListView):
         self.copy_paths_action.setShortcut('Ctrl+P')
         self.copy_paths_action.triggered.connect(
             self.copy_selected_image_paths)
+        self.copy_image_to_clipboard_action = self.addAction(
+            'Copy Image to Clipboard')
+        self.copy_image_to_clipboard_action.triggered.connect(
+            self.copy_current_image_to_clipboard)
         self.move_images_action = self.addAction('Move Images to...')
         self.move_images_action.setShortcut('Ctrl+M')
         self.move_images_action.triggered.connect(
@@ -457,6 +473,7 @@ class ImageListView(ElidedToolTipListView):
         self.context_menu.addAction(self.paste_tags_action)
         self.context_menu.addAction(self.copy_file_names_action)
         self.context_menu.addAction(self.copy_paths_action)
+        self.context_menu.addAction(self.copy_image_to_clipboard_action)
         self.context_menu.addSeparator()
         self.context_menu.addAction(self.move_images_action)
         self.context_menu.addAction(self.copy_images_action)
@@ -588,6 +605,93 @@ class ImageListView(ElidedToolTipListView):
 
     def contextMenuEvent(self, event):
         self.context_menu.exec_(event.globalPos())
+
+    def _is_drag_out_press(self, event: QMouseEvent) -> bool:
+        """Whether a mouse press should start dragging images out of the app.
+
+        Only a plain left-click on an already selected image does. Clicks with
+        Ctrl/Shift and presses on unselected images keep their normal
+        selection behavior (including drag-to-select a range).
+        """
+        if (event.button() != Qt.MouseButton.LeftButton
+                or event.modifiers() != Qt.KeyboardModifier.NoModifier):
+            return False
+        index = self.indexAt(event.position().toPoint())
+        return index.isValid() and self.selectionModel().isSelected(index)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        self._deferred_toggle_index = None
+        self._dragged_out_since_press = False
+        self.setDragEnabled(self._is_drag_out_press(event))
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        # Ignore any held-button movement left over after a drag-out so it
+        # can't start a drag-to-select that changes the selection.
+        if (self._dragged_out_since_press
+                and event.buttons() != Qt.MouseButton.NoButton):
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+    def selectionCommand(self, index, event=None):
+        # A mouse release that ends a drag-out must not change the selection
+        # (e.g. narrow a multi-image selection to the pressed image).
+        if (isinstance(event, QMouseEvent)
+                and event.type() == QEvent.Type.MouseButtonRelease
+                and self._dragged_out_since_press):
+            return QItemSelectionModel.SelectionFlag.NoUpdate
+        # In toggle selection mode a click normally deselects the pressed image
+        # immediately, which would drop it from a drag that follows. Defer that
+        # toggle to the mouse release instead, so a selected image can be
+        # dragged out, and a plain click on it still deselects it.
+        if (self.selectionMode()
+                == QAbstractItemView.SelectionMode.MultiSelection
+                and isinstance(event, QMouseEvent) and index.isValid()):
+            if (event.type() == QEvent.Type.MouseButtonPress
+                    and self._is_drag_out_press(event)):
+                self._deferred_toggle_index = QPersistentModelIndex(index)
+                return QItemSelectionModel.SelectionFlag.NoUpdate
+            if (event.type() == QEvent.Type.MouseButtonRelease
+                    and self._deferred_toggle_index is not None
+                    and QModelIndex(self._deferred_toggle_index) == index):
+                self._deferred_toggle_index = None
+                return QItemSelectionModel.SelectionFlag.Toggle
+        return super().selectionCommand(index, event)
+
+    def startDrag(self, supported_actions):
+        """Drag the selected image files out of the app.
+
+        Only a copy is offered, so dropping into a file manager can never move
+        or remove the original image from the dataset.
+        """
+        self._deferred_toggle_index = None
+        self._dragged_out_since_press = True
+        selected_indices = sorted(self.selectedIndexes(),
+                                  key=lambda index: index.row())
+        image_urls = []
+        for index in selected_indices:
+            image = index.data(Qt.ItemDataRole.UserRole)
+            if image is not None:
+                image_urls.append(QUrl.fromLocalFile(str(image.path)))
+        if not image_urls:
+            return
+        mime_data = QMimeData()
+        mime_data.setUrls(image_urls)
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        drag_index = self.currentIndex()
+        if drag_index not in selected_indices:
+            drag_index = selected_indices[0]
+        thumbnail = drag_index.data(Qt.ItemDataRole.DecorationRole)
+        if isinstance(thumbnail, QIcon) and thumbnail.availableSizes():
+            pixmap = thumbnail.pixmap(thumbnail.availableSizes()[0])
+            if not pixmap.isNull():
+                pixmap = pixmap.scaled(
+                    QSize(96, 96), Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)
+                drag.setPixmap(pixmap)
+                drag.setHotSpot(pixmap.rect().center())
+        drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
 
     def switch_between_selected_images(self, direction: int) -> bool:
         selected_proxy_indices = sorted(self.selectedIndexes(),
@@ -748,6 +852,29 @@ class ImageListView(ElidedToolTipListView):
         selected_images = self.get_selected_images()
         selected_image_paths = [str(image.path) for image in selected_images]
         QApplication.clipboard().setText('\n'.join(selected_image_paths))
+
+    @Slot()
+    def copy_current_image_to_clipboard(self):
+        """Copy the current image itself (not its path) to the clipboard, so it
+        can be pasted into other apps such as chats or image editors."""
+        current_image = self.get_current_image()
+        if current_image is None:
+            return
+        image_reader = QImageReader(str(current_image.path))
+        # Rotate the image based on the orientation tag, like the viewer does.
+        image_reader.setAutoTransform(True)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            image = image_reader.read()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if image.isNull():
+            QMessageBox.critical(
+                self, 'Error',
+                f'Failed to copy {current_image.path.name} to the clipboard:'
+                f'\n{image_reader.errorString()}')
+            return
+        QApplication.clipboard().setImage(image)
 
     @Slot()
     def move_selected_images(self):
@@ -966,6 +1093,8 @@ class ImageListView(ElidedToolTipListView):
                 has_caption_file = current_image.path.with_suffix(
                     '.txt').exists()
         self.open_image_action.setVisible(selected_image_count > 0)
+        self.copy_image_to_clipboard_action.setVisible(
+            selected_image_count > 0)
         self.open_image_editor_action.setVisible(selected_image_count > 0)
         self.rename_image_action.setVisible(selected_image_count == 1)
         self.open_caption_file_action.setVisible(has_caption_file)

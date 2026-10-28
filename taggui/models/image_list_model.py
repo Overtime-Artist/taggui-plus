@@ -532,6 +532,14 @@ class ImageListModel(QAbstractListModel):
     def rowCount(self, parent=None) -> int:
         return len(self.images)
 
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        # Images can be dragged out of the Images pane as files (see
+        # `ImageListView.startDrag`).
+        flags = super().flags(index)
+        if index.isValid():
+            flags |= Qt.ItemFlag.ItemIsDragEnabled
+        return flags
+
     def set_tokenizer(self, tokenizer):
         self.tokenizer = tokenizer
 
