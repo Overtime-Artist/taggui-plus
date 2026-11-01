@@ -19,7 +19,9 @@ QT_MESSAGES_TO_SUPPRESS = (
     "Error with Permissions-Policy header: Unrecognized feature: 'payment'.",
     "Error with Permissions-Policy header: Unrecognized feature: 'usb'.",
     'Failed to create WebGPU Context Provider',
-    '%c%d font-size:0;color:transparent NaN',
+    # Cloudflare's challenge page logs invisible console messages (e.g.
+    # '%c%d ... NaN' and '%c%o ... [object Object]') to detect open DevTools.
+    'font-size:0;color:transparent',
     'Failed to parse audio contentType:',
     'Failed to parse video contentType:',
     'challenges.cloudflare.com/cdn-cgi/challenge-platform/',
