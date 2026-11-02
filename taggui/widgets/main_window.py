@@ -2024,10 +2024,12 @@ class MainWindow(QMainWindow):
             return
         escaped_selected_tags = []
         for selected_tag in selected_tags:
-            # `[`, `*` and `?` are wildcards in the filter; wrap them in
-            # brackets so only this exact tag matches.
-            literal_tag = ''.join(f'[{character}]'
-                                  if character in '[*?' else character
+            # `*` and `?` are wildcards in the filter; escape them with a
+            # backslash (shown as `\\?` inside quotes). `[` has no backslash
+            # escape, so it becomes `[[]`.
+            literal_tag = ''.join('\\' + character if character in '*?'
+                                  else '[[]' if character == '['
+                                  else character
                                   for character in selected_tag)
             escaped_selected_tag = (literal_tag.replace('\\', '\\\\')
                                     .replace('"', r'\"')
