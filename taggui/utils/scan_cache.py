@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 
@@ -32,22 +33,99 @@ def _get_cache_dir() -> Path:
     return d
 
 
-def _load_json(path: Path) -> dict:
+# Serializes cache writes from the main thread and background save threads, so
+# two saves of the same file can never interleave.
+_save_lock = threading.Lock()
+# Files that were found damaged when loaded. Their damaged contents must not be
+# copied over the good backup on the next save.
+_damaged_paths: set[str] = set()
+
+
+def _get_backup_path(path: Path) -> Path:
+    return path.with_name(path.name + '.bak')
+
+
+def _read_json_dict(path: Path) -> dict:
+    """Read a JSON object from ``path``. Raises on a missing, unreadable or
+    damaged file."""
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f'{path} does not contain a JSON object')
+    return data
+
+
+def _load_json(path: Path, use_backup: bool = False) -> dict:
+    """Load a cache file, returning ``{}`` if it is missing or damaged.
+
+    With ``use_backup``, a damaged file falls back to the backup written by
+    ``_save_json(..., keep_backup=True)``. A missing file does not fall back,
+    so data the user deleted is not brought back.
+    """
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
+        return _read_json_dict(path)
+    except FileNotFoundError:
         return {}
-
-
-def _save_json(path: Path, data: dict):
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f)
     except Exception:
         pass
+    _damaged_paths.add(str(path))
+    if use_backup:
+        try:
+            return _read_json_dict(_get_backup_path(path))
+        except Exception:
+            pass
+    return {}
+
+
+def _replace_file_contents(path: Path, text: str):
+    """Write ``text`` to ``path`` so that a crash or interrupted write can
+    never leave a partial file: the text goes to a temporary file that is then
+    swapped into place in one step. Raises ``OSError`` on failure."""
+    temp_path = path.with_name(
+        f'{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+    try:
+        temp_path.write_text(text, encoding='utf-8')
+        # On Windows the swap fails while another thread has the target open
+        # for reading, so retry briefly.
+        for attempt in range(10):
+            try:
+                os.replace(temp_path, path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.05)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _save_json(path: Path, data: dict, keep_backup: bool = False):
+    """Save a cache file safely (see ``_replace_file_contents``).
+
+    With ``keep_backup``, the previous version is first copied to
+    ``<name>.bak`` so it can be used if the main file is ever damaged.
+    """
+    try:
+        text = json.dumps(data)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    with _save_lock:
+        if (keep_backup and str(path) not in _damaged_paths
+                and path.exists()):
+            try:
+                _replace_file_contents(_get_backup_path(path),
+                                       path.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+        try:
+            _replace_file_contents(path, text)
+            _damaged_paths.discard(str(path))
+        except Exception:
+            pass
 
 
 class ScanCache:
@@ -92,7 +170,13 @@ class ScanCache:
         if mtime_ns is None:
             return False
         cached = self.dimensions.get(str(image_path))
-        return cached is not None and cached.get('mtime_ns') == mtime_ns
+        if cached is None or cached.get('mtime_ns') != mtime_ns:
+            return False
+        # Older versions cached (-1, -1) for images whose size could not be
+        # read quickly (e.g. BMP). Treat those as not cached so they are read
+        # again.
+        dims = cached.get('dims')
+        return not dims or min(dims) > 0
 
     def cache_dimensions(self, updates: dict, image_path: Path,
                          mtime_ns: int | None, dimensions) -> None:

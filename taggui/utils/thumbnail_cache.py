@@ -1,6 +1,7 @@
 import hashlib
 import os
 import sys
+import threading
 from pathlib import Path
 
 
@@ -35,13 +36,47 @@ def get_cache_path(image_path: Path, file_modified_time_ns: int | None,
     return get_thumbnail_cache_dir() / f'{key}.png'
 
 
+def save_thumbnail(thumbnail_image, cache_path: Path):
+    """Save a thumbnail (a ``QImage``) to the cache without ever leaving a
+    partly written file: it is written to a temporary file first and then
+    swapped into place. Several threads may save the same thumbnail at once;
+    whichever finishes last wins, and both results are identical."""
+    temp_path = cache_path.with_name(
+        f'{cache_path.stem}.{os.getpid()}.{threading.get_ident()}.tmp')
+    try:
+        if thumbnail_image.save(str(temp_path), 'PNG'):
+            os.replace(temp_path, cache_path)
+    except OSError:
+        pass
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def mark_thumbnail_used(cache_path: Path):
+    """Record that a cached thumbnail was just used, so the cache size limit
+    removes the least recently used thumbnails first. (Windows does not
+    reliably record when a file was last read, so the modified time is used.)"""
+    try:
+        os.utime(cache_path)
+    except OSError:
+        pass
+
+
+def _is_cache_file(f: Path) -> bool:
+    # `.tmp` files are leftovers from a save that was interrupted.
+    return f.is_file() and f.suffix in ('.png', '.tmp')
+
+
 def get_cache_size_bytes() -> int:
     """Return total size of all cached thumbnail files in bytes."""
     cache_dir = get_thumbnail_cache_dir()
     try:
         return sum(
             f.stat().st_size for f in cache_dir.iterdir()
-            if f.is_file() and f.suffix == '.png'
+            if _is_cache_file(f)
         )
     except OSError:
         return 0
@@ -52,7 +87,7 @@ def clear_cache():
     cache_dir = get_thumbnail_cache_dir()
     try:
         for f in cache_dir.iterdir():
-            if f.is_file() and f.suffix == '.png':
+            if _is_cache_file(f):
                 try:
                     f.unlink()
                 except OSError:
@@ -63,18 +98,20 @@ def clear_cache():
 
 def evict_to_limit(max_bytes: int):
     """
-    Delete the oldest cached files (by access time) until the total cache
-    size is at or below max_bytes.  This is called in a background thread on
-    startup so stale / over-limit entries are cleaned up across sessions.
+    Delete the least recently used cached files until the total cache size is
+    at or below max_bytes. "Used" is the file's modified time, which is updated
+    by `mark_thumbnail_used` whenever a cached thumbnail is shown. This is
+    called in a background thread on startup so stale / over-limit entries are
+    cleaned up across sessions.
     """
     cache_dir = get_thumbnail_cache_dir()
     try:
         files = []
         for f in cache_dir.iterdir():
-            if f.is_file() and f.suffix == '.png':
+            if _is_cache_file(f):
                 try:
                     stat = f.stat()
-                    files.append((f, stat.st_size, stat.st_atime))
+                    files.append((f, stat.st_size, stat.st_mtime))
                 except OSError:
                     pass
     except OSError:
@@ -84,7 +121,7 @@ def evict_to_limit(max_bytes: int):
     if total <= max_bytes:
         return
 
-    # Delete oldest-accessed entries first
+    # Delete least recently used entries first
     files.sort(key=lambda x: x[2])
     for f, size, _ in files:
         try:

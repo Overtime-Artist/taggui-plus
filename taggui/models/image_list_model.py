@@ -13,14 +13,15 @@ import exifread
 import imagesize
 from PySide6.QtCore import (QAbstractListModel, QModelIndex, QObject,
                             QRunnable, QSize, Qt, QThreadPool, Signal, Slot)
-from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap
+from PySide6.QtGui import QIcon, QImage, QImageIOHandler, QImageReader, QPixmap
 from PySide6.QtWidgets import QMessageBox
 
 from utils.completion_store import get_completion_store
 from utils.enums import ImageListSortBy, SortOrder
 from utils.image import Image, build_caption_text, parse_caption_text
 from utils.settings import DEFAULT_SETTINGS, get_settings
-from utils.thumbnail_cache import evict_to_limit, get_cache_path
+from utils.thumbnail_cache import (evict_to_limit, get_cache_path,
+                                   mark_thumbnail_used, save_thumbnail)
 from utils.utils import get_confirmation_dialog_reply, pluralize
 
 UNDO_STACK_SIZE = 32
@@ -66,16 +67,10 @@ class BackgroundThumbnailWarmer(QRunnable):
             # what makes warming cheap on a directory that's mostly cached.
             if cache_path is None or cache_path.exists():
                 continue
-            image_reader = QImageReader(str(image_path))
-            # Rotate the image based on the orientation tag.
-            image_reader.setAutoTransform(True)
-            image = image_reader.read()
-            if image.isNull():
-                continue
-            thumbnail_image = image.scaledToWidth(
-                self.image_width, Qt.TransformationMode.SmoothTransformation)
+            thumbnail_image = create_thumbnail_image(image_path,
+                                                     self.image_width)
             if not thumbnail_image.isNull():
-                thumbnail_image.save(str(cache_path))
+                save_thumbnail(thumbnail_image, cache_path)
 
 
 class _CacheEvictionRunner(QRunnable):
@@ -89,18 +84,109 @@ class _CacheEvictionRunner(QRunnable):
         evict_to_limit(self.max_bytes)
 
 
-def get_file_paths(directory_path: Path) -> set[Path]:
+def get_file_paths(directory_path: Path,
+                   skipped_directories: list | None = None) -> set[Path]:
     """
     Recursively get all file paths in a directory, including those in
     subdirectories.
+
+    Subfolders that cannot be read (e.g. no permission) are skipped and added
+    to ``skipped_directories``; only an unreadable top folder raises
+    ``OSError``. Each real folder is scanned once, so a junction or symbolic
+    link that leads back to an already scanned folder (which could otherwise
+    loop) is not followed again. Linked folders are scanned after real ones so
+    images are listed under their real location when possible.
     """
     file_paths = set()
-    for path in directory_path.iterdir():
-        if path.is_file():
-            file_paths.add(path)
-        elif path.is_dir():
-            file_paths.update(get_file_paths(path))
+    visited_directories = set()
+    directories_to_scan = [directory_path]
+    linked_directories = []
+    while directories_to_scan or linked_directories:
+        directory = (directories_to_scan.pop() if directories_to_scan
+                     else linked_directories.pop())
+        try:
+            real_directory = os.path.normcase(os.path.realpath(directory))
+        except (OSError, ValueError):
+            real_directory = os.path.normcase(str(directory))
+        if real_directory in visited_directories:
+            continue
+        visited_directories.add(real_directory)
+        try:
+            with os.scandir(directory) as entries:
+                entries = list(entries)
+        except OSError:
+            if directory == directory_path:
+                raise
+            if skipped_directories is not None:
+                skipped_directories.append(directory)
+            continue
+        for entry in entries:
+            try:
+                if entry.is_file():
+                    file_paths.add(Path(entry.path))
+                elif entry.is_dir():
+                    # `is_junction` needs Python 3.12+; on older versions a
+                    # junction loop is still caught by the visited check.
+                    is_link = entry.is_symlink() or getattr(
+                        entry, 'is_junction', lambda: False)()
+                    if is_link:
+                        linked_directories.append(Path(entry.path))
+                    else:
+                        directories_to_scan.append(Path(entry.path))
+            except OSError:
+                continue
     return file_paths
+
+
+def get_caption_key(caption_path: Path) -> str:
+    """Key used to match an image to its caption file. Ignores upper/lower
+    case on Windows (where `a.TXT` and `a.txt` are the same file) and always
+    ignores the case of the `.txt` extension."""
+    return os.path.normcase(str(caption_path.with_suffix('.txt')))
+
+
+def get_caption_paths(file_paths) -> dict[str, Path]:
+    """Map caption key (see `get_caption_key`) -> actual caption file path for
+    every `.txt` file, whatever the case of its extension (`.txt`, `.TXT`)."""
+    return {get_caption_key(path): path for path in file_paths
+            if path.suffix.lower() == '.txt'}
+
+
+def get_caption_path(image_path: Path,
+                     caption_paths: dict[str, Path]) -> Path:
+    """The caption file for an image: the existing file found by the scan if
+    there is one, otherwise `<image name>.txt`."""
+    text_file_path = image_path.with_suffix('.txt')
+    return caption_paths.get(get_caption_key(text_file_path), text_file_path)
+
+
+def create_thumbnail_image(image_path: Path, image_width: int) -> QImage:
+    """Decode an image file into a thumbnail `image_width` pixels wide. Returns
+    a null `QImage` if the file cannot be read.
+
+    Large images are decoded at reduced size (twice the thumbnail width, then
+    smoothly scaled down as before), which needs far less memory and time than
+    decoding them at full size.
+    """
+    image_reader = QImageReader(str(image_path))
+    # Rotate the image based on the orientation tag.
+    image_reader.setAutoTransform(True)
+    size = image_reader.size()
+    if size.isValid() and size.width() > 0 and size.height() > 0:
+        is_rotated = bool(
+            image_reader.transformation()
+            & QImageIOHandler.Transformation.TransformationRotate90)
+        displayed_width = size.height() if is_rotated else size.width()
+        scale = 2 * image_width / displayed_width
+        if scale < 1:
+            image_reader.setScaledSize(QSize(
+                max(1, round(size.width() * scale)),
+                max(1, round(size.height() * scale))))
+    image = image_reader.read()
+    if image.isNull():
+        return QImage()
+    return image.scaledToWidth(image_width,
+                               Qt.TransformationMode.SmoothTransformation)
 
 
 def read_caption_file(text_file_path: Path,
@@ -132,6 +218,13 @@ def read_caption_file(text_file_path: Path,
 def get_image_dimensions(image_path: Path) -> tuple[int, int] | None:
     try:
         dimensions = imagesize.get(image_path)
+        if min(dimensions) <= 0:
+            # The fast header reader can't handle some formats (e.g. some
+            # BMPs); fall back to Qt's reader. None if neither can read it.
+            size = QImageReader(str(image_path)).size()
+            if not size.isValid() or size.width() <= 0 or size.height() <= 0:
+                return None
+            dimensions = (size.width(), size.height())
         # Check the Exif orientation tag and rotate the dimensions if
         # necessary.
         with open(image_path, 'rb') as image_file:
@@ -166,6 +259,21 @@ class HistoryItem:
 MAX_LISTED_WRITE_ERRORS = 10
 
 
+def get_existing_name_case(path: Path) -> Path:
+    """On case-insensitive file systems (Windows), return `path` with its last
+    part spelled the way the existing file is actually named (`a.txt` ->
+    `a.TXT`). Returns `path` unchanged if it doesn't exist or is a link."""
+    try:
+        if path.exists() and not path.is_symlink():
+            actual_name = path.resolve().name
+            if (actual_name != path.name
+                    and actual_name.lower() == path.name.lower()):
+                return path.with_name(actual_name)
+    except (OSError, RuntimeError):
+        pass
+    return path
+
+
 def write_text_atomically(path: Path, text: str):
     """Write a caption file so a crash mid-write cannot leave it truncated.
 
@@ -173,7 +281,11 @@ def write_text_atomically(path: Path, text: str):
     swapped into place in one step. If the swap is not possible (for example,
     another program has the file open), fall back to a direct write. Raises
     ``OSError`` if the file could not be written at all.
+
+    If the file already exists under a differently-cased name (e.g. `a.TXT`
+    when asked to write `a.txt` on Windows), that name is kept.
     """
+    path = get_existing_name_case(path)
     temp_path = path.with_name(f'.{path.name}.taggui-tmp')
     try:
         temp_path.write_text(text, encoding='utf-8', errors='replace')
@@ -206,6 +318,9 @@ class Scope(str, Enum):
 class DirectoryScanner(QObject, QRunnable):
     """Scans a directory for images and captions off the main thread."""
     scan_complete = Signal(list)
+    # Emitted instead of `scan_complete` if the scan could not finish, with a
+    # description of the problem.
+    scan_failed = Signal(str)
 
     def __init__(self, directory_path: Path, image_suffixes: list,
                  tag_separator: str):
@@ -214,22 +329,33 @@ class DirectoryScanner(QObject, QRunnable):
         self.directory_path = directory_path
         self.image_suffixes = image_suffixes
         self.tag_separator = tag_separator
+        # Subfolders that could not be read and were left out of the scan.
+        self.skipped_directories: list[Path] = []
         self.setAutoDelete(False)
 
     @Slot()
     def run(self):
+        try:
+            self._scan()
+        except Exception as exception:
+            # Never leave the folder half-loaded with no explanation.
+            print(f'Failed to load {self.directory_path}: {exception}',
+                  file=sys.stderr)
+            self.scan_failed.emit(str(exception))
+
+    def _scan(self):
         from utils.scan_cache import ScanCache
         scan_cache = ScanCache()
         scan_cache.load()
         completion_store = get_completion_store()
         completion_store.load()
 
-        file_paths = get_file_paths(self.directory_path)
+        file_paths = get_file_paths(self.directory_path,
+                                    self.skipped_directories)
         image_paths = sorted(
             p for p in file_paths if p.suffix.lower() in self.image_suffixes
         )
-        text_file_path_strings = {str(p) for p in file_paths
-                                  if p.suffix == '.txt'}
+        caption_paths = get_caption_paths(file_paths)
 
         dim_updates: dict = {}
         cap_updates: dict = {}
@@ -259,12 +385,16 @@ class DirectoryScanner(QObject, QRunnable):
 
             # Caption — use cache if available, otherwise read from disk.
             txt_path = image_path.with_suffix('.txt')
+            caption_key = get_caption_key(txt_path)
+            if caption_key in caption_paths:
+                # The actual file, which may be named e.g. `a.TXT`.
+                txt_path = caption_paths[caption_key]
             txt_path_str = str(txt_path)
             tags: list = []
             nl: str = ''
             cap_mtime_ns = None
 
-            if txt_path_str in text_file_path_strings:
+            if caption_key in caption_paths:
                 try:
                     cap_mtime_ns = txt_path.stat().st_mtime_ns
                 except OSError:
@@ -315,7 +445,8 @@ class DirectoryScanner(QObject, QRunnable):
         scan_cache.save_async(dim_updates, cap_updates,
                               directory_path=self.directory_path,
                               live_dim_keys=live_dim_keys,
-                              live_cap_keys=text_file_path_strings)
+                              live_cap_keys={str(path) for path
+                                             in caption_paths.values()})
         images.sort(key=lambda img: img.path)
         self.scan_complete.emit(images)
 
@@ -363,22 +494,37 @@ class RefreshScanner(QObject, QRunnable):
     def run(self):
         try:
             result = self._scan()
-        except OSError:
+        except Exception as exception:
             # The directory may have been removed or become unreadable while
             # scanning. Report an empty (no-op) diff so the UI simply skips
-            # this refresh; the next re-focus will try again.
+            # this refresh; the next re-focus will try again. (Any other error
+            # is handled the same way, so refreshing never stops working.)
+            if not isinstance(exception, OSError):
+                print(f'Failed to refresh {self.directory_path}: '
+                      f'{exception}', file=sys.stderr)
             result = RefreshResult(self.directory_path, [], set(), {})
         self.refresh_complete.emit(result)
 
     def _scan(self) -> 'RefreshResult':
         completion_store = get_completion_store()
-        file_paths = get_file_paths(self.directory_path)
+        skipped_directories: list[Path] = []
+        file_paths = get_file_paths(self.directory_path, skipped_directories)
         image_paths = {path for path in file_paths
                        if path.suffix.lower() in self.image_suffixes}
-        text_file_path_strings = {str(path) for path in file_paths
-                                  if path.suffix == '.txt'}
+        caption_paths = get_caption_paths(file_paths)
+
+        def is_in_skipped_directory(path: Path) -> bool:
+            return any(path.is_relative_to(directory)
+                       for directory in skipped_directories)
+
+        # Images in a subfolder that couldn't be read this time (e.g. briefly
+        # locked by another program) are left exactly as they are: not removed
+        # and not checked for changes.
+        unscanned_paths = ({path for path in self.snapshot
+                            if is_in_skipped_directory(path)}
+                           if skipped_directories else set())
         existing_paths = set(self.snapshot.keys())
-        removed_paths = existing_paths - image_paths
+        removed_paths = existing_paths - image_paths - unscanned_paths
         added_paths = sorted(image_paths - existing_paths)
 
         # Per-image info handed to the completion store so it can refresh hashes
@@ -401,9 +547,9 @@ class RefreshScanner(QObject, QRunnable):
             tags: list = []
             natural_language_prompt = ''
             caption_file_modified_time_ns = None
-            text_file_path = image_path.with_suffix('.txt')
+            text_file_path = get_caption_path(image_path, caption_paths)
             text_file_path_str = str(text_file_path)
-            if text_file_path_str in text_file_path_strings:
+            if get_caption_key(text_file_path) in caption_paths:
                 (tags, natural_language_prompt,
                  caption_file_modified_time_ns) = read_caption_file(
                      text_file_path, self.tag_separator)
@@ -427,7 +573,7 @@ class RefreshScanner(QObject, QRunnable):
         updates: dict = {}
         for image_path, (snapshot_file_mtime,
                          snapshot_caption_mtime) in self.snapshot.items():
-            if image_path in removed_paths:
+            if image_path in removed_paths or image_path in unscanned_paths:
                 continue
             entry: dict = {}
 
@@ -445,7 +591,7 @@ class RefreshScanner(QObject, QRunnable):
                                  get_image_dimensions(image_path))
 
             # Caption file: stat first; only read + parse when it changed.
-            text_file_path = image_path.with_suffix('.txt')
+            text_file_path = get_caption_path(image_path, caption_paths)
             text_file_path_str = str(text_file_path)
             try:
                 new_caption_mtime = text_file_path.stat().st_mtime_ns
@@ -515,21 +661,15 @@ class ThumbnailLoader(QObject, QRunnable):
         if cache_path is not None and cache_path.exists():
             cached_image = QImage(str(cache_path))
             if not cached_image.isNull():
+                mark_thumbnail_used(cache_path)
                 self.thumbnail_loaded.emit(
                     self.image_path, cached_image,
                     self.image_width, self.file_modified_time_ns)
                 return
-        image_reader = QImageReader(str(self.image_path))
-        # Rotate the image based on the orientation tag.
-        image_reader.setAutoTransform(True)
-        image = image_reader.read()
-        if image.isNull():
-            thumbnail_image = QImage()
-        else:
-            thumbnail_image = image.scaledToWidth(
-                self.image_width, Qt.TransformationMode.SmoothTransformation)
+        thumbnail_image = create_thumbnail_image(self.image_path,
+                                                 self.image_width)
         if not thumbnail_image.isNull() and cache_path is not None:
-            thumbnail_image.save(str(cache_path))
+            save_thumbnail(thumbnail_image, cache_path)
         self.thumbnail_loaded.emit(self.image_path, thumbnail_image,
                                    self.image_width,
                                    self.file_modified_time_ns)
@@ -538,6 +678,8 @@ class ThumbnailLoader(QObject, QRunnable):
 class ImageListModel(QAbstractListModel):
     update_undo_and_redo_actions_requested = Signal()
     directory_loaded = Signal()
+    # A folder scan failed; carries the folder path and the reason.
+    directory_load_failed = Signal(object, str)
 
     def __init__(self, image_list_image_width: int, tag_separator: str):
         super().__init__()
@@ -563,8 +705,12 @@ class ImageListModel(QAbstractListModel):
         self.proxy_image_list_model = None
         self.image_list_selection_model = None
         self.thumbnail_loaders = set()
+        # Image path -> row it was in when its thumbnail load was started.
+        self._thumbnail_row_hints: dict[Path, int] = {}
         self._current_scanner = None
         self._pending_images: list = []
+        # Subfolders the last completed folder scan could not read.
+        self.skipped_directories: list[Path] = []
         # Dedicated pool for all thumbnail work (both on-demand and bulk
         # preloading); capped so thumbnails can't starve the global pool, which
         # is reserved for the interactive image load, the directory scanner, and
@@ -631,6 +777,7 @@ class ImageListModel(QAbstractListModel):
             return
         self._preload_pool.clear()
         self._preload_generation += 1
+        self._thumbnail_row_hints.clear()
         self.image_list_image_width = normalized_width
         for image in self.images:
             image.thumbnail = None
@@ -644,10 +791,14 @@ class ImageListModel(QAbstractListModel):
         # Thumbnails are keyed by width, so the new size needs its own cache.
         self._start_background_warm()
 
-    def load_thumbnail(self, image: Image):
+    def load_thumbnail(self, image: Image, row: int | None = None):
         if image.thumbnail or image.thumbnail_loading:
             return
         image.thumbnail_loading = True
+        if row is not None:
+            # Lets `on_thumbnail_loaded` find the row without searching the
+            # whole list (slow for very large folders).
+            self._thumbnail_row_hints[image.path] = row
         thumbnail_loader = ThumbnailLoader(
             image.path, self.image_list_image_width, image.file_modified_time_ns)
         thumbnail_loader.thumbnail_loaded.connect(self.on_thumbnail_loaded)
@@ -666,7 +817,15 @@ class ImageListModel(QAbstractListModel):
         if thumbnail_loader in self.thumbnail_loaders:
             self.thumbnail_loaders.remove(thumbnail_loader)
             thumbnail_loader.deleteLater()
-        for row, image in enumerate(self.images):
+        row = self._thumbnail_row_hints.pop(image_path, None)
+        # The list may have been re-sorted or changed since the load started,
+        # so only trust the hint if it still points at this image.
+        if (row is not None and 0 <= row < len(self.images)
+                and self.images[row].path == image_path):
+            rows_and_images = [(row, self.images[row])]
+        else:
+            rows_and_images = enumerate(self.images)
+        for row, image in rows_and_images:
             if image.path != image_path:
                 continue
             if image_width != self.image_list_image_width:
@@ -723,6 +882,7 @@ class ImageListModel(QAbstractListModel):
             if cache_path is not None and cache_path.exists():
                 cached_image = QImage(str(cache_path))
                 if not cached_image.isNull():
+                    mark_thumbnail_used(cache_path)
                     pixmap = QPixmap.fromImage(cached_image)
                     thumbnail = QIcon(pixmap)
                     image.thumbnail = thumbnail
@@ -730,7 +890,7 @@ class ImageListModel(QAbstractListModel):
                     return thumbnail
             # Cache miss — start async loader, don't block main thread.
             if not image.thumbnail_loading:
-                self.load_thumbnail(image)
+                self.load_thumbnail(image, index.row())
             return None
         if role == Qt.ItemDataRole.SizeHintRole:
             if image.thumbnail:
@@ -853,6 +1013,7 @@ class ImageListModel(QAbstractListModel):
         # Cancel any pending preload workers from the previous directory.
         self._preload_pool.clear()
         self._preload_generation += 1
+        self._thumbnail_row_hints.clear()
         self.undo_stack.clear()
         self.redo_stack.clear()
         self._last_undo_push = None
@@ -863,8 +1024,16 @@ class ImageListModel(QAbstractListModel):
                                    self.tag_separator)
         scanner.scan_complete.connect(
             lambda images, s=scanner: self._on_directory_scanned(images, s))
+        scanner.scan_failed.connect(
+            lambda message, s=scanner: self._on_directory_scan_failed(
+                message, s))
         self._current_scanner = scanner
         QThreadPool.globalInstance().start(scanner)
+
+    def _on_directory_scan_failed(self, message: str, scanner):
+        if scanner is not self._current_scanner:
+            return
+        self.directory_load_failed.emit(scanner.directory_path, message)
 
     @Slot(list)
     def _on_directory_scanned(self, images: list, scanner=None):
@@ -873,6 +1042,8 @@ class ImageListModel(QAbstractListModel):
         # current and this stale result must not overwrite its images.
         if scanner is not None and scanner is not self._current_scanner:
             return
+        self.skipped_directories = (list(scanner.skipped_directories)
+                                    if scanner is not None else [])
         # Store images for main_window._on_directory_loaded to sort and commit
         # in a single model reset (avoids the double-reset from sort + load).
         self._pending_images = images

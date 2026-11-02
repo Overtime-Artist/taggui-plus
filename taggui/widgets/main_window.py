@@ -739,6 +739,13 @@ class MainWindow(QMainWindow):
         # next tag-count update as a new baseline, not a user-driven deletion.
         self.skip_next_all_tags_removal_prompt = True
         self.is_syncing_tag_library_from_directory = True
+        # Remembered so a failed load can put things back as they were.
+        self._directory_state_before_load = (
+            self.directory_path, self.windowTitle(), save_path_to_settings)
+        # Load and refresh must use the same form of the path (refresh uses
+        # `self.directory_path`); otherwise, for folders on mapped network
+        # drives or reached through links, every refresh would see all images
+        # as removed and re-added.
         self.directory_path = path.resolve()
         if save_path_to_settings:
             self.settings.setValue('directory_path', str(self.directory_path))
@@ -748,7 +755,25 @@ class MainWindow(QMainWindow):
         # Filter to reapply once loading completes (empty clears the filter, as
         # every normal directory load does).
         self._pending_directory_filter = restore_filter
-        self.image_list_model.load_directory(path)
+        self.image_list_model.load_directory(self.directory_path)
+
+    @Slot(object, str)
+    def _on_directory_load_failed(self, directory_path: Path, message: str):
+        previous_path, previous_title, was_saved = (
+            self._directory_state_before_load)
+        self.directory_path = previous_path
+        self.setWindowTitle(previous_title)
+        if was_saved:
+            self.settings.setValue(
+                'directory_path',
+                str(previous_path) if previous_path is not None else '')
+        self.skip_next_all_tags_removal_prompt = False
+        self.is_syncing_tag_library_from_directory = False
+        self._pending_directory_filter = ''
+        self._show_window()
+        QMessageBox.warning(
+            self, 'Could Not Load Folder',
+            f'The folder could not be loaded:\n{directory_path}\n\n{message}')
 
     @Slot(object)
     def _on_tokenizer_loaded(self, tokenizer):
@@ -802,6 +827,26 @@ class MainWindow(QMainWindow):
         # therefore no first_image_rendered signal, so show the window now.
         if not self.image_list_model.images:
             self._show_window()
+        skipped_directories = self.image_list_model.skipped_directories
+        if skipped_directories:
+            # Deferred so the window (and first image) can appear first.
+            QTimer.singleShot(
+                0, lambda: self._show_skipped_directories_notice(
+                    skipped_directories))
+
+    def _show_skipped_directories_notice(self, skipped_directories):
+        self._show_window()
+        listed = '\n'.join(str(path) for path in skipped_directories[:10])
+        if len(skipped_directories) > 10:
+            listed += f'\n... and {len(skipped_directories) - 10} more'
+        QMessageBox.information(
+            self, f'{pluralize("Subfolder", len(skipped_directories))} '
+                  f'Skipped',
+            f'{len(skipped_directories)} '
+            f'{pluralize("subfolder", len(skipped_directories))} could not '
+            f'be read (for example, because of folder permissions), so '
+            f'images inside {"it" if len(skipped_directories) == 1 else "them"}'
+            f' are not shown:\n\n{listed}')
 
     @Slot()
     def select_and_load_directory(self):
@@ -1664,6 +1709,8 @@ class MainWindow(QMainWindow):
             self.update_undo_and_redo_actions)
         self.image_list_model.directory_loaded.connect(
             self._on_directory_loaded)
+        self.image_list_model.directory_load_failed.connect(
+            self._on_directory_load_failed)
         # Rows are inserted or removed from the proxy image list model when the
         # filter is changed.
         self.proxy_image_list_model.rowsInserted.connect(
