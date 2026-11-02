@@ -56,6 +56,138 @@ def replace_filter_wildcards(filter_: str | list) -> str | list:
     return replaced_filter
 
 
+def ask_name_clash_action(parent, clashes: list, image_count: int,
+                          verb: str) -> str | None:
+    """Ask once what to do with images whose name is already taken in the
+    target folder. Returns 'skip', 'keep_both' or None (cancel)."""
+    names = format_error_summary(
+        [item.image_path.name for item in clashes])
+    message_box = QMessageBox(parent)
+    message_box.setIcon(QMessageBox.Icon.Warning)
+    message_box.setWindowTitle('Name Already Taken')
+    message_box.setText(
+        f'{len(clashes)} of {image_count} '
+        f'{pluralize("image", image_count)} cannot be {verb} without '
+        f'replacing a file of the same name in the target folder (or '
+        f'another selected image with the same name):\n\n{names}')
+    message_box.setInformativeText(
+        'Skip them, or keep both by adding a number to the new '
+        'file names, e.g. "image (2).png"?')
+    skip_button = message_box.addButton(
+        'Skip', QMessageBox.ButtonRole.AcceptRole)
+    keep_both_button = message_box.addButton(
+        'Keep Both', QMessageBox.ButtonRole.AcceptRole)
+    message_box.addButton(QMessageBox.StandardButton.Cancel)
+    message_box.setDefaultButton(keep_both_button)
+    message_box.exec()
+    clicked_button = message_box.clickedButton()
+    if clicked_button == skip_button:
+        return 'skip'
+    if clicked_button == keep_both_button:
+        return 'keep_both'
+    return None
+
+
+def transfer_images(parent, image_paths: list[Path], target_directory: Path,
+                    is_move: bool, all_image_paths,
+                    description: str = 'selected'
+                    ) -> list[tuple[Path, Path]]:
+    """Move or copy images and their captions into `target_directory`,
+    following the rules of `utils.image_file_operations` (never overwrite,
+    ask about name clashes, keep captions other images still use). Shows any
+    errors. `all_image_paths` are all loaded images (for shared captions).
+    Returns the (source, target) path of every image transferred."""
+    verb = 'move' if is_move else 'copy'
+    plan = plan_transfer(image_paths, target_directory, is_move)
+    if not plan.items:
+        QMessageBox.information(
+            parent, f'{verb.capitalize()} Images',
+            f'The {description} {pluralize("image", len(image_paths))} '
+            f'{"is" if len(image_paths) == 1 else "are"} already in '
+            f'that folder.')
+        return []
+    if plan.clashes:
+        action = ask_name_clash_action(
+            parent, plan.clashes, len(plan.items),
+            'moved' if is_move else 'copied')
+        if action is None:
+            return []
+        if action == 'keep_both':
+            resolve_clashes_by_renaming(plan)
+    caption_users = count_caption_users(all_image_paths)
+    result = execute_transfer(plan, is_move, caption_users)
+    completion_store = get_completion_store()
+    completion_changed = False
+    for source_path, target_path in result.transferred:
+        if is_move:
+            changed = completion_store.move_completion(source_path,
+                                                       target_path)
+        else:
+            changed = completion_store.copy_completion(source_path,
+                                                       target_path)
+        completion_changed = completion_changed or changed
+    if completion_changed:
+        completion_store.save()
+    if result.errors:
+        failed_count = len(plan.items) - len(result.transferred)
+        if failed_count:
+            heading = (f'{failed_count} of {len(plan.items)} '
+                       f'{pluralize("image", len(plan.items))} could not '
+                       f'be {"moved" if is_move else "copied"} to '
+                       f'{target_directory}:')
+        else:
+            heading = (f'Some caption files could not be '
+                       f'{"moved" if is_move else "copied"} to '
+                       f'{target_directory}:')
+        QMessageBox.critical(
+            parent, 'Error',
+            f'{heading}\n\n{format_error_summary(result.errors)}')
+    return result.transferred
+
+
+def trash_images(parent, image_paths: list[Path], all_image_paths
+                 ) -> list[Path]:
+    """Move images and their captions to the Recycle Bin (no confirmation).
+    A caption another loaded image still uses (`a.png` and `a.jpg` sharing
+    `a.txt`) is kept. Shows any errors. `all_image_paths` are all loaded
+    images. Returns the images deleted."""
+    caption_users = count_caption_users(all_image_paths)
+    errors = []
+    deleted = []
+    # Caption key -> caption file of a successfully deleted image.
+    orphaned_captions: dict[str, Path] = {}
+    for image_path in image_paths:
+        if not QFile(image_path).moveToTrash():
+            errors.append(f'{image_path.name} could not be moved to the '
+                          f'Recycle Bin.')
+            continue
+        deleted.append(image_path)
+        caption_key = get_caption_key(image_path.with_suffix('.txt'))
+        caption_users[caption_key] -= 1
+        caption_file_path = find_caption_file(image_path)
+        if caption_file_path is not None:
+            orphaned_captions[caption_key] = caption_file_path
+    # Only delete a caption once no remaining image uses it (an image
+    # that could not be deleted, or `a.jpg` sharing `a.txt` with `a.png`).
+    for caption_key, caption_file_path in orphaned_captions.items():
+        if caption_users[caption_key] > 0:
+            continue
+        caption_file = QFile(caption_file_path)
+        if caption_file.exists() and not caption_file.moveToTrash():
+            errors.append(f'Caption file {caption_file_path.name} could '
+                          f'not be moved to the Recycle Bin.')
+    if errors:
+        image_count = len(image_paths)
+        failed_count = image_count - len(deleted)
+        heading = (f'{failed_count} of {image_count} '
+                   f'{pluralize("image", image_count)} could not '
+                   f'be deleted:' if failed_count
+                   else 'Some caption files could not be deleted:')
+        QMessageBox.critical(
+            parent, 'Error', f'{heading}\n\n{format_error_summary(errors)}')
+    return deleted
+
+
 class FilterLineEdit(QLineEdit):
     def __init__(self):
         super().__init__()
@@ -1024,37 +1156,6 @@ class ImageListView(ElidedToolTipListView):
             return None
         return Path(directory_path)
 
-    def ask_name_clash_action(self, clashes: list, image_count: int,
-                              verb: str) -> str | None:
-        """Ask once what to do with images whose name is already taken in the
-        target folder. Returns 'skip', 'keep_both' or None (cancel)."""
-        names = format_error_summary(
-            [item.image_path.name for item in clashes])
-        message_box = QMessageBox(self)
-        message_box.setIcon(QMessageBox.Icon.Warning)
-        message_box.setWindowTitle('Name Already Taken')
-        message_box.setText(
-            f'{len(clashes)} of {image_count} '
-            f'{pluralize("image", image_count)} cannot be {verb} without '
-            f'replacing a file of the same name in the target folder (or '
-            f'another selected image with the same name):\n\n{names}')
-        message_box.setInformativeText(
-            'Skip them, or keep both by adding a number to the new '
-            'file names, e.g. "image (2).png"?')
-        skip_button = message_box.addButton(
-            'Skip', QMessageBox.ButtonRole.AcceptRole)
-        keep_both_button = message_box.addButton(
-            'Keep Both', QMessageBox.ButtonRole.AcceptRole)
-        message_box.addButton(QMessageBox.StandardButton.Cancel)
-        message_box.setDefaultButton(keep_both_button)
-        message_box.exec()
-        clicked_button = message_box.clickedButton()
-        if clicked_button == skip_button:
-            return 'skip'
-        if clicked_button == keep_both_button:
-            return 'keep_both'
-        return None
-
     def _transfer_selected_images(self, is_move: bool):
         verb = 'move' if is_move else 'copy'
         selected_images = self.get_selected_images()
@@ -1063,54 +1164,12 @@ class ImageListView(ElidedToolTipListView):
         target_directory = self._ask_directory(verb, len(selected_images))
         if target_directory is None:
             return
-        plan = plan_transfer([image.path for image in selected_images],
-                             target_directory, is_move)
-        if not plan.items:
-            QMessageBox.information(
-                self, f'{verb.capitalize()} Images',
-                f'The selected {pluralize("image", len(selected_images))} '
-                f'{"is" if len(selected_images) == 1 else "are"} already in '
-                f'that folder.')
-            return
-        if plan.clashes:
-            action = self.ask_name_clash_action(
-                plan.clashes, len(plan.items),
-                'moved' if is_move else 'copied')
-            if action is None:
-                return
-            if action == 'keep_both':
-                resolve_clashes_by_renaming(plan)
         source_model = self.proxy_image_list_model.sourceModel()
-        caption_users = count_caption_users(
-            image.path for image in source_model.images)
-        result = execute_transfer(plan, is_move, caption_users)
-        completion_store = get_completion_store()
-        completion_changed = False
-        for source_path, target_path in result.transferred:
-            if is_move:
-                changed = completion_store.move_completion(source_path,
-                                                           target_path)
-            else:
-                changed = completion_store.copy_completion(source_path,
-                                                           target_path)
-            completion_changed = completion_changed or changed
-        if completion_changed:
-            completion_store.save()
-        if result.errors:
-            failed_count = len(plan.items) - len(result.transferred)
-            if failed_count:
-                heading = (f'{failed_count} of {len(plan.items)} '
-                           f'{pluralize("image", len(plan.items))} could not '
-                           f'be {"moved" if is_move else "copied"} to '
-                           f'{target_directory}:')
-            else:
-                heading = (f'Some caption files could not be '
-                           f'{"moved" if is_move else "copied"} to '
-                           f'{target_directory}:')
-            QMessageBox.critical(
-                self, 'Error',
-                f'{heading}\n\n{format_error_summary(result.errors)}')
-        if result.transferred:
+        transferred = transfer_images(
+            self, [image.path for image in selected_images],
+            target_directory, is_move,
+            [image.path for image in source_model.images])
+        if transferred:
             # A copy into the open folder (or a subfolder) must show up too.
             self.directory_reload_requested.emit()
 
@@ -1137,40 +1196,8 @@ class ImageListView(ElidedToolTipListView):
         if reply != QMessageBox.StandardButton.Yes:
             return
         source_model = self.proxy_image_list_model.sourceModel()
-        caption_users = count_caption_users(
-            image.path for image in source_model.images)
-        errors = []
-        deleted_count = 0
-        # Caption key -> caption file of a successfully deleted image.
-        orphaned_captions: dict[str, Path] = {}
-        for image in selected_images:
-            if not QFile(image.path).moveToTrash():
-                errors.append(f'{image.path.name} could not be moved to the '
-                              f'Recycle Bin.')
-                continue
-            deleted_count += 1
-            caption_key = get_caption_key(image.path.with_suffix('.txt'))
-            caption_users[caption_key] -= 1
-            caption_file_path = find_caption_file(image.path)
-            if caption_file_path is not None:
-                orphaned_captions[caption_key] = caption_file_path
-        # Only delete a caption once no remaining image uses it (an image
-        # that could not be deleted, or `a.jpg` sharing `a.txt` with `a.png`).
-        for caption_key, caption_file_path in orphaned_captions.items():
-            if caption_users[caption_key] > 0:
-                continue
-            caption_file = QFile(caption_file_path)
-            if caption_file.exists() and not caption_file.moveToTrash():
-                errors.append(f'Caption file {caption_file_path.name} could '
-                              f'not be moved to the Recycle Bin.')
-        if errors:
-            failed_count = selected_image_count - deleted_count
-            heading = (f'{failed_count} of {selected_image_count} '
-                       f'{pluralize("image", selected_image_count)} could not '
-                       f'be deleted:' if failed_count
-                       else 'Some caption files could not be deleted:')
-            QMessageBox.critical(
-                self, 'Error', f'{heading}\n\n{format_error_summary(errors)}')
+        trash_images(self, [image.path for image in selected_images],
+                     [image.path for image in source_model.images])
         self.directory_reload_requested.emit()
 
     @Slot()

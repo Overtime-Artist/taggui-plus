@@ -1839,17 +1839,27 @@ class ImageListModel(QAbstractListModel):
         self.write_image_tags_to_disk(image)
 
     @Slot(list, list)
-    @collect_write_errors
     def add_tags(self, tags: list[str], image_indices: list[QModelIndex]):
         """Add one or more tags to one or more images."""
-        image_indices = self._valid_indices(image_indices)
-        if not image_indices:
+        self.add_tags_per_image([(index, tags) for index in image_indices],
+                                f'Add {pluralize("Tag", len(tags))}')
+
+    @collect_write_errors
+    def add_tags_per_image(self, tags_by_index: list[tuple[QModelIndex,
+                                                            list[str]]],
+                           action_name: str):
+        """Add each image's own list of tags to it, as one undo step. Tags
+        an image already has are skipped."""
+        valid_rows = range(len(self.images))
+        tags_by_index = [(index, tags) for index, tags in tags_by_index
+                         if tags and index is not None and index.isValid()
+                         and index.row() in valid_rows]
+        if not tags_by_index:
             return
-        action_name = f'Add {pluralize("Tag", len(tags))}'
-        should_ask_for_confirmation = len(image_indices) > 1
+        should_ask_for_confirmation = len(tags_by_index) > 1
         self.add_to_undo_stack(action_name, should_ask_for_confirmation)
         changed_indices = []
-        for image_index in image_indices:
+        for image_index, tags in tags_by_index:
             image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
             # A tag that only differs in letter case from one the image
             # already has counts as a duplicate, like in the Image Tags pane.

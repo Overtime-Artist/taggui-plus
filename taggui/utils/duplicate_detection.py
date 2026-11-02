@@ -12,6 +12,10 @@ Phase 1 provides two tiers of detection:
   must be to count as duplicates. A finer (256-bit) hash gives more useful,
   stricter gradations than a coarse 64-bit one.
 
+Near duplicates are grouped strictly: every image in a group is within the
+threshold of the group's main (largest) image, so a chain of small differences
+(A looks like B, B looks like C) can never pull very different images together.
+
 Both hashes are cached on disk keyed by ``(file_path, mtime_ns)`` (mirroring the
 existing :class:`~utils.scan_cache.ScanCache`), so re-scanning a folder only
 recomputes files whose modification time changed.
@@ -19,9 +23,10 @@ recomputes files whose modification time changed.
 
 from __future__ import annotations
 
-import json
+import os
 from pathlib import Path
 
+import numpy as np
 from PIL import Image as PILImage
 
 from utils.completion_store import _hash_file
@@ -118,6 +123,26 @@ class DuplicateCache:
         }
         self._dirty = True
 
+    def prune(self, scanned_paths: list[Path]) -> None:
+        """Forget files that no longer exist inside the folder that was just
+        scanned, so entries for deleted, moved or renamed images don't pile
+        up forever. Entries elsewhere are left alone."""
+        if not scanned_paths:
+            return
+        try:
+            root = os.path.commonpath([str(path.parent)
+                                       for path in scanned_paths])
+        except ValueError:
+            # Images on different drives have no common folder.
+            return
+        prefix = os.path.join(root, '')
+        scanned = {str(path) for path in scanned_paths}
+        for key in list(self._entries):
+            if (key.startswith(prefix) and key not in scanned
+                    and not os.path.exists(key)):
+                del self._entries[key]
+                self._dirty = True
+
     def save_if_dirty(self) -> None:
         if not self._dirty:
             return
@@ -158,14 +183,25 @@ def _stat_size_mtime(path: Path) -> tuple[int | None, int | None]:
         return None, None
 
 
-def _find(parent: list[int], node: int) -> int:
-    root = node
-    while parent[root] != root:
-        root = parent[root]
-    # Path compression keeps the union-find fast on large datasets.
-    while parent[node] != root:
-        parent[node], node = root, parent[node]
-    return root
+# Bits set in each byte value, for numpy versions without `bitwise_count`.
+_BYTE_BIT_COUNTS = np.array([bin(value).count('1') for value in range(256)],
+                            dtype=np.uint16)
+
+
+def _hashes_to_array(hashes: list[int]) -> np.ndarray:
+    """Pack 256-bit hashes into an (n, 4) array of 64-bit words."""
+    words = _DHASH_BITS // 64
+    mask = (1 << 64) - 1
+    return np.array([[(value >> (64 * word)) & mask for word in range(words)]
+                     for value in hashes], dtype=np.uint64).reshape(-1, words)
+
+
+def _distances(hashes: np.ndarray, center: np.ndarray) -> np.ndarray:
+    """Hamming distance from `center` to every row of `hashes`."""
+    differences = hashes ^ center
+    if hasattr(np, 'bitwise_count'):
+        return np.bitwise_count(differences).sum(axis=1, dtype=np.int32)
+    return _BYTE_BIT_COUNTS[differences.view(np.uint8)].sum(axis=1)
 
 
 def find_duplicate_groups(images, threshold: int,
@@ -177,15 +213,16 @@ def find_duplicate_groups(images, threshold: int,
     ``images`` is any iterable of objects exposing ``path`` and ``dimensions``
     (the app's :class:`~utils.image.Image` works directly).
 
-    ``threshold`` is the maximum dHash Hamming distance for two images to be
-    considered near-duplicates. ``0`` disables perceptual matching entirely so
-    that only byte-identical files (same SHA-256) are grouped ("exact /
-    identical only"). Larger values also catch edited variants (with more false
-    positives).
+    ``threshold`` is the maximum dHash Hamming distance between an image and
+    its group's main image for it to count as a near duplicate. ``0``
+    disables perceptual matching entirely so that only byte-identical files
+    (same SHA-256) are grouped ("exact / identical only"). Larger values also
+    catch edited variants (with more false positives).
 
-    ``progress_callback(done, total)`` is called as hashing proceeds and
-    ``should_cancel()`` (if given) is polled so a long scan can be aborted; on
-    cancellation an empty list is returned.
+    ``progress_callback(stage, done, total)`` is called as the scan proceeds,
+    with ``stage`` 'hashing' and then 'comparing'. ``should_cancel()`` (if
+    given) is polled so a long scan can be aborted; on cancellation an empty
+    list is returned.
     """
     if cache is None:
         cache = DuplicateCache()
@@ -196,6 +233,8 @@ def find_duplicate_groups(images, threshold: int,
     total = len(image_list)
     for done, image in enumerate(image_list):
         if should_cancel is not None and should_cancel():
+            # Keep the hashes computed so far for the next scan.
+            cache.save_if_dirty()
             return []
         path = Path(image.path)
         size, mtime_ns = _stat_size_mtime(path)
@@ -219,68 +258,86 @@ def find_duplicate_groups(images, threshold: int,
             path=path, dimensions=getattr(image, 'dimensions', None),
             size=size, mtime_ns=mtime_ns, sha256=sha256, dhash=dhash))
         if progress_callback is not None:
-            progress_callback(done + 1, total)
+            progress_callback('hashing', done + 1, total)
 
+    cache.prune([record.path for record in records])
     cache.save_if_dirty()
 
-    # Union-find over duplicate relationships. Two images are joined when they
-    # are byte-identical (same SHA-256) or their dHash distance is within the
-    # threshold. Exact copies naturally have distance 0 and are joined too.
-    parent = list(range(len(records)))
-
-    def union(a: int, b: int) -> None:
-        root_a, root_b = _find(parent, a), _find(parent, b)
-        if root_a != root_b:
-            parent[root_b] = root_a
-
-    # First pass: join exact duplicates by SHA-256 (cheap, no distance maths).
-    by_sha: dict[str, int] = {}
-    for index, record in enumerate(records):
+    # Byte-identical files (same SHA-256) always belong together; each set of
+    # them is handled as one unit below.
+    units: list[list[ImageRecord]] = []
+    by_sha: dict[str, list[ImageRecord]] = {}
+    for record in records:
         if record.sha256 is None:
-            continue
-        if record.sha256 in by_sha:
-            union(by_sha[record.sha256], index)
+            units.append([record])
+        elif record.sha256 in by_sha:
+            by_sha[record.sha256].append(record)
         else:
-            by_sha[record.sha256] = index
+            by_sha[record.sha256] = [record]
+            units.append(by_sha[record.sha256])
+    for unit in units:
+        unit.sort(key=_member_sort_key, reverse=True)
 
-    # Second pass: join near duplicates by dHash distance. Skipped entirely
-    # when the threshold is 0 ("exact / identical only"), so that mode groups
-    # strictly by byte-identical SHA-256 and never merges images that merely
-    # look alike. O(n^2) over images that have a dHash; fine for the typical
-    # few-hundred-to-few-thousand set.
-    if threshold > 0:
-        hashed = [i for i, r in enumerate(records) if r.dhash is not None]
-        for a_pos in range(len(hashed)):
-            if should_cancel is not None and should_cancel():
-                return []
-            i = hashed[a_pos]
-            for b_pos in range(a_pos + 1, len(hashed)):
-                j = hashed[b_pos]
-                if _find(parent, i) == _find(parent, j):
-                    continue  # Already grouped (e.g. exact match).
-                if hamming_distance(records[i].dhash,
-                                    records[j].dhash) <= threshold:
-                    union(i, j)
-
-    # Collect groups, keeping only those with more than one member.
-    clusters: dict[int, list[ImageRecord]] = {}
-    for index, record in enumerate(records):
-        root = _find(parent, index)
-        clusters.setdefault(root, []).append(record)
+    if threshold <= 0:
+        # "Exact / identical only": never merge images that merely look alike.
+        clusters = [unit for unit in units if len(unit) > 1]
+    else:
+        clusters = _group_near_duplicates(units, threshold, progress_callback,
+                                          should_cancel)
+        if clusters is None:
+            return []
 
     groups: list[DuplicateGroup] = []
-    for members in clusters.values():
-        if len(members) < 2:
-            continue
-        distinct_hashes = {m.sha256 for m in members if m.sha256 is not None}
-        kind = 'exact' if len(distinct_hashes) == 1 else 'near'
-        # Show the largest / newest first inside each group.
+    for members in clusters:
+        distinct_hashes = {m.sha256 for m in members}
+        kind = ('exact' if len(distinct_hashes) == 1
+                and None not in distinct_hashes else 'near')
+        # Show the largest / newest first inside each group. The sort is
+        # stable, so the main image stays first if another one ties with it.
         members.sort(key=_member_sort_key, reverse=True)
         groups.append(DuplicateGroup(members, kind))
 
     # Exact groups first, then by size (biggest groups on top).
     groups.sort(key=lambda g: (g.kind != 'exact', -len(g.members)))
     return groups
+
+
+def _group_near_duplicates(units: list[list[ImageRecord]], threshold: int,
+                           progress_callback, should_cancel
+                           ) -> list[list[ImageRecord]] | None:
+    """Group the units (sets of byte-identical images) around main images.
+
+    Going from the largest image down, each image not yet in a group becomes
+    the main image of a new group, which takes every remaining image within
+    `threshold` of it. Returns None if cancelled."""
+    hashed = [unit for unit in units if unit[0].dhash is not None]
+    clusters = [unit for unit in units
+                if unit[0].dhash is None and len(unit) > 1]
+    hashed.sort(key=lambda unit: _member_sort_key(unit[0]), reverse=True)
+    hashes = _hashes_to_array([unit[0].dhash for unit in hashed])
+    assigned = np.zeros(len(hashed), dtype=bool)
+    count = len(hashed)
+    for center in range(count):
+        if center % 256 == 0:
+            if should_cancel is not None and should_cancel():
+                return None
+            if progress_callback is not None:
+                progress_callback('comparing', center, count)
+        if assigned[center]:
+            continue
+        assigned[center] = True
+        rest = slice(center + 1, count)
+        close = ((_distances(hashes[rest], hashes[center]) <= threshold)
+                 & ~assigned[rest])
+        members = list(hashed[center])
+        for offset in np.flatnonzero(close):
+            members.extend(hashed[center + 1 + offset])
+        assigned[rest] |= close
+        if len(members) > 1:
+            clusters.append(members)
+    if progress_callback is not None:
+        progress_callback('comparing', count, count)
+    return clusters
 
 
 def _member_sort_key(record: ImageRecord):
