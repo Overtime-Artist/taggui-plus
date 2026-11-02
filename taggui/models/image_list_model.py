@@ -1,7 +1,10 @@
+import functools
+import os
 import random
 import re
 import sys
 from collections import Counter, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -153,9 +156,45 @@ def get_image_dimensions(image_path: Path) -> tuple[int, int] | None:
 @dataclass
 class HistoryItem:
     action_name: str
-    tags: list[list[str]]
-    natural_language_prompts: list[str]
+    # Keyed by image path (not list position) so undo/redo stays correct after
+    # the image list is re-sorted or files are added/removed by a refresh.
+    # Values are (tags, natural_language_prompt).
+    captions: dict[Path, tuple[list[str], str]]
     should_ask_for_confirmation: bool
+
+
+MAX_LISTED_WRITE_ERRORS = 10
+
+
+def write_text_atomically(path: Path, text: str):
+    """Write a caption file so a crash mid-write cannot leave it truncated.
+
+    The text is written to a temporary file next to the target, which is then
+    swapped into place in one step. If the swap is not possible (for example,
+    another program has the file open), fall back to a direct write. Raises
+    ``OSError`` if the file could not be written at all.
+    """
+    temp_path = path.with_name(f'.{path.name}.taggui-tmp')
+    try:
+        temp_path.write_text(text, encoding='utf-8', errors='replace')
+        os.replace(temp_path, path)
+        return
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    path.write_text(text, encoding='utf-8', errors='replace')
+
+
+def collect_write_errors(method):
+    """Decorator for bulk caption operations: show one summary error message
+    at the end instead of one message per caption file that fails to save."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.batch_write_errors():
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class Scope(str, Enum):
@@ -508,6 +547,14 @@ class ImageListModel(QAbstractListModel):
         self.images: list[Image] = []
         self.undo_stack = deque(maxlen=UNDO_STACK_SIZE)
         self.redo_stack = []
+        # What the most recent `add_to_undo_stack` call displaced (the oldest
+        # undo entry dropped by the size limit, and the cleared redo stack), so
+        # a bulk operation that ends up changing nothing can be fully undone
+        # from the history. None when there is nothing to restore.
+        self._last_undo_push = None
+        # Caption files that failed to save while a bulk operation is running.
+        self._write_error_batch_depth = 0
+        self._failed_write_paths: list[Path] = []
         # True only while restoring tags from the undo/redo history. Consumers
         # (e.g. the Common/Differences panel) use this to distinguish a genuine
         # new edit from a history restore, so an undone/redone tag returns to
@@ -808,6 +855,7 @@ class ImageListModel(QAbstractListModel):
         self._preload_generation += 1
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self._last_undo_push = None
         self.update_undo_and_redo_actions_requested.emit()
         # Scan in a background thread; the old list stays visible until done.
         image_suffixes = self.get_image_suffixes()
@@ -842,9 +890,13 @@ class ImageListModel(QAbstractListModel):
         never overwritten with stale data.
         """
         structure_changed = False
+        # Images whose captions changed outside the app (or that disappeared).
+        # Undo/redo must not overwrite those outside changes.
+        paths_to_forget_in_history = set()
 
         # Removals: files that disappeared from the directory.
         if result.removed_paths:
+            paths_to_forget_in_history.update(result.removed_paths)
             rows_to_remove = [row for row, image in enumerate(self.images)
                               if image.path in result.removed_paths]
             for row in sorted(rows_to_remove, reverse=True):
@@ -918,6 +970,7 @@ class ImageListModel(QAbstractListModel):
                         image.caption_file_modified_time_ns = new_mtime
                         image.tags = tags
                         image.natural_language_prompt = natural_language_prompt
+                        paths_to_forget_in_history.add(image_path)
                         did_change = True
                 if did_change:
                     changed_rows.append(row)
@@ -965,28 +1018,98 @@ class ImageListModel(QAbstractListModel):
         if structure_changed or changed_rows:
             self._preload_generation += 1
             self._start_background_warm()
+        self.forget_history_for_paths(paths_to_forget_in_history)
         return structure_changed, set(changed_rows)
 
     def add_to_undo_stack(self, action_name: str,
                           should_ask_for_confirmation: bool):
         """Add the current state of the image tags to the undo stack."""
-        tags = [image.tags.copy() for image in self.images]
-        natural_language_prompts = [
-            image.natural_language_prompt for image in self.images
-        ]
-        self.undo_stack.append(HistoryItem(action_name, tags,
-                                           natural_language_prompts,
+        captions = {
+            image.path: (image.tags.copy(), image.natural_language_prompt)
+            for image in self.images
+        }
+        dropped_item = (self.undo_stack[0]
+                        if len(self.undo_stack) == self.undo_stack.maxlen
+                        else None)
+        self._last_undo_push = (dropped_item, self.redo_stack.copy())
+        self.undo_stack.append(HistoryItem(action_name, captions,
                                            should_ask_for_confirmation))
         self.redo_stack.clear()
         self.update_undo_and_redo_actions_requested.emit()
 
+    def discard_last_undo_entry(self):
+        """Remove the entry just added by `add_to_undo_stack`, for an operation
+        that turned out to change nothing, restoring the history exactly as it
+        was before (including the redo stack)."""
+        if self._last_undo_push is None or not self.undo_stack:
+            return
+        dropped_item, previous_redo_stack = self._last_undo_push
+        self._last_undo_push = None
+        self.undo_stack.pop()
+        if dropped_item is not None:
+            self.undo_stack.appendleft(dropped_item)
+        self.redo_stack[:] = previous_redo_stack
+        self.update_undo_and_redo_actions_requested.emit()
+
+    def forget_history_for_paths(self, paths):
+        """Stop undo/redo from touching these images, e.g. because their
+        captions were changed outside the app or the files were removed."""
+        if not paths:
+            return
+        for history_item in (*self.undo_stack, *self.redo_stack):
+            for path in paths:
+                history_item.captions.pop(path, None)
+
+    @contextmanager
+    def batch_write_errors(self):
+        """While active, caption save failures are collected and reported in
+        one message at the end instead of one message per file."""
+        self.begin_write_error_batch()
+        try:
+            yield
+        finally:
+            self.end_write_error_batch()
+
+    def begin_write_error_batch(self):
+        self._write_error_batch_depth += 1
+
+    def end_write_error_batch(self):
+        if self._write_error_batch_depth == 0:
+            return
+        self._write_error_batch_depth -= 1
+        if self._write_error_batch_depth > 0 or not self._failed_write_paths:
+            return
+        failed_paths = self._failed_write_paths
+        self._failed_write_paths = []
+        self.show_write_errors(failed_paths)
+
+    @staticmethod
+    def show_write_errors(failed_paths: list[Path]):
+        error_message_box = QMessageBox()
+        error_message_box.setWindowTitle('Error')
+        error_message_box.setIcon(QMessageBox.Icon.Critical)
+        if len(failed_paths) == 1:
+            error_message_box.setText(
+                f'Failed to save tags for {failed_paths[0]}.')
+        else:
+            listed_paths = '\n'.join(
+                str(path) for path in failed_paths[:MAX_LISTED_WRITE_ERRORS])
+            remaining_count = len(failed_paths) - MAX_LISTED_WRITE_ERRORS
+            if remaining_count > 0:
+                listed_paths += f'\n...and {remaining_count} more.'
+            error_message_box.setText(
+                f'Failed to save tags for {len(failed_paths)} images. The '
+                f'caption files may be read-only or open in another '
+                f'program.\n\n{listed_paths}')
+        error_message_box.exec()
+
     def write_image_tags_to_disk(self, image: Image):
         text_file_path = image.path.with_suffix('.txt')
         try:
-            text_file_path.write_text(
+            write_text_atomically(
+                text_file_path,
                 build_caption_text(image.tags, image.natural_language_prompt,
-                                   self.tag_separator),
-                encoding='utf-8', errors='replace')
+                                   self.tag_separator))
             image.caption_file_modified_time_ns = text_file_path.stat().st_mtime_ns
             # Keep the completion store's caption hash current for complete
             # images so an external move/rename still confirms as the same
@@ -994,12 +1117,25 @@ class ImageListModel(QAbstractListModel):
             if image.is_complete:
                 get_completion_store().refresh_caption(image.path)
         except OSError:
-            error_message_box = QMessageBox()
-            error_message_box.setWindowTitle('Error')
-            error_message_box.setIcon(QMessageBox.Icon.Critical)
-            error_message_box.setText(f'Failed to save tags for {image.path}.')
-            error_message_box.exec()
+            if self._write_error_batch_depth > 0:
+                self._failed_write_paths.append(image.path)
+            else:
+                self.show_write_errors([image.path])
 
+    @staticmethod
+    def is_caption_changed_outside_app(image: Image) -> bool:
+        """Whether the caption file on disk differs from the version the app
+        last read or wrote (e.g. it was edited in another program)."""
+        text_file_path = image.path.with_suffix('.txt')
+        try:
+            modified_time_ns = text_file_path.stat().st_mtime_ns
+        except FileNotFoundError:
+            modified_time_ns = None
+        except OSError:
+            return False
+        return modified_time_ns != image.caption_file_modified_time_ns
+
+    @collect_write_errors
     def restore_history_tags(self, is_undo: bool):
         if is_undo:
             source_stack = self.undo_stack
@@ -1020,34 +1156,54 @@ class ImageListModel(QAbstractListModel):
             if reply != QMessageBox.StandardButton.Yes:
                 return
         source_stack.pop()
-        tags = [image.tags for image in self.images]
-        natural_language_prompts = [
-            image.natural_language_prompt for image in self.images
-        ]
-        destination_stack.append(HistoryItem(
-            history_item.action_name, tags, natural_language_prompts,
-            history_item.should_ask_for_confirmation))
-        changed_image_indices = []
-        for image_index, (image, history_image_tags,
-                          history_natural_language_prompt) in enumerate(
-                zip(self.images, history_item.tags,
-                    history_item.natural_language_prompts)):
-            if (image.tags == history_image_tags
+        self._last_undo_push = None
+        path_to_row = {image.path: row
+                       for row, image in enumerate(self.images)}
+        reverse_captions = {}
+        changed_rows = []
+        skipped_paths = set()
+        for path, (history_tags, history_natural_language_prompt) in (
+                history_item.captions.items()):
+            row = path_to_row.get(path)
+            if row is None:
+                # The image is no longer in the list.
+                continue
+            image = self.images[row]
+            if (image.tags == history_tags
                     and image.natural_language_prompt
                     == history_natural_language_prompt):
+                reverse_captions[path] = (image.tags.copy(),
+                                          image.natural_language_prompt)
                 continue
-            changed_image_indices.append(image_index)
-            image.tags = history_image_tags
+            if self.is_caption_changed_outside_app(image):
+                skipped_paths.add(path)
+                continue
+            reverse_captions[path] = (image.tags.copy(),
+                                      image.natural_language_prompt)
+            image.tags = history_tags.copy()
             image.natural_language_prompt = history_natural_language_prompt
             self.write_image_tags_to_disk(image)
-        if changed_image_indices:
+            changed_rows.append(row)
+        destination_stack.append(HistoryItem(
+            history_item.action_name, reverse_captions,
+            history_item.should_ask_for_confirmation))
+        self.forget_history_for_paths(skipped_paths)
+        if changed_rows:
             self.is_restoring_history = True
             try:
-                self.dataChanged.emit(self.index(changed_image_indices[0]),
-                                      self.index(changed_image_indices[-1]))
+                self.dataChanged.emit(self.index(min(changed_rows)),
+                                      self.index(max(changed_rows)))
             finally:
                 self.is_restoring_history = False
         self.update_undo_and_redo_actions_requested.emit()
+        if skipped_paths:
+            skipped_count = len(skipped_paths)
+            QMessageBox.information(
+                None, 'Undo' if is_undo else 'Redo',
+                f'{skipped_count} {pluralize("image", skipped_count)} '
+                f'{"was" if skipped_count == 1 else "were"} skipped because '
+                f'{"its caption was" if skipped_count == 1 else "their captions were"} '
+                f'changed outside TagGUI Plus.')
 
     @Slot()
     def undo(self):
@@ -1135,6 +1291,7 @@ class ImageListModel(QAbstractListModel):
                          key=lambda item: (-item[1], item[0]))
         return match_count, ordered
 
+    @collect_write_errors
     def find_and_replace(self, find_text: str, replace_text: str,
                          scope: Scope | str, use_regex: bool):
         """
@@ -1159,15 +1316,21 @@ class ImageListModel(QAbstractListModel):
                 if find_text not in caption:
                     continue
                 caption = caption.replace(find_text, replace_text)
-            changed_image_indices.append(image_index)
-            image.tags = list(dict.fromkeys(
+            new_tags = list(dict.fromkeys(
                 t.strip() for t in caption.split(self.tag_separator)
                 if t.strip()))
+            if new_tags == image.tags:
+                continue
+            changed_image_indices.append(image_index)
+            image.tags = new_tags
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
+    @collect_write_errors
     def sort_tags_alphabetically(self, do_not_reorder_first_tag: bool):
         """Sort the tags for each image in alphabetical order."""
         self.add_to_undo_stack(action_name='Sort Tags',
@@ -1189,7 +1352,10 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
+    @collect_write_errors
     def sort_tags_by_frequency(self, tag_counter: Counter,
                                do_not_reorder_first_tag: bool):
         """
@@ -1217,7 +1383,10 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
+    @collect_write_errors
     def reverse_tags_order(self, do_not_reorder_first_tag: bool):
         """Reverse the order of the tags for each image."""
         self.add_to_undo_stack(action_name='Reverse Order of Tags',
@@ -1226,16 +1395,22 @@ class ImageListModel(QAbstractListModel):
         for image_index, image in enumerate(self.images):
             if len(image.tags) < 2:
                 continue
-            changed_image_indices.append(image_index)
             if do_not_reorder_first_tag:
-                image.tags = [image.tags[0]] + list(reversed(image.tags[1:]))
+                new_tags = [image.tags[0]] + list(reversed(image.tags[1:]))
             else:
-                image.tags = list(reversed(image.tags))
+                new_tags = list(reversed(image.tags))
+            if new_tags == image.tags:
+                continue
+            changed_image_indices.append(image_index)
+            image.tags = new_tags
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
+    @collect_write_errors
     def shuffle_tags(self, do_not_reorder_first_tag: bool):
         """Shuffle the tags for each image randomly."""
         self.add_to_undo_stack(action_name='Shuffle Tags',
@@ -1244,18 +1419,25 @@ class ImageListModel(QAbstractListModel):
         for image_index, image in enumerate(self.images):
             if len(image.tags) < 2:
                 continue
-            changed_image_indices.append(image_index)
             if do_not_reorder_first_tag:
                 first_tag, *remaining_tags = image.tags
                 random.shuffle(remaining_tags)
-                image.tags = [first_tag] + remaining_tags
+                new_tags = [first_tag] + remaining_tags
             else:
-                random.shuffle(image.tags)
+                new_tags = image.tags.copy()
+                random.shuffle(new_tags)
+            if new_tags == image.tags:
+                continue
+            changed_image_indices.append(image_index)
+            image.tags = new_tags
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
+    @collect_write_errors
     def move_tags_to_front(self, tags_to_move: list[str]):
         """
         Move one or more tags to the front of the tags list for each image.
@@ -1280,7 +1462,10 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
+    @collect_write_errors
     def sort_tags_by_category(self, get_category_for_tag,
                               category_order_map: dict[str, int],
                               do_not_reorder_first_tag: bool):
@@ -1326,6 +1511,8 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
     def set_images_complete(self, image_indices: list[QModelIndex],
                             is_complete: bool):
@@ -1380,6 +1567,7 @@ class ImageListModel(QAbstractListModel):
         self.write_image_tags_to_disk(image)
 
     @Slot(list, list)
+    @collect_write_errors
     def add_tags(self, tags: list[str], image_indices: list[QModelIndex]):
         """Add one or more tags to one or more images."""
         if not image_indices:
@@ -1387,17 +1575,25 @@ class ImageListModel(QAbstractListModel):
         action_name = f'Add {pluralize("Tag", len(tags))}'
         should_ask_for_confirmation = len(image_indices) > 1
         self.add_to_undo_stack(action_name, should_ask_for_confirmation)
+        changed_indices = []
         for image_index in image_indices:
             image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
             existing = set(image.tags)
             new_tags = [t for t in tags if t not in existing]
+            if not new_tags:
+                continue
             image.tags.extend(new_tags)
             self.write_image_tags_to_disk(image)
-        min_image_index = min(image_indices, key=lambda index: index.row())
-        max_image_index = max(image_indices, key=lambda index: index.row())
+            changed_indices.append(image_index)
+        if not changed_indices:
+            self.discard_last_undo_entry()
+            return
+        min_image_index = min(changed_indices, key=lambda index: index.row())
+        max_image_index = max(changed_indices, key=lambda index: index.row())
         self.dataChanged.emit(min_image_index, max_image_index)
 
     @Slot(list, list)
+    @collect_write_errors
     def remove_tags_from_images(self, tags: list[str],
                                 image_indices: list[QModelIndex]):
         """Remove one or more tags from an explicit set of images.
@@ -1424,12 +1620,14 @@ class ImageListModel(QAbstractListModel):
             self.write_image_tags_to_disk(image)
             changed_indices.append(image_index)
         if not changed_indices:
+            self.discard_last_undo_entry()
             return
         min_image_index = min(changed_indices, key=lambda index: index.row())
         max_image_index = max(changed_indices, key=lambda index: index.row())
         self.dataChanged.emit(min_image_index, max_image_index)
 
     @Slot(str, str, list)
+    @collect_write_errors
     def rename_tag_in_images(self, old_tag: str, new_tag: str,
                              image_indices: list[QModelIndex]):
         """Rename a tag on an explicit set of images (grouped view in-place edit).
@@ -1460,6 +1658,7 @@ class ImageListModel(QAbstractListModel):
         self.dataChanged.emit(min_image_index, max_image_index)
 
     @Slot(list, str)
+    @collect_write_errors
     def rename_tags(self, old_tags: list[str], new_tag: str,
                     scope: Scope | str = Scope.ALL_IMAGES,
                     use_regex: bool = False):
@@ -1489,8 +1688,11 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
     @Slot(list)
+    @collect_write_errors
     def delete_tags(self, tags: list[str],
                     scope: Scope | str = Scope.ALL_IMAGES,
                     use_regex: bool = False):
@@ -1519,3 +1721,5 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()

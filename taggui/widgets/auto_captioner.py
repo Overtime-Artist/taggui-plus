@@ -872,6 +872,9 @@ class AutoCaptioner(QDockWidget):
         state cleared and ``captioning_finished`` emitted, which drains those
         queued tags as a single prompt.
         """
+        if getattr(self, '_is_write_error_batch_active', False):
+            self._is_write_error_batch_active = False
+            self.image_list_model.end_write_error_batch()
         if getattr(self, '_show_alert_when_finished', False):
             self.show_alert()
         self.set_is_captioning(False)
@@ -972,4 +975,7 @@ class AutoCaptioner(QDockWidget):
         # the console text edit.
         sys.stdout = self.captioning_thread
         sys.stderr = self.captioning_thread
+        # Report caption files that fail to save in one message at the end.
+        self.image_list_model.begin_write_error_batch()
+        self._is_write_error_batch_active = True
         self.captioning_thread.start()
