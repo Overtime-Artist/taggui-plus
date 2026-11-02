@@ -11,10 +11,10 @@ the kept image first.
 import itertools
 from pathlib import Path
 
-from PySide6.QtCore import (QObject, QRunnable, Qt, QThread, QThreadPool,
-                            QTimer, Signal, Slot)
-from PySide6.QtGui import (QFont, QImageReader, QKeySequence, QPalette, QPixmap,
-                           QShortcut)
+from PySide6.QtCore import (QEvent, QObject, QRunnable, Qt, QThread,
+                            QThreadPool, QTimer, Signal, Slot)
+from PySide6.QtGui import (QFont, QImageReader, QKeySequence, QPainter,
+                           QPalette, QPen, QPixmap, QShortcut)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
                                QComboBox, QDialog,
                                QFileDialog, QFrame, QGridLayout, QGroupBox,
@@ -53,9 +53,10 @@ _DUPLICATE_TAG = 'duplicate'
 KEEP_LARGEST_RESOLUTION = 'Largest resolution'
 KEEP_LARGEST_FILE = 'Largest file'
 KEEP_NEWEST_FILE = 'Newest file'
+KEEP_OLDEST_FILE = 'Oldest file'
 KEEP_MOST_TAGS = 'Most tags'
 KEEP_RULES = [KEEP_LARGEST_RESOLUTION, KEEP_LARGEST_FILE, KEEP_NEWEST_FILE,
-              KEEP_MOST_TAGS]
+              KEEP_OLDEST_FILE, KEEP_MOST_TAGS]
 
 
 class _ClickableLabel(QLabel):
@@ -80,6 +81,63 @@ def _strictness_text(value: int) -> str:
     if value <= 12:
         return f'Medium (\u2264 {value})'
     return f'Loose (\u2264 {value})'
+
+
+def _apply_indicator_palette(button):
+    # Only the Base color is overridden, so the other colors keep following
+    # the app theme.
+    window_color = button.palette().color(QPalette.ColorRole.Window)
+    if button.palette().color(QPalette.ColorRole.Base) != window_color:
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Base, window_color)
+        button.setPalette(palette)
+
+
+class _IndicatorPaletteFilter(QObject):
+    """Updates the overridden indicator color when the app theme changes."""
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.PaletteChange:
+            _apply_indicator_palette(watched)
+        return False
+
+
+_indicator_palette_filter = None
+
+
+def _make_indicator_visible(button):
+    """Fusion fills check box and radio button indicators with the Base
+    color, which would make them invisible on the dark results background.
+    Use the window color for them instead."""
+    global _indicator_palette_filter
+    if _indicator_palette_filter is None:
+        _indicator_palette_filter = _IndicatorPaletteFilter()
+    _apply_indicator_palette(button)
+    button.installEventFilter(_indicator_palette_filter)
+
+
+class _DuplicateCard(QFrame):
+    """A frameless card; the kept one is outlined in the highlight color,
+    like a selected image in the Images pane."""
+
+    def __init__(self):
+        super().__init__()
+        self.kept = False
+
+    def set_kept(self, kept: bool):
+        if kept != self.kept:
+            self.kept = kept
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.kept:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Highlight),
+                            2))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 4, 4)
 
 
 def _format_size(num_bytes) -> str:
@@ -257,6 +315,11 @@ def choose_keeper(members: list, rule: str, tag_counts: dict):
             return (member.size or 0,) + resolution
         if rule == KEEP_NEWEST_FILE:
             return (member.mtime_ns or 0,) + resolution
+        if rule == KEEP_OLDEST_FILE:
+            # Files whose date is unknown count as the newest.
+            mtime_ns = member.mtime_ns
+            return ((-mtime_ns if mtime_ns is not None else -float('inf')),
+                    ) + resolution
         if rule == KEEP_MOST_TAGS:
             return (tag_counts.get(member.path, 0),) + resolution
         return resolution
@@ -686,19 +749,15 @@ class FindDuplicatesDialog(QDialog):
 
     def _build_card(self, member, group_cards) -> tuple:
         """Return (card, keep radio, relation label, info label)."""
-        card = QFrame()
-        card.setFrameShape(QFrame.Shape.StyledPanel)
+        card = _DuplicateCard()
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(8, 8, 8, 8)
+        card_layout.setContentsMargins(6, 6, 6, 6)
         card_layout.setSpacing(4)
 
         thumbnail_label = _ClickableLabel()
         thumbnail_label.setFixedSize(_THUMBNAIL_SIZE, _THUMBNAIL_SIZE)
         thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumbnail_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        # A darker well behind the image sets it apart from the controls.
-        thumbnail_label.setBackgroundRole(QPalette.ColorRole.Base)
-        thumbnail_label.setAutoFillBackground(True)
         self._request_thumbnail(member.path, thumbnail_label)
         thumbnail_label.clicked.connect(
             lambda m=member, gc=group_cards: self._show_preview(gc, m))
@@ -713,6 +772,7 @@ class FindDuplicatesDialog(QDialog):
         card_layout.addWidget(relation_label)
 
         radio = QRadioButton('Keep')
+        _make_indicator_visible(radio)
         card_layout.addWidget(radio)
         return card, radio, relation_label, info_label
 
@@ -1141,10 +1201,9 @@ class _GroupCards:
         kind_label = 'Exact duplicates' if group.kind == 'exact' \
             else 'Near duplicates'
         self.box = QGroupBox(f'{kind_label} \u2014 {len(group.members)} images')
-        # A panel in the normal window color, standing out against the
-        # darker results background.
-        self.box.setBackgroundRole(QPalette.ColorRole.Window)
-        self.box.setAutoFillBackground(True)
+        # Only a title and a divider line, so the images sit directly on the
+        # dark results background like in the Images pane.
+        self.box.setFlat(True)
         title_font = self.box.font()
         title_font.setBold(True)
         self.box.setFont(title_font)
@@ -1161,12 +1220,14 @@ class _GroupCards:
         normal_font = QFont(title_font)
         normal_font.setBold(False)
         self.ignore_checkbox.setFont(normal_font)
+        _make_indicator_visible(self.ignore_checkbox)
         box_layout.addWidget(self.ignore_checkbox)
 
         self.cards_scroll = QScrollArea()
         self.cards_scroll.setFont(normal_font)
         self.cards_scroll.setWidgetResizable(True)
         self.cards_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.cards_scroll.viewport().setAutoFillBackground(False)
         self.cards_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         box_layout.addWidget(self.cards_scroll)
@@ -1187,6 +1248,7 @@ class _GroupCards:
         self.button_group = button_group
         self.radio_members = []
         self.card_labels = []
+        self.cards = []
 
         cards_widget = QWidget()
         cards_layout = QHBoxLayout(cards_widget)
@@ -1204,6 +1266,7 @@ class _GroupCards:
             button_group.addButton(radio)
             self.radio_members.append((radio, member))
             self.card_labels.append((relation_label, info_label, member))
+            self.cards.append((card, member))
             cards_layout.addWidget(card)
             if self.expanded and position % 20 == 19:
                 QApplication.processEvents()
@@ -1214,8 +1277,6 @@ class _GroupCards:
             more_tile.setFixedSize(_THUMBNAIL_SIZE, _THUMBNAIL_SIZE)
             more_tile.setAlignment(Qt.AlignmentFlag.AlignCenter)
             more_tile.setFrameShape(QFrame.Shape.StyledPanel)
-            more_tile.setBackgroundRole(QPalette.ColorRole.Base)
-            more_tile.setAutoFillBackground(True)
             more_tile.setCursor(Qt.CursorShape.PointingHandCursor)
             more_tile.clicked.connect(self.expand)
             cards_layout.addWidget(more_tile)
@@ -1243,6 +1304,8 @@ class _GroupCards:
             relation_label.setText(f'<b>{text}</b>' if member
                                    is self.keep_member else text)
             relation_label.setToolTip(tooltip)
+        for card, member in self.cards:
+            card.set_kept(member is self.keep_member)
 
     def refresh_info(self):
         """Refresh each shown card's details (e.g. its tag count)."""
