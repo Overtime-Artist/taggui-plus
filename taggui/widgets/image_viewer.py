@@ -1,4 +1,5 @@
 import math
+import time
 from pathlib import Path
 
 from PySide6.QtCore import (QEvent, QModelIndex, QObject, QPoint, QRect,
@@ -43,6 +44,9 @@ GRID_HIGHLIGHT_WIDTH_PX = 10
 # tag list. The focused ("has tag") cells stay fully opaque; hovering or the
 # current cell temporarily restores full opacity so the image can be judged.
 GRID_DIM_OPACITY = 0.28
+# While decoding a page of grid cells, hand finished cells to the GUI at most
+# this often so the grid sharpens progressively instead of all at once.
+GRID_PARTIAL_EMIT_SECONDS = 0.4
 
 
 class _ImageFileLoader(QObject, QRunnable):
@@ -71,13 +75,20 @@ class _ImageFileLoader(QObject, QRunnable):
 
 
 class _GridCellsLoader(QObject, QRunnable):
-    """Decodes several grid-cell images (near-original size) off the GUI thread.
+    """Decodes several grid-cell images off the GUI thread.
 
     Used to upgrade the grid preview from instant thumbnails to sharp images
     without blocking the UI. Images are decoded to QImages here; the QPixmaps
     are built on the GUI thread in the receiving slot (see _ImageFileLoader).
+
+    Each image is decoded at full resolution and then smooth-scaled down to the
+    cell size it will be drawn at. This gives the same pixels as scaling the
+    full image directly, while only keeping cell-sized images in memory.
+    (Decoding with QImageReader.setScaledSize is faster but visibly lower
+    quality, especially for JPEGs.)
     """
-    loaded = Signal(dict, int)  # {path_str: QImage}, render token
+    # {path_str: QImage}, target cell size, render token, final batch?
+    loaded = Signal(dict, int, int, bool)
 
     def __init__(self, path_strings: list[str], target_px: int, token: int):
         QObject.__init__(self)
@@ -87,24 +98,33 @@ class _GridCellsLoader(QObject, QRunnable):
         self.token = token
         self.setAutoDelete(False)
 
+    @staticmethod
+    def fit_to_cell(image: QImage, target_px: int) -> QImage:
+        long_edge = max(image.width(), image.height())
+        if long_edge <= target_px:
+            return image
+        scale = target_px / long_edge
+        size = QSize(max(1, round(image.width() * scale)),
+                     max(1, round(image.height() * scale)))
+        return image.scaled(size, Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation)
+
     @Slot()
     def run(self):
         results: dict[str, QImage] = {}
+        last_emit = time.monotonic()
         for path_string in self.path_strings:
             reader = QImageReader(path_string)
             reader.setAutoTransform(True)
-            size = reader.size()
-            target = self.target_px
-            if size.isValid() and (size.width() > target
-                                   or size.height() > target):
-                scale = min(target / size.width(), target / size.height())
-                reader.setScaledSize(
-                    QSize(max(1, round(size.width() * scale)),
-                          max(1, round(size.height() * scale))))
             image = reader.read()
             if not image.isNull():
-                results[path_string] = image
-        self.loaded.emit(results, self.token)
+                results[path_string] = self.fit_to_cell(image, self.target_px)
+            if (results and time.monotonic() - last_emit
+                    >= GRID_PARTIAL_EMIT_SECONDS):
+                self.loaded.emit(results, self.target_px, self.token, False)
+                results = {}
+                last_emit = time.monotonic()
+        self.loaded.emit(results, self.target_px, self.token, True)
 
 
 class ImageLabel(QLabel):
@@ -116,7 +136,11 @@ class ImageLabel(QLabel):
         self.original_pixmap = QPixmap()
         self._pending_path: str | None = None
         self._current_loader: _ImageFileLoader | None = None
+        # True while the label shows a text message (e.g. an unreadable image)
+        # instead of a picture.
+        self.message_shown = False
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(True)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.setMinimumSize(QSize(1, 1))
 
@@ -150,8 +174,24 @@ class ImageLabel(QLabel):
         self.image_loaded.emit()
 
     def set_scaled_pixmap(self, scaled_pixmap: QPixmap):
+        self.message_shown = False
         self.setPixmap(scaled_pixmap)
         self.resize(scaled_pixmap.size())
+
+    def clear_image(self):
+        """Show nothing, cancelling any in-flight load."""
+        self._pending_path = None
+        self._current_loader = None
+        self.image_path = None
+        self.original_pixmap = QPixmap()
+        self.message_shown = False
+        self.clear()
+
+    def show_message(self, text: str):
+        """Show a text message in place of the image (keeps image_path)."""
+        self.original_pixmap = QPixmap()
+        self.message_shown = True
+        self.setText(text)
 
     def set_static_pixmap(self, pixmap: QPixmap):
         """Display a ready-made pixmap (e.g. the composited grid) directly.
@@ -168,7 +208,9 @@ class ImageLabel(QLabel):
 class ImageScrollArea(QScrollArea):
     clicked = Signal()
     reset_requested = Signal()
-    zoom_requested = Signal(int)
+    # Wheel delta and the cursor position in viewport coordinates, so the zoom
+    # can keep the point under the cursor in place.
+    zoom_requested = Signal(int, QPoint)
     viewport_resized = Signal()
     # Emitted on a plain left click that did not turn into a drag-to-pan,
     # carrying the release position in viewport coordinates. Used in grid mode
@@ -220,7 +262,9 @@ class ImageScrollArea(QScrollArea):
             self.viewport_resized.emit()
             return False
         if event.type() == QEvent.Type.Wheel:
-            self.zoom_requested.emit(event.angleDelta().y())
+            viewport_point = self.viewport().mapFromGlobal(
+                event.globalPosition().toPoint())
+            self.zoom_requested.emit(event.angleDelta().y(), viewport_point)
             event.accept()
             return True
         if event.type() == QEvent.Type.MouseButtonDblClick:
@@ -247,6 +291,13 @@ class ImageScrollArea(QScrollArea):
                 self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
                 event.accept()
                 return True
+        if (event.type() == QEvent.Type.MouseMove and self.is_dragging
+                and not (event.buttons() & Qt.MouseButton.LeftButton)):
+            # The button release was never delivered (e.g. it happened over
+            # another window or a dialog grabbed the mouse), so stop panning
+            # instead of following the cursor with no button held.
+            self.is_dragging = False
+            self.viewport().unsetCursor()
         if event.type() == QEvent.Type.MouseMove and self.is_dragging:
             mouse_event = event
             current_drag_position = mouse_event.globalPosition().toPoint()
@@ -301,6 +352,9 @@ class ImageViewer(QWidget):
     # Emitted once, after the first image has been fully decoded and scaled.
     # Used by MainWindow to defer show() until the UI is ready to paint.
     first_image_rendered = Signal()
+    # Emitted on a right click over the single-image preview (not the grid),
+    # carrying the global screen position where a context menu should appear.
+    image_context_menu_requested = Signal(QPoint)
 
     def __init__(self, proxy_image_list_model: ProxyImageListModel):
         super().__init__()
@@ -309,10 +363,15 @@ class ImageViewer(QWidget):
         self.scroll_area = ImageScrollArea(self.image_label)
         self.zoom_factor = 1.0
         self._first_render_done = False
+        # Set by a cursor-anchored zoom and consumed by the next
+        # _update_scaled_image: (label x ratio, label y ratio, viewport point).
+        self._pending_zoom_anchor: tuple[float, float, QPoint] | None = None
         # Grid-preview state. When _grid_mode is True the label shows a single
         # composited pixmap of all selected images instead of one image.
         self._grid_mode = False
-        self._grid_cell_cache: dict[str, QPixmap] = {}
+        # path -> (cell size it was decoded for, pixmap). Only holds the cells
+        # of the page currently shown.
+        self._grid_cell_cache: dict[str, tuple[int, QPixmap]] = {}
         self._grid_cell_layout: list[tuple[QRect, int]] = []
         self._grid_current_cell_rect: QRect | None = None
         # Paths of images to mark in the grid (those containing the tag focused
@@ -335,6 +394,9 @@ class ImageViewer(QWidget):
         # newer view, plus a reference to the running loader to keep it alive.
         self._grid_render_token = 0
         self._grid_loaders: set = set()
+        # path -> the loader currently decoding it, so re-renders while a page
+        # is loading don't start duplicate decodes.
+        self._grid_in_flight: dict[str, _GridCellsLoader] = {}
         # Subtle, fixed overlay (bottom-left of the viewport) showing the
         # current page and total image count while a grid is displayed. Parented
         # to the viewport so it stays put regardless of zoom or scroll. Its
@@ -352,7 +414,7 @@ class ImageViewer(QWidget):
         self.refresh_grid_overlay_style()
         self.scroll_area.clicked.connect(lambda: self.clicked.emit())
         self.scroll_area.reset_requested.connect(self.reset_view)
-        self.scroll_area.zoom_requested.connect(self.zoom_image)
+        self.scroll_area.zoom_requested.connect(self._on_wheel_zoom)
         self.scroll_area.viewport_resized.connect(self._on_viewport_resized)
         self.scroll_area.cell_click_requested.connect(
             self._on_cell_click_requested)
@@ -455,7 +517,11 @@ class ImageViewer(QWidget):
                    viewport.height() - label.height() - margin)
 
     def _update_scaled_image(self, force_smooth: bool = False):
+        anchor = self._pending_zoom_anchor
+        self._pending_zoom_anchor = None
         if self.image_label.original_pixmap.isNull():
+            if self.image_label.message_shown:
+                self.image_label.resize(self.scroll_area.viewport().size())
             return
         viewport_size = self.scroll_area.viewport().size()
         if viewport_size.width() <= 0 or viewport_size.height() <= 0:
@@ -478,9 +544,31 @@ class ImageViewer(QWidget):
         scaled_pixmap = self.image_label.original_pixmap.scaled(
             target_size, Qt.AspectRatioMode.KeepAspectRatio, transformation)
         self.image_label.set_scaled_pixmap(scaled_pixmap)
-        self.restore_view_center(old_size, self.image_label.size())
+        if anchor is not None:
+            self._restore_view_anchor(*anchor)
+        else:
+            self.restore_view_center(old_size, self.image_label.size())
         if use_fast:
             self._smooth_render_timer.start()
+
+    def _restore_view_anchor(self, ratio_x: float, ratio_y: float,
+                             viewport_point: QPoint):
+        """Scroll so the image point at (ratio_x, ratio_y) of the label stays
+        under ``viewport_point`` after a zoom."""
+        viewport_size = self.scroll_area.viewport().size()
+        new_size = self.image_label.size()
+        horizontal_bar = self.scroll_area.horizontalScrollBar()
+        vertical_bar = self.scroll_area.verticalScrollBar()
+        if new_size.width() > viewport_size.width():
+            horizontal_bar.setValue(
+                round(ratio_x * new_size.width() - viewport_point.x()))
+        else:
+            horizontal_bar.setValue(0)
+        if new_size.height() > viewport_size.height():
+            vertical_bar.setValue(
+                round(ratio_y * new_size.height() - viewport_point.y()))
+        else:
+            vertical_bar.setValue(0)
 
     def restore_view_center(self, old_size: QSize, new_size: QSize):
         viewport_size = self.scroll_area.viewport().size()
@@ -509,18 +597,38 @@ class ImageViewer(QWidget):
         else:
             self.scroll_area.verticalScrollBar().setValue(0)
 
-    @Slot(int)
-    def zoom_image(self, wheel_delta: int):
+    @Slot(int, QPoint)
+    def zoom_image(self, wheel_delta: int, anchor: QPoint | None = None):
+        """Zoom by one step per 120 units of wheel delta (one mouse notch).
+
+        Smaller deltas (touchpads, high-resolution wheels) zoom
+        proportionally less. With ``anchor`` (a viewport point, e.g. the
+        cursor) the image point under it stays in place; otherwise the view
+        center is kept.
+        """
         if self.image_label.original_pixmap.isNull() or wheel_delta == 0:
             return
-        zoom_step = ZOOM_STEP if wheel_delta > 0 else 1 / ZOOM_STEP
+        zoom_step = ZOOM_STEP ** (wheel_delta / 120)
         new_zoom_factor = max(
             MIN_ZOOM_FACTOR,
             min(self._max_zoom_factor(), self.zoom_factor * zoom_step))
         if new_zoom_factor == self.zoom_factor:
             return
         self.zoom_factor = new_zoom_factor
+        self._pending_zoom_anchor = None
+        if anchor is not None:
+            label = self.image_label
+            if label.width() > 0 and label.height() > 0:
+                label_point = label.mapFrom(self.scroll_area.viewport(),
+                                            anchor)
+                ratio_x = min(1.0, max(0.0, label_point.x() / label.width()))
+                ratio_y = min(1.0, max(0.0, label_point.y() / label.height()))
+                self._pending_zoom_anchor = (ratio_x, ratio_y, QPoint(anchor))
         self._update_scaled_image()
+
+    @Slot(int, QPoint)
+    def _on_wheel_zoom(self, wheel_delta: int, viewport_point: QPoint):
+        self.zoom_image(wheel_delta, viewport_point)
 
     @Slot()
     def reset_view(self):
@@ -533,13 +641,12 @@ class ImageViewer(QWidget):
 
     @Slot()
     def zoom_in(self):
-        # zoom_image only checks the sign of its argument, so any positive
-        # value performs a single zoom-in step (matching a mouse wheel notch).
-        self.zoom_image(1)
+        # One mouse-wheel notch, centred on the view.
+        self.zoom_image(120)
 
     @Slot()
     def zoom_out(self):
-        self.zoom_image(-1)
+        self.zoom_image(-120)
 
     def _pan(self, horizontal_steps: int, vertical_steps: int):
         """Scroll the (zoomed) image by a fraction of the viewport.
@@ -577,7 +684,18 @@ class ImageViewer(QWidget):
     @Slot()
     def _on_image_loaded(self):
         """Called when the async image load finishes; render the image."""
-        self._update_scaled_image()
+        if self.image_label.original_pixmap.isNull():
+            # The file could not be decoded (corrupt, unsupported, or deleted).
+            # Say so rather than leaving the previous image on screen.
+            name = (self.image_label.image_path.name
+                    if self.image_label.image_path is not None else '')
+            self.image_label.show_message(
+                f"Can't display this image\n{name}")
+            self.scroll_area.horizontalScrollBar().setValue(0)
+            self.scroll_area.verticalScrollBar().setValue(0)
+            self.image_label.resize(self.scroll_area.viewport().size())
+        else:
+            self._update_scaled_image()
         if not self._first_render_done:
             self._first_render_done = True
             self.first_image_rendered.emit()
@@ -613,20 +731,42 @@ class ImageViewer(QWidget):
 
     @Slot()
     def load_image(self, proxy_image_index: QModelIndex):
+        self._load_image(proxy_image_index, preserve_view=False)
+
+    def reload_image(self, proxy_image_index: QModelIndex):
+        """Re-read the image (e.g. after it changed on disk), keeping the
+        current zoom and scroll position."""
+        self._load_image(proxy_image_index, preserve_view=True)
+
+    def _load_image(self, proxy_image_index: QModelIndex,
+                    preserve_view: bool):
         if self._grid_mode:
             # A grid is being shown for a multi-image selection; ignore
             # single-image loads until the grid is torn down via exit_grid().
             return
+        self._resize_debounce_timer.stop()
+        self._smooth_render_timer.stop()
+        self._pending_zoom_anchor = None
         if not proxy_image_index.isValid():
+            # No current image (e.g. the filter matches nothing): show nothing
+            # rather than leaving the previous image on screen.
+            self.zoom_factor = 1.0
+            self.image_label.clear_image()
+            self.scroll_area.horizontalScrollBar().setValue(0)
+            self.scroll_area.verticalScrollBar().setValue(0)
+            self.image_label.resize(self.scroll_area.viewport().size())
             return
         image: Image = self.proxy_image_list_model.data(
             proxy_image_index, Qt.ItemDataRole.UserRole)
+        if preserve_view:
+            # Keep showing the current picture until the new decode arrives;
+            # _update_scaled_image then keeps the zoom and view center.
+            self.image_label.load_image(image.path)
+            return
         # Reset zoom/scroll state immediately (image load happens async).
         self.zoom_factor = 1.0
         self.scroll_area.horizontalScrollBar().setValue(0)
         self.scroll_area.verticalScrollBar().setValue(0)
-        self._resize_debounce_timer.stop()
-        self._smooth_render_timer.stop()
         # Start async decode; _on_image_loaded fires when done. Show the list
         # thumbnail upscaled as an instant placeholder for large images.
         placeholder = self._get_thumbnail_placeholder(proxy_image_index, image)
@@ -673,6 +813,7 @@ class ImageViewer(QWidget):
             return
         self._grid_mode = False
         self._grid_cell_cache.clear()
+        self._grid_in_flight.clear()
         self._grid_cell_layout = []
         self._grid_current_cell_rect = None
         self._grid_marked_paths = set()
@@ -792,6 +933,8 @@ class ImageViewer(QWidget):
             return
         for path in relevant:
             self._grid_cell_cache.pop(path, None)
+            # Drop any decode of the old file contents still in progress.
+            self._grid_in_flight.pop(path, None)
         self._render_grid(self._grid_proxy_indices,
                           self._grid_current_position,
                           self._grid_cell_cap, preserve_view=True)
@@ -806,6 +949,12 @@ class ImageViewer(QWidget):
         token = self._grid_render_token
         window_indices, highlight_position = self._grid_window(
             proxy_indices, current_position, cell_cap)
+        # Only keep decoded cells for the page being shown, so paging through
+        # a large selection doesn't accumulate every page in memory.
+        window_paths = self._paths_of(window_indices)
+        for path in list(self._grid_cell_cache):
+            if path not in window_paths:
+                del self._grid_cell_cache[path]
         # Build and show the composite immediately, using sharp cached images
         # where available and the already-decoded list thumbnails elsewhere as
         # instant placeholders.
@@ -830,8 +979,18 @@ class ImageViewer(QWidget):
         self._schedule_grid_high_quality(window_indices, token)
         self._update_grid_overlay()
 
+    def _paths_of(self, proxy_indices: list[QModelIndex]) -> set[str]:
+        paths = set()
+        for proxy_index in proxy_indices:
+            image: Image = self.proxy_image_list_model.data(
+                proxy_index, Qt.ItemDataRole.UserRole)
+            if image is not None:
+                paths.add(str(image.path))
+        return paths
+
     def _schedule_grid_high_quality(self, window_indices: list[QModelIndex],
                                     token: int):
+        target_px = self._grid_cell_size(self._grid_geometry_count())
         missing: list[str] = []
         seen: set[str] = set()
         for proxy_index in window_indices:
@@ -842,26 +1001,56 @@ class ImageViewer(QWidget):
                 continue
             seen.add(path_string)
             cached = self._grid_cell_cache.get(path_string)
-            if cached is None or cached.isNull():
-                missing.append(path_string)
+            # Re-decode when the cell size changed (e.g. the selection grew),
+            # so the cell is neither blurry nor larger than needed.
+            if (cached is not None and not cached[1].isNull()
+                    and cached[0] == target_px):
+                continue
+            in_flight = self._grid_in_flight.get(path_string)
+            if in_flight is not None and in_flight.target_px == target_px:
+                continue  # already being decoded at this size
+            missing.append(path_string)
         if not missing:
             return
-        loader = _GridCellsLoader(missing, GRID_CELL_MAX_PX, token)
+        loader = _GridCellsLoader(missing, target_px, token)
         loader.loaded.connect(self._on_grid_cells_loaded)
         self._grid_loaders.add(loader)  # keep alive while it runs
+        for path_string in missing:
+            self._grid_in_flight[path_string] = loader
         QThreadPool.globalInstance().start(loader, IMAGE_LOAD_PRIORITY)
 
-    @Slot(dict, int)
-    def _on_grid_cells_loaded(self, images: dict, token: int):
-        self._grid_loaders.discard(self.sender())
-        # Build the QPixmaps on the GUI thread and cache them for reuse.
+    @Slot(dict, int, int, bool)
+    def _on_grid_cells_loaded(self, images: dict, target_px: int, token: int,
+                              final: bool):
+        loader = self.sender()
+        # Only accept results this loader is still responsible for. A path is
+        # handed to a newer loader when its file changed on disk or the cell
+        # size changed, and everything is dropped when the grid is closed.
+        accepted = {}
         for path_string, image in images.items():
-            if not image.isNull():
-                self._grid_cell_cache[path_string] = QPixmap.fromImage(image)
-        # Ignore results from a superseded render (selection/current changed).
-        if not self._grid_mode or token != self._grid_render_token:
+            if self._grid_in_flight.get(path_string) is loader:
+                del self._grid_in_flight[path_string]
+                accepted[path_string] = image
+        if final:
+            self._grid_loaders.discard(loader)
+            for path_string in [path for path, owner
+                                in self._grid_in_flight.items()
+                                if owner is loader]:
+                del self._grid_in_flight[path_string]
+        if not self._grid_mode or self._grid_proxy_indices is None:
             return
-        if self._grid_proxy_indices is None:
+        window_indices, _ = self._grid_window(
+            self._grid_proxy_indices, self._grid_current_position,
+            self._grid_cell_cap)
+        window_paths = self._paths_of(window_indices)
+        # Build the QPixmaps on the GUI thread and cache the ones still shown.
+        changed = False
+        for path_string, image in accepted.items():
+            if not image.isNull() and path_string in window_paths:
+                self._grid_cell_cache[path_string] = (
+                    target_px, QPixmap.fromImage(image))
+                changed = True
+        if not changed:
             return
         # Re-render in place with the now-cached sharp images, keeping the view.
         self._render_grid(self._grid_proxy_indices,
@@ -983,10 +1172,12 @@ class ImageViewer(QWidget):
             y = gap + row * (cell + gap)
             cell_rect = QRect(x, y, cell, cell)
             self._grid_cell_layout.append((cell_rect, absolute_position))
-            # Prefer the sharp cached image; fall back to the list thumbnail as
-            # an instant placeholder until the background decode fills the cache.
-            source_pixmap = self._grid_cell_cache.get(str(image.path))
-            if source_pixmap is None or source_pixmap.isNull():
+            # Prefer the sharp cached image (even one decoded for a different
+            # cell size while its replacement loads); fall back to the list
+            # thumbnail as an instant placeholder until the decode arrives.
+            cached = self._grid_cell_cache.get(str(image.path))
+            source_pixmap = cached[1] if cached is not None else QPixmap()
+            if source_pixmap.isNull():
                 source_pixmap = self._get_cell_thumbnail(proxy_index)
             # A without-tag cell is dimmed, except the cell under the cursor
             # (hover) and, while peeking, the current cell. The current cell is
@@ -1097,7 +1288,13 @@ class ImageViewer(QWidget):
 
     @Slot(QPoint)
     def _on_cell_context_menu_requested(self, viewport_point: QPoint):
-        if not self._grid_mode or self._grid_proxy_indices is None:
+        if not self._grid_mode:
+            if (self.image_label.image_path is not None
+                    and not self.image_label.original_pixmap.isNull()):
+                self.image_context_menu_requested.emit(
+                    self.scroll_area.viewport().mapToGlobal(viewport_point))
+            return
+        if self._grid_proxy_indices is None:
             return
         position = self._cell_position_at(viewport_point)
         if position is None:

@@ -925,7 +925,8 @@ class MainWindow(QMainWindow):
             current_proxy_index)
         if current_source_index.row() not in changed_rows:
             return
-        self.image_viewer.load_image(current_proxy_index)
+        # Keep the user's zoom and position while showing the updated file.
+        self.image_viewer.reload_image(current_proxy_index)
 
 
     @Slot()
@@ -1754,6 +1755,8 @@ class MainWindow(QMainWindow):
         self.image_viewer.grid_cell_clicked.connect(self._select_grid_cell)
         self.image_viewer.grid_cell_context_menu_requested.connect(
             self._show_grid_cell_tag_menu)
+        self.image_viewer.image_context_menu_requested.connect(
+            self._show_image_preview_menu)
         self.tag_counter_model.modelReset.connect(self.track_all_tags_changes)
         # Connecting the signal directly without `isVisible()` causes the menu
         # item to be unchecked when the widget is an inactive tab.
@@ -1786,6 +1789,21 @@ class MainWindow(QMainWindow):
         if len(tag) <= limit:
             return tag
         return tag[:limit - 1] + '\u2026'
+
+    @Slot(QPoint)
+    def _show_image_preview_menu(self, global_point: QPoint):
+        """Context menu for the single-image preview.
+
+        Reuses the Images pane's action, so its text and (customizable)
+        shortcut stay identical in both menus.
+        """
+        self.image_list.list_view.update_context_menu_actions()
+        copy_action = self.image_list.list_view.copy_image_to_clipboard_action
+        if not copy_action.isVisible():
+            return
+        menu = QMenu(self)
+        menu.addAction(copy_action)
+        menu.exec(global_point)
 
     @Slot(QModelIndex, QPoint)
     def _show_grid_cell_tag_menu(self, proxy_index: QModelIndex,
@@ -1926,9 +1944,10 @@ class MainWindow(QMainWindow):
             self.image_tags_editor.load_image_tags(current_proxy_index)
         if was_grid:
             self.image_viewer.exit_grid()
+            # Also called with an invalid index (nothing current), which
+            # clears the grid instead of leaving it on screen.
             current_proxy_index = self.image_list_selection_model.currentIndex()
-            if current_proxy_index.isValid():
-                self.image_viewer.load_image(current_proxy_index)
+            self.image_viewer.load_image(current_proxy_index)
 
     @Slot()
     def _focus_image_list_on_preview_click(self):
