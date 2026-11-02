@@ -34,6 +34,37 @@ def normalize_shortcut_sequences(value) -> list[str]:
     return sequences
 
 
+def resolve_shortcut_sequences(
+        shortcut_specs: list[tuple[str, str, str | list[str]]],
+        configured_shortcuts: dict[str, object]) -> dict[str, list[str]]:
+    """Return the key sequences each action actually uses: the user's saved
+    choice, or else the default. A default that reuses a key the user assigned
+    to another action (e.g. a default added in a later version) is dropped,
+    because Qt treats a key bound to two actions as ambiguous and then neither
+    one fires. The user's own choice always wins."""
+    def portable(sequence: str) -> str:
+        return QKeySequence(sequence).toString(
+            QKeySequence.SequenceFormat.PortableText)
+
+    user_claimed_keys = {
+        portable(sequence)
+        for shortcut_id, _, _ in shortcut_specs
+        if shortcut_id in configured_shortcuts
+        for sequence in normalize_shortcut_sequences(
+            configured_shortcuts[shortcut_id])}
+    resolved = {}
+    for shortcut_id, _, default_shortcut in shortcut_specs:
+        if shortcut_id in configured_shortcuts:
+            resolved[shortcut_id] = normalize_shortcut_sequences(
+                configured_shortcuts[shortcut_id])
+        else:
+            resolved[shortcut_id] = [
+                sequence for sequence
+                in normalize_shortcut_sequences(default_shortcut)
+                if portable(sequence) not in user_claimed_keys]
+    return resolved
+
+
 class ShortcutEditList(QWidget):
     """An editable list of key sequences for a single action.
 

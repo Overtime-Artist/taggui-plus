@@ -338,6 +338,11 @@ class DirectoryScanner(QObject, QRunnable):
         try:
             self._scan()
         except Exception as exception:
+            # The app is quitting while the scan runs; nobody is waiting for
+            # the result, so don't print an alarming error to the console.
+            if (sys.is_finalizing()
+                    or 'interpreter shutdown' in str(exception)):
+                return
             # Never leave the folder half-loaded with no explanation.
             print(f'Failed to load {self.directory_path}: {exception}',
                   file=sys.stderr)

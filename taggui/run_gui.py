@@ -3,6 +3,8 @@ import os
 import sys
 import traceback
 import warnings
+from datetime import datetime
+from pathlib import Path
 
 import transformers
 from PySide6.QtCore import QtMsgType, QTimer, qInstallMessageHandler
@@ -101,6 +103,62 @@ def install_qt_message_filter():
     _previous_qt_message_handler = qInstallMessageHandler(qt_message_handler)
 
 
+def _backup_settings_before_reset() -> Path | None:
+    """Save every setting (including the Tag Library) to a JSON file that can
+    be restored with File > Import Settings. Returns None if it failed."""
+    from utils.scan_cache import _get_cache_dir
+    from utils.settings_export_import import save_settings_to_file
+    file_name = f'settings-backup-{datetime.now():%Y-%m-%d_%H-%M-%S}.json'
+    for folder in (_get_cache_dir(), Path.home()):
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            backup_path = folder / file_name
+            if save_settings_to_file(str(backup_path),
+                                     include_tag_library=True,
+                                     include_auto_captioner=True):
+                return backup_path
+        except Exception:
+            continue
+    return None
+
+
+def show_startup_error(exception: Exception):
+    """Report a startup error. Settings are only reset if the user asks, and
+    only after a backup has been saved, because a single (possibly one-off)
+    error must never wipe the Tag Library, shortcuts and preferences."""
+    if QApplication.instance() is None:
+        QApplication([])
+    error_box = QMessageBox()
+    error_box.setWindowTitle('Error')
+    error_box.setIcon(QMessageBox.Icon.Critical)
+    error_box.setText(str(exception))
+    error_box.setInformativeText(
+        'If this keeps happening, your saved settings may be the cause. '
+        'Choose "Reset Settings and Close" to start fresh next time; a backup '
+        'is saved first and can be restored with File > Import Settings.')
+    error_box.setDetailedText(traceback.format_exc())
+    close_button = error_box.addButton(QMessageBox.StandardButton.Close)
+    reset_button = error_box.addButton(
+        'Reset Settings and Close', QMessageBox.ButtonRole.DestructiveRole)
+    error_box.setDefaultButton(close_button)
+    error_box.exec()
+    if error_box.clickedButton() is not reset_button:
+        return
+    backup_path = _backup_settings_before_reset()
+    if backup_path is None:
+        QMessageBox.critical(
+            None, 'Settings Not Reset',
+            'A backup of your settings could not be saved, so they were not '
+            'reset.')
+        return
+    get_settings().clear()
+    get_settings().sync()
+    QMessageBox.information(
+        None, 'Settings Reset',
+        f'Your settings were reset. A backup was saved to:\n{backup_path}\n\n'
+        f'To restore it, use File > Import Settings.')
+
+
 def run_gui():
     configure_embedded_browser_runtime()
     from widgets.main_window import MainWindow
@@ -120,14 +178,7 @@ def run_gui():
             # show() is deferred — MainWindow calls _show_window() once the
             # first image has been rendered (or immediately if there is none).
         except Exception as exception:
-            settings = get_settings()
-            settings.clear()
-            error_box = QMessageBox()
-            error_box.setWindowTitle('Error')
-            error_box.setIcon(QMessageBox.Icon.Critical)
-            error_box.setText(str(exception))
-            error_box.setDetailedText(traceback.format_exc())
-            error_box.exec()
+            show_startup_error(exception)
             app.quit()
 
     QTimer.singleShot(0, _create_and_show)
@@ -153,12 +204,5 @@ if __name__ == '__main__':
     try:
         run_gui()
     except Exception as exception:
-        settings = get_settings()
-        settings.clear()
-        error_message_box = QMessageBox()
-        error_message_box.setWindowTitle('Error')
-        error_message_box.setIcon(QMessageBox.Icon.Critical)
-        error_message_box.setText(str(exception))
-        error_message_box.setDetailedText(traceback.format_exc())
-        error_message_box.exec()
+        show_startup_error(exception)
         raise exception

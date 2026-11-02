@@ -27,7 +27,7 @@ from dialogs.find_duplicates_dialog import FindDuplicatesDialog
 from dialogs.gelbooru_wiki_dialog import GelbooruWikiDialog
 from dialogs.import_settings_preview_dialog import ImportSettingsPreviewDialog
 from dialogs.keyboard_shortcuts_dialog import (KeyboardShortcutsDialog,
-                                               normalize_shortcut_sequences)
+                                               resolve_shortcut_sequences)
 from dialogs.settings_dialog import SettingsDialog
 from dialogs.tag_library_dialog import TagLibraryDialog
 from models.image_list_model import ImageListModel, RefreshScanner
@@ -57,6 +57,40 @@ from widgets.image_viewer import ImageViewer
 ICON_PATH = Path('images/icon.ico')
 GITHUB_REPOSITORY_URL = 'https://github.com/Overtime-Artist/taggui-plus'
 TOKENIZER_DIRECTORY_PATH = Path('clip-vit-base-patch32')
+
+
+def ensure_menu_shortcut_gap(menu: QMenu):
+    """Keep a clear gap between action names and their shortcuts.
+
+    Fusion places the shortcut column right after the longest action name, so
+    an action whose name is the longest (a one-item menu, a long
+    'Undo "..."' text, or a user-assigned key on the longest item) gets almost
+    no gap. The shortcut is right-aligned, so widening the menu adds the gap.
+    Call again whenever texts or shortcuts may have changed (e.g. from
+    `aboutToShow`).
+    """
+    menu.setMinimumWidth(0)
+    menu.ensurePolished()
+    font_metrics = menu.fontMetrics()
+    actions = [action for action in menu.actions()
+               if action.isVisible() and not action.isSeparator()]
+    actions_with_shortcut = [action for action in actions
+                             if not action.shortcut().isEmpty()]
+    if not actions_with_shortcut:
+        return
+
+    def text_width(action: QAction) -> int:
+        # '&' marks a mnemonic and is not drawn ('&&' draws one '&').
+        text = action.text().replace('&&', '\0').replace('&', '')
+        return font_metrics.horizontalAdvance(text.replace('\0', '&'))
+
+    widest_text = max(text_width(action) for action in actions)
+    smallest_gap = min(widest_text - text_width(action)
+                       for action in actions_with_shortcut)
+    wanted_gap = 3 * font_metrics.horizontalAdvance('M')
+    if smallest_gap < wanted_gap:
+        menu.setMinimumWidth(menu.sizeHint().width()
+                             + wanted_gap - smallest_gap)
 
 
 class TokenizerLoader(QObject, QRunnable):
@@ -245,8 +279,8 @@ class MainWindow(QMainWindow):
         self.toggle_all_tags_editor_action = QAction('All Tags', parent=self)
         self.toggle_auto_captioner_action = QAction('Auto-Captioner',
                                                     parent=self)
-        self.open_danbooru_wiki_action = QAction('Danbooru Wiki...' + ' ' * 12, parent=self)
-        self.open_gelbooru_wiki_action = QAction('Gelbooru Wiki...' + ' ' * 12, parent=self)
+        self.open_danbooru_wiki_action = QAction('Danbooru Wiki...', parent=self)
+        self.open_gelbooru_wiki_action = QAction('Gelbooru Wiki...', parent=self)
         self.create_menus()
         self.app.installEventFilter(self)
 
@@ -764,9 +798,12 @@ class MainWindow(QMainWindow):
         self.directory_path = previous_path
         self.setWindowTitle(previous_title)
         if was_saved:
-            self.settings.setValue(
-                'directory_path',
-                str(previous_path) if previous_path is not None else '')
+            # Never save an empty path: on the next launch `Path('')` would
+            # mean "the folder the app was started from" and load that.
+            if previous_path is not None:
+                self.settings.setValue('directory_path', str(previous_path))
+            else:
+                self.settings.remove('directory_path')
         self.skip_next_all_tags_removal_prompt = False
         self.is_syncing_tag_library_from_directory = False
         self._pending_directory_filter = ''
@@ -1271,16 +1308,13 @@ class MainWindow(QMainWindow):
         handlers_by_id = self.get_shortcut_handlers_map()
         if not hasattr(self, '_extra_qshortcuts'):
             self._extra_qshortcuts = {}
-        for shortcut_id, _, default_shortcut in shortcut_specs:
+        sequences_by_id = resolve_shortcut_sequences(shortcut_specs,
+                                                     configured_shortcuts)
+        for shortcut_id, _, _ in shortcut_specs:
             action = action_by_id.get(shortcut_id)
             if action is None:
                 continue
-            if shortcut_id in configured_shortcuts:
-                sequence_strings = normalize_shortcut_sequences(
-                    configured_shortcuts[shortcut_id])
-            else:
-                sequence_strings = normalize_shortcut_sequences(
-                    default_shortcut)
+            sequence_strings = sequences_by_id[shortcut_id]
             key_sequences = [QKeySequence(sequence)
                              for sequence in sequence_strings]
             # The map holds both QActions (menu/list actions, which support
@@ -1343,7 +1377,8 @@ class MainWindow(QMainWindow):
         keyboard_shortcuts_dialog = KeyboardShortcutsDialog(
             parent=parent or self,
             shortcut_specs=self.get_shortcut_specs(),
-            configured_shortcuts=configured_shortcuts)
+            configured_shortcuts=resolve_shortcut_sequences(
+                self.get_shortcut_specs(), configured_shortcuts))
         if keyboard_shortcuts_dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.settings.setValue('keyboard_shortcuts',
@@ -1627,7 +1662,7 @@ class MainWindow(QMainWindow):
             self.show_directory_analytics_dialog)
         tools_menu.addAction(self.directory_analytics_action)
         tools_menu.addSeparator()
-        self.tag_library_action = QAction('Tag Library...' + ' ' * 4, parent=self)
+        self.tag_library_action = QAction('Tag Library...', parent=self)
         self.tag_library_action.triggered.connect(self.show_tag_library_dialog)
         tools_menu.addAction(self.tag_library_action)
 
@@ -1636,6 +1671,10 @@ class MainWindow(QMainWindow):
         open_github_repository_action.triggered.connect(
             lambda: QDesktopServices.openUrl(QUrl(GITHUB_REPOSITORY_URL)))
         help_menu.addAction(open_github_repository_action)
+
+        for menu in (file_menu, edit_menu, view_menu, tools_menu, help_menu):
+            menu.aboutToShow.connect(
+                lambda menu=menu: ensure_menu_shortcut_gap(menu))
 
     @Slot()
     def update_undo_and_redo_actions(self):
@@ -1803,11 +1842,7 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         menu.addAction(copy_action)
-        # Fusion leaves almost no gap before the shortcut in a one-item menu;
-        # the shortcut is right-aligned, so widening the menu adds the gap.
-        menu.ensurePolished()
-        menu.setMinimumWidth(menu.sizeHint().width()
-                             + 3 * menu.fontMetrics().horizontalAdvance('M'))
+        ensure_menu_shortcut_gap(menu)
         menu.exec(global_point)
 
     @Slot(QModelIndex, QPoint)
@@ -2586,9 +2621,13 @@ class MainWindow(QMainWindow):
             image_index = 0
         # Load the last loaded directory.
         if self.settings.contains('directory_path'):
-            directory_path = Path(self.settings.value('directory_path',
-                                                      type=str))
-            if directory_path.is_dir():
+            saved_directory_path = self.settings.value('directory_path',
+                                                       type=str)
+            # An empty value (saved by older versions after a failed load)
+            # would otherwise resolve to the app's own working folder.
+            directory_path = (Path(saved_directory_path)
+                              if saved_directory_path.strip() else None)
+            if directory_path is not None and directory_path.is_dir():
                 self.load_directory(directory_path, select_index=image_index,
                                     restore_filter=saved_filter)
                 return
