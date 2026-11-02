@@ -73,9 +73,10 @@ class LibraryTagCompleter(TagCompleter):
 class LibraryTagLineEdit(QLineEdit):
     """Line edit with optional Tag Library autocomplete.
 
-    Picking a suggestion with Enter only fills the field: Qt also forwards
-    that Enter to the line edit (emitting `returnPressed`), which would
-    otherwise submit the row straight away."""
+    Pressing Enter on a highlighted suggestion only fills the field. Qt sends
+    that Enter to the line edit before applying the suggestion, and the line
+    edit would emit `returnPressed` (submitting the row) even though the popup
+    is open."""
 
     def __init__(self, tag_library_model: TagLibraryModel,
                  multiple: bool = False, parent=None):
@@ -84,7 +85,6 @@ class LibraryTagLineEdit(QLineEdit):
         self._multiple = multiple
         self._completer = None
         self._candidates_stale = True
-        self._just_completed = False
         tag_library_model.modelReset.connect(self._mark_candidates_stale)
 
     def set_autocomplete_enabled(self, enabled: bool):
@@ -99,7 +99,6 @@ class LibraryTagLineEdit(QLineEdit):
         self._completer = LibraryTagCompleter(model, self, self._multiple)
         self._completer.setPopup(CompleterPopupList())
         self.setCompleter(self._completer)
-        self._completer.activated[str].connect(self._on_completion_activated)
         self._candidates_stale = True
         if self.hasFocus():
             self._refresh_candidates()
@@ -121,18 +120,17 @@ class LibraryTagLineEdit(QLineEdit):
         self._refresh_candidates()
         super().focusInEvent(event)
 
-    def _on_completion_activated(self, _text: str):
-        self._just_completed = True
-        QTimer.singleShot(0, self._clear_just_completed)
-
-    def _clear_just_completed(self):
-        self._just_completed = False
+    def _suggestion_highlighted(self) -> bool:
+        if self._completer is None:
+            return False
+        popup = self._completer.popup()
+        return popup.isVisible() and popup.currentIndex().isValid()
 
     def keyPressEvent(self, event):
-        if (self._just_completed
-                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
-            self._just_completed = False
-            event.accept()
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and self._suggestion_highlighted()):
+            # Leave it unaccepted so the completer applies the suggestion.
+            event.ignore()
             return
         super().keyPressEvent(event)
 
