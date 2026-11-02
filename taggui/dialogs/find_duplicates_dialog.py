@@ -11,9 +11,10 @@ the kept image first.
 import itertools
 from pathlib import Path
 
-from PySide6.QtCore import (QEvent, QObject, QRunnable, Qt, QThread,
-                            QThreadPool, QTimer, Signal, Slot)
-from PySide6.QtGui import (QFont, QImageReader, QKeySequence, QPainter,
+from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject,
+                            QRunnable, Qt, QThread, QThreadPool, QTimer,
+                            Signal, Slot)
+from PySide6.QtGui import (QFont, QIcon, QImageReader, QKeySequence, QPainter,
                            QPalette, QPen, QPixmap, QShortcut)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
                                QComboBox, QDialog,
@@ -31,6 +32,7 @@ from utils.settings_widgets import (FocusedScrollSettingsComboBox,
                                     SettingsBigCheckBox)
 from utils.utils import get_confirmation_dialog_reply, pluralize
 from widgets.image_list import transfer_images, trash_images
+from widgets.image_viewer import ImageViewer
 
 # Thumbnail edge length (pixels) for the cards in a duplicate group.
 _THUMBNAIL_SIZE = 140
@@ -820,7 +822,8 @@ class FindDuplicatesDialog(QDialog):
                 index = position
                 break
 
-        dialog = _PreviewDialog(self, radio_members, index)
+        dialog = _PreviewDialog(self, radio_members, index,
+                                self._thumbnails)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.exec()
 
@@ -1014,169 +1017,374 @@ def _elide(text: str, limit: int = 22) -> str:
     return text[:limit - 1] + '\u2026'
 
 
+class _GroupImagesModel(QAbstractListModel):
+    """The images of one duplicate group, in the shape the main ImageViewer
+    reads: the image record (path and dimensions) for UserRole and the
+    already-loaded card thumbnail, used as an instant placeholder, for
+    DecorationRole."""
+
+    def __init__(self, members, thumbnails: dict, parent=None):
+        super().__init__(parent)
+        self.members = members
+        self.thumbnails = thumbnails
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.members)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self.members):
+            return None
+        member = self.members[index.row()]
+        if role == Qt.ItemDataRole.UserRole:
+            return member
+        if role == Qt.ItemDataRole.DecorationRole:
+            pixmap = self.thumbnails.get(str(member.path))
+            if pixmap is not None and not pixmap.isNull():
+                return QIcon(pixmap)
+        return None
+
+
+_OVERLAY_STYLE = (
+    'QFrame#previewOverlay { background-color: rgba(0, 0, 0, 160);'
+    ' border-radius: 6px; }'
+    'QFrame#previewOverlay QLabel { color: rgba(255, 255, 255, 230);'
+    ' background: transparent; }'
+    'QFrame#previewOverlay QPushButton { color: white;'
+    ' background-color: rgba(255, 255, 255, 28);'
+    ' border: 1px solid rgba(255, 255, 255, 70); border-radius: 4px;'
+    ' padding: 4px 10px; }'
+    'QFrame#previewOverlay QPushButton:hover {'
+    ' background-color: rgba(255, 255, 255, 60); }'
+    'QFrame#previewOverlay QPushButton:pressed {'
+    ' background-color: rgba(255, 255, 255, 90); }'
+    'QFrame#previewOverlay QPushButton:disabled {'
+    ' color: rgba(255, 255, 255, 110);'
+    ' border-color: rgba(255, 255, 255, 35); }')
+# Hide the overlaid controls after this long without mouse movement.
+_OVERLAY_HIDE_DELAY_MS = 2500
+_OVERLAY_MARGIN = 10
+
+
 class _PreviewDialog(QDialog):
-    """Large image preview that can page through every image in a duplicate
-    group (Previous / Next), mark which one to keep, and scales each image to
-    fit the window without ever enlarging it beyond its original resolution.
+    """Large viewer for a duplicate group, built on the main image viewer:
+    zoom (mouse wheel, + / -), pan (drag) and double-click to reset, a
+    single-image view that cycles through the group and a grid view of the
+    whole group, with controls overlaid on the image and a full-screen
+    toggle.
 
     ``radio_members`` is a list of ``(QRadioButton | None, member)`` tuples
-    shared with the main dialog, so pressing "Keep this image" here checks the
+    shared with the main dialog, so "Keep this image" here checks the
     matching radio back in the results list.
     """
 
-    def __init__(self, parent, radio_members, index):
+    def __init__(self, parent, radio_members, index, thumbnails=None):
         super().__init__(parent)
         self.radio_members = radio_members
         self.index = index
-        self._pixmap = None
+        self._grid = False
+        self._was_maximized = False
+        members = [member for _radio, member in radio_members]
+        self.model = _GroupImagesModel(members, thumbnails or {}, self)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.viewer = ImageViewer(self.model)
+        layout.addWidget(self.viewer)
+        viewport = self.viewer.scroll_area.viewport()
 
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setWidget(self.image_label)
-        layout.addWidget(self.scroll, 1)
+        # Top left: what is shown.
+        self.info_overlay = self._make_overlay(viewport)
+        info_layout = QVBoxLayout(self.info_overlay)
+        info_layout.setContentsMargins(10, 6, 10, 6)
+        info_layout.setSpacing(2)
+        self.name_label = QLabel()
+        name_font = QFont(self.font())
+        name_font.setBold(True)
+        self.name_label.setFont(name_font)
+        self.details_label = QLabel()
+        info_layout.addWidget(self.name_label)
+        info_layout.addWidget(self.details_label)
 
-        self.info_label = QLabel()
-        self.info_label.setWordWrap(True)
-        layout.addWidget(self.info_label)
+        # Top right: view controls.
+        self.view_overlay = self._make_overlay(viewport)
+        view_layout = QHBoxLayout(self.view_overlay)
+        view_layout.setContentsMargins(6, 6, 6, 6)
+        self.grid_button = self._make_button('Grid view (G)')
+        self.grid_button.clicked.connect(self.toggle_grid)
+        self.full_screen_button = self._make_button('Full screen (F11)')
+        self.full_screen_button.clicked.connect(self.toggle_full_screen)
+        self.close_button = self._make_button('Close (Esc)')
+        self.close_button.clicked.connect(self.reject)
+        for button in (self.grid_button, self.full_screen_button,
+                       self.close_button):
+            view_layout.addWidget(button)
 
-        button_row = QHBoxLayout()
-        self.prev_button = QPushButton('\u2190 Previous')
-        self.next_button = QPushButton('Next \u2192')
-        self.keep_button = QPushButton('Keep this image')
-        self.close_button = QPushButton('Close')
+        # Bottom centre: paging and the keep decision.
+        self.nav_overlay = self._make_overlay(viewport)
+        nav_layout = QHBoxLayout(self.nav_overlay)
+        nav_layout.setContentsMargins(6, 6, 6, 6)
+        self.prev_button = self._make_button('\u2190 Previous')
         self.prev_button.clicked.connect(lambda: self._step(-1))
-        self.next_button.clicked.connect(lambda: self._step(1))
+        self.keep_button = self._make_button('Keep this image (K)')
         self.keep_button.clicked.connect(self._keep_current)
-        self.close_button.clicked.connect(self.accept)
-        button_row.addWidget(self.prev_button)
-        button_row.addWidget(self.next_button)
-        button_row.addStretch()
-        button_row.addWidget(self.keep_button)
-        button_row.addWidget(self.close_button)
-        layout.addLayout(button_row)
+        self.next_button = self._make_button('Next \u2192')
+        self.next_button.clicked.connect(lambda: self._step(1))
+        for button in (self.prev_button, self.keep_button, self.next_button):
+            nav_layout.addWidget(button)
+        self.overlays = (self.info_overlay, self.view_overlay,
+                         self.nav_overlay)
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(_OVERLAY_HIDE_DELAY_MS)
+        self._hide_timer.timeout.connect(self._hide_overlays_if_idle)
+        # Watch mouse movement anywhere over the image to bring the controls
+        # back, and viewport resizes to keep them in their corners.
+        for widget in (viewport, self.viewer.image_label):
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+        for overlay in self.overlays:
+            overlay.installEventFilter(self)
+
+        self.viewer.grid_cell_clicked.connect(self._on_grid_cell_clicked)
+        # Double-clicking a grid cell opens it in the single-image view.
+        self.viewer.scroll_area.reset_requested.connect(
+            self._on_double_click)
+
+        for key, slot in (
+                (Qt.Key.Key_Left, lambda: self._step(-1)),
+                (Qt.Key.Key_Right, lambda: self._step(1)),
+                (Qt.Key.Key_K, self._keep_current),
+                (Qt.Key.Key_G, self.toggle_grid),
+                (Qt.Key.Key_F11, self.toggle_full_screen),
+                (Qt.Key.Key_Return, self._on_enter),
+                (Qt.Key.Key_Enter, self._on_enter),
+                (Qt.Key.Key_Plus, self.viewer.zoom_in),
+                (Qt.Key.Key_Equal, self.viewer.zoom_in),
+                (Qt.Key.Key_Minus, self.viewer.zoom_out),
+                (Qt.Key.Key_0, self.viewer.reset_view)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(slot)
 
         screen = self.screen() or QApplication.primaryScreen()
         available = screen.availableGeometry()
         self.resize(int(available.width() * 0.85),
                     int(available.height() * 0.85))
+        self._show_current()
 
-        # Left/Right arrow keys page through the group. QShortcut works even
-        # when a button has keyboard focus (a plain keyPressEvent would not).
-        previous_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
-        previous_shortcut.activated.connect(lambda: self._step(-1))
-        next_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
-        next_shortcut.activated.connect(lambda: self._step(1))
+    @staticmethod
+    def _make_overlay(parent) -> QFrame:
+        overlay = QFrame(parent)
+        overlay.setObjectName('previewOverlay')
+        overlay.setStyleSheet(_OVERLAY_STYLE)
+        overlay.setCursor(Qt.CursorShape.ArrowCursor)
+        # Clicks on the panel itself must not pan the image or pick a cell.
+        overlay.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation)
+        return overlay
 
-        self._load_current()
+    @staticmethod
+    def _make_button(text: str) -> QPushButton:
+        button = QPushButton(text)
+        # Keep keyboard focus off the buttons so the arrow keys, Enter and
+        # Esc always reach the viewer's shortcuts.
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setAutoDefault(False)
+        return button
 
-    def _load_current(self):
+    # --- Showing images -----------------------------------------------------
+
+    def _indices(self) -> list[QModelIndex]:
+        return [self.model.index(row) for row in range(self.model.rowCount())]
+
+    def _grid_cell_cap(self) -> int:
+        return max(1, get_settings().value(
+            'variant_grid_cell_cap',
+            defaultValue=DEFAULT_SETTINGS['variant_grid_cell_cap'], type=int))
+
+    def _kept_member(self):
+        for radio, member in self.radio_members:
+            if radio is not None and radio.isChecked():
+                return member
+        return None
+
+    def _show_current(self):
+        """Show the current image, in the single-image or the grid view."""
+        if self._grid:
+            self.viewer.update_grid_current(self._indices(), self.index,
+                                            self._grid_cell_cap())
+        else:
+            self.viewer.exit_grid()
+            self.viewer.load_image(self.model.index(self.index))
+        self._update_info()
+
+    def _update_info(self):
         _radio, member = self.radio_members[self.index]
-        self._pixmap = QPixmap(str(member.path))
-
         total = len(self.radio_members)
         self.setWindowTitle(
+            f'{member.path}  \u2014  {self.index + 1} of {total}')
+        self.name_label.setText(
             f'{member.path.name}  \u2014  {self.index + 1} of {total}')
+        parts = []
+        if member.dimensions:
+            width, height = member.dimensions
+            parts.append(f'{width}\u00d7{height}')
+        if member.size is not None:
+            parts.append(_format_size(member.size))
+        kept = self._kept_member()
+        if kept is not None:
+            relation, _tooltip = describe_relation(member, kept)
+            if relation:
+                parts.append(relation)
+        self.details_label.setText('  \u2022  '.join(parts))
+
         multiple = total > 1
         self.prev_button.setEnabled(multiple)
         self.next_button.setEnabled(multiple)
-
-        if self._pixmap.isNull():
-            original_text = ''
-        else:
-            original_text = (f'{self._pixmap.width()}\u00d7'
-                             f'{self._pixmap.height()} (original)')
-        try:
-            size_text = _format_size(member.path.stat().st_size)
-        except OSError:
-            size_text = ''
-        parts = [part for part in (original_text, size_text) if part]
-        self.info_label.setText(
-            str(member.path)
-            + (('\n' + '  \u2022  '.join(parts)) if parts else ''))
-
-        self._update_keep_button()
-        self._render()
-        self._focus_primary_button()
-
-    def _focus_primary_button(self):
-        """Give keyboard focus (and Enter-key default) to the most useful
-        button for the current image: "Keep this image" when it can still be
-        kept, otherwise "Next" so Enter keeps paging through the group, and
-        "Close" as a last resort. Navigation is also always available via the
-        Left/Right arrow keys, so the default button is reserved for the
-        primary decision rather than paging."""
-        if self.keep_button.isEnabled():
-            target = self.keep_button
-        elif self.next_button.isEnabled():
-            target = self.next_button
-        else:
-            target = self.close_button
-        # Every button keeps ``autoDefault`` on so that tabbing focus to another
-        # button makes *it* the Enter-key target; only the primary target is the
-        # initial default and gets focus.
-        for button in (self.prev_button, self.next_button,
-                       self.keep_button, self.close_button):
-            button.setAutoDefault(True)
-            button.setDefault(button is target)
-        target.setFocus()
-
-    def _update_keep_button(self):
-        radio, _member = self.radio_members[self.index]
-        already_kept = radio is not None and radio.isChecked()
+        radio = self.radio_members[self.index][0]
         if radio is None:
-            self.keep_button.setText('Keep this image')
+            self.keep_button.setText('Keep this image (K)')
             self.keep_button.setEnabled(False)
-        elif already_kept:
+        elif radio.isChecked():
             self.keep_button.setText('\u2713 Keeping this image')
             self.keep_button.setEnabled(False)
         else:
-            self.keep_button.setText('Keep this image')
+            self.keep_button.setText('Keep this image (K)')
             self.keep_button.setEnabled(True)
-
-    def _render(self):
-        """Scale to fit the viewport, but never upscale past original size."""
-        if self._pixmap is None or self._pixmap.isNull():
-            self.image_label.setText('(cannot load this image)')
-            return
-        viewport = self.scroll.viewport().size()
-        available_width = max(1, viewport.width())
-        available_height = max(1, viewport.height())
-        pixmap = self._pixmap
-        if (pixmap.width() > available_width
-                or pixmap.height() > available_height):
-            pixmap = pixmap.scaled(
-                available_width, available_height,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation)
-        self.image_label.setPixmap(pixmap)
+        self.grid_button.setText('Single view (G)' if self._grid
+                                 else 'Grid view (G)')
+        self.grid_button.setEnabled(multiple or self._grid)
+        self.full_screen_button.setText(
+            'Exit full screen (F11)' if self.isFullScreen()
+            else 'Full screen (F11)')
+        self._position_overlays()
 
     def _step(self, delta):
+        if len(self.radio_members) < 2:
+            return
         self.index = (self.index + delta) % len(self.radio_members)
-        self._load_current()
+        self._show_current()
+        self._show_overlays()
 
     def _keep_current(self):
         radio, _member = self.radio_members[self.index]
-        if radio is not None:
-            radio.setChecked(True)
-        self._update_keep_button()
-        # Keeping disables the Keep button, so move focus/default off it to the
-        # next most useful action.
-        self._focus_primary_button()
+        if radio is None or radio.isChecked():
+            return
+        radio.setChecked(True)
+        self._update_info()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._render()
+    def toggle_grid(self):
+        if not self._grid and len(self.radio_members) < 2:
+            return
+        self._grid = not self._grid
+        if self._grid:
+            self.viewer.show_grid(self._indices(), self.index,
+                                  self._grid_cell_cap())
+            self._update_info()
+        else:
+            self._show_current()
+        self._show_overlays()
+
+    def _open_in_single_view(self, row: int):
+        self.index = row
+        self._grid = False
+        self._show_current()
+
+    @Slot(QModelIndex)
+    def _on_grid_cell_clicked(self, proxy_index):
+        # Like the main grid: a click makes the cell current.
+        if self._grid and proxy_index.row() != self.index:
+            self.index = proxy_index.row()
+            self._show_current()
+
+    def _on_double_click(self):
+        if self._grid:
+            # The first click of the double-click already made the cell
+            # under the cursor current.
+            QTimer.singleShot(0, lambda: self._open_in_single_view(
+                self.index))
+
+    def _on_enter(self):
+        if self._grid:
+            self._open_in_single_view(self.index)
+        else:
+            self._keep_current()
+
+    # --- Full screen ----------------------------------------------------------
+
+    def toggle_full_screen(self):
+        if self.isFullScreen():
+            if self._was_maximized:
+                self.showMaximized()
+            else:
+                self.showNormal()
+        else:
+            self._was_maximized = self.isMaximized()
+            self.showFullScreen()
+        self._update_info()
+        self._show_overlays()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.toggle_full_screen()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # --- Overlaid controls ----------------------------------------------------
+
+    def _position_overlays(self):
+        viewport = self.viewer.scroll_area.viewport()
+        width = viewport.width()
+        height = viewport.height()
+        for overlay in self.overlays:
+            overlay.adjustSize()
+        self.info_overlay.move(_OVERLAY_MARGIN, _OVERLAY_MARGIN)
+        view_x = width - self.view_overlay.width() - _OVERLAY_MARGIN
+        view_y = _OVERLAY_MARGIN
+        # In a narrow window, put the buttons under the info box.
+        if view_x < self.info_overlay.geometry().right() + _OVERLAY_MARGIN:
+            view_x = max(_OVERLAY_MARGIN, view_x)
+            view_y = self.info_overlay.geometry().bottom() + _OVERLAY_MARGIN
+        self.view_overlay.move(view_x, view_y)
+        self.nav_overlay.move(
+            (width - self.nav_overlay.width()) // 2,
+            height - self.nav_overlay.height() - _OVERLAY_MARGIN)
+        for overlay in self.overlays:
+            overlay.raise_()
+
+    def _show_overlays(self):
+        for overlay in self.overlays:
+            overlay.show()
+        self._position_overlays()
+        self.viewer.scroll_area.viewport().unsetCursor()
+        self._hide_timer.start()
+
+    def _hide_overlays_if_idle(self):
+        # Keep the controls while the cursor is on them.
+        if any(overlay.underMouse() for overlay in self.overlays):
+            self._hide_timer.start()
+            return
+        for overlay in self.overlays:
+            overlay.hide()
+        if self.isFullScreen() and not self.viewer.scroll_area.is_dragging:
+            self.viewer.scroll_area.viewport().setCursor(
+                Qt.CursorShape.BlankCursor)
+
+    def eventFilter(self, watched, event):
+        event_type = event.type()
+        if event_type == QEvent.Type.MouseMove:
+            if not all(overlay.isVisible() for overlay in self.overlays):
+                self._show_overlays()
+            else:
+                self._hide_timer.start()
+        elif (event_type == QEvent.Type.Resize
+              and watched is self.viewer.scroll_area.viewport()):
+            self._position_overlays()
+        return False
 
     def showEvent(self, event):
         super().showEvent(event)
-        # The viewport has no real size until the window is shown and laid
-        # out, so defer one more fit-to-window pass to the next event-loop
-        # turn. Without this the first image opens unscaled.
-        QTimer.singleShot(0, self._render)
+        QTimer.singleShot(0, self._show_overlays)
 
 
 class _GroupCards:
