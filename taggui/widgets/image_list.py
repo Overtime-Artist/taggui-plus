@@ -414,6 +414,7 @@ class ImageListView(ElidedToolTipListView):
             self.copy_selected_image_paths)
         self.copy_image_to_clipboard_action = self.addAction(
             'Copy Image to Clipboard')
+        self.copy_image_to_clipboard_action.setShortcut('Ctrl+Shift+I')
         self.copy_image_to_clipboard_action.triggered.connect(
             self.copy_current_image_to_clipboard)
         self.move_images_action = self.addAction('Move Images to...')
@@ -1117,6 +1118,8 @@ class ImageListView(ElidedToolTipListView):
             'paste_tags': ('Paste Tags', self.paste_tags_action),
             'copy_file_name': ('Copy File Name', self.copy_file_names_action),
             'copy_path': ('Copy Path', self.copy_paths_action),
+            'copy_image_to_clipboard': ('Copy Image to Clipboard',
+                                        self.copy_image_to_clipboard_action),
             'move_images': ('Move Images to...', self.move_images_action),
             'copy_images': ('Copy Images to...', self.copy_images_action),
             'delete_images': ('Delete Images', self.delete_images_action),

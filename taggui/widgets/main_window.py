@@ -1086,6 +1086,8 @@ class MainWindow(QMainWindow):
             ('paste_tags', 'Paste Tags', 'Ctrl+V'),
             ('copy_file_name', 'Copy File Name', 'Ctrl+Shift+P'),
             ('copy_path', 'Copy Path', 'Ctrl+P'),
+            ('copy_image_to_clipboard', 'Copy Image to Clipboard',
+             'Ctrl+Shift+I'),
             ('move_images', 'Move Images to...', 'Ctrl+M'),
             ('copy_images', 'Copy Images to...', 'Ctrl+Shift+M'),
             ('delete_images', 'Delete Images', 'Ctrl+Del'),
