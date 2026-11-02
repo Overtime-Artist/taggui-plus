@@ -252,19 +252,81 @@ def save_tag_library_category_by_tag(category_by_tag: dict[str, str]):
     settings.setValue('tag_library_category_by_tag', normalized_mapping)
 
 
+def _normalize_tag_library_aliases(value) -> dict[str, str]:
+    """Keep only well-formed `alias → canonical` string pairs."""
+    if not isinstance(value, dict):
+        return {}
+    aliases = {}
+    for alias, canonical in value.items():
+        if not isinstance(alias, str) or not isinstance(canonical, str):
+            continue
+        alias = alias.strip()
+        canonical = canonical.strip()
+        if alias and canonical and alias != canonical:
+            aliases[alias] = canonical
+    return aliases
+
+
+def _normalize_tag_library_implications(value) -> dict[str, list[str]]:
+    """Keep only `trigger → [implied tags]` entries with string tags. A single
+    string is accepted as one implied tag (never split into letters)."""
+    if not isinstance(value, dict):
+        return {}
+    implications = {}
+    for trigger, implied in value.items():
+        if not isinstance(trigger, str) or not trigger.strip():
+            continue
+        trigger = trigger.strip()
+        if isinstance(implied, str):
+            implied = [implied]
+        if not isinstance(implied, (list, tuple)):
+            continue
+        tags = []
+        for tag in implied:
+            if isinstance(tag, str):
+                tag = tag.strip()
+                if tag and tag != trigger and tag not in tags:
+                    tags.append(tag)
+        if tags:
+            implications[trigger] = tags
+    return implications
+
+
+def _normalize_tag_library_profiles(value) -> dict[str, dict[str, str]]:
+    """Keep only `profile name → {original: replacement}` string mappings."""
+    if not isinstance(value, dict):
+        return {}
+    profiles = {}
+    for name, mapping in value.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(mapping, dict):
+            mapping = {}
+        clean_mapping = {}
+        for original, replacement in mapping.items():
+            if not isinstance(original, str) or not original.strip():
+                continue
+            if replacement is None:
+                replacement = ''
+            if not isinstance(replacement, str):
+                continue
+            clean_mapping[original.strip()] = replacement.strip()
+        profiles[name.strip()] = clean_mapping
+    return profiles
+
+
 def get_tag_library_aliases() -> dict[str, str]:
     settings = get_settings()
     value = settings.value(
         'tag_library_aliases',
         defaultValue=DEFAULT_SETTINGS['tag_library_aliases'])
-    if isinstance(value, dict):
-        return value
-    return {}
+    return _normalize_tag_library_aliases(value)
 
 
 def save_tag_library_aliases(aliases: dict[str, str]):
     settings = get_settings()
-    settings.setValue('tag_library_aliases', aliases)
+    settings.setValue('tag_library_aliases',
+                      _normalize_tag_library_aliases(aliases))
     settings.sync()
 
 
@@ -273,14 +335,13 @@ def get_tag_library_implications() -> dict[str, list[str]]:
     value = settings.value(
         'tag_library_implications',
         defaultValue=DEFAULT_SETTINGS['tag_library_implications'])
-    if isinstance(value, dict):
-        return value
-    return {}
+    return _normalize_tag_library_implications(value)
 
 
 def save_tag_library_implications(implications: dict[str, list[str]]):
     settings = get_settings()
-    settings.setValue('tag_library_implications', implications)
+    settings.setValue('tag_library_implications',
+                      _normalize_tag_library_implications(implications))
     settings.sync()
 
 
@@ -289,14 +350,13 @@ def get_tag_library_profiles() -> dict[str, dict[str, str]]:
     value = settings.value(
         'tag_library_profiles',
         defaultValue=DEFAULT_SETTINGS['tag_library_profiles'])
-    if isinstance(value, dict):
-        return value
-    return {}
+    return _normalize_tag_library_profiles(value)
 
 
 def save_tag_library_profiles(profiles: dict[str, dict[str, str]]):
     settings = get_settings()
-    settings.setValue('tag_library_profiles', profiles)
+    settings.setValue('tag_library_profiles',
+                      _normalize_tag_library_profiles(profiles))
     settings.sync()
 
 

@@ -1903,6 +1903,35 @@ class ImageListModel(QAbstractListModel):
         else:
             self.discard_last_undo_entry()
 
+    @collect_write_errors
+    def apply_tag_mapping(self, mapping: dict[str, str],
+                          action_name: str) -> int:
+        """Replace tags on all images using `mapping` in a single pass, as one
+        undo step. Every mapping is applied to the original tags at the same
+        time, so chained (a→b, b→c) or swapped (a↔b) mappings do not cascade.
+        An empty replacement removes the tag. Returns the number of images
+        changed."""
+        self.add_to_undo_stack(action_name=action_name,
+                               should_ask_for_confirmation=True)
+        changed_image_indices = []
+        for image_index, image in enumerate(self.images):
+            if not any(tag in mapping for tag in image.tags):
+                continue
+            new_tags = []
+            for tag in image.tags:
+                replacement = mapping.get(tag, tag)
+                if replacement:
+                    new_tags.append(replacement)
+            image.tags = list(dict.fromkeys(new_tags))
+            changed_image_indices.append(image_index)
+            self.write_image_tags_to_disk(image)
+        if changed_image_indices:
+            self.dataChanged.emit(self.index(changed_image_indices[0]),
+                                  self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
+        return len(changed_image_indices)
+
     @Slot(list)
     @collect_write_errors
     def delete_tags(self, tags: list[str],
