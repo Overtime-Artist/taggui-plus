@@ -24,6 +24,7 @@ recomputes files whose modification time changed.
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +41,9 @@ _DHASH_SIZE = 16
 # Total bits in a dHash. Stored alongside cached hashes so that raising or
 # lowering the resolution automatically invalidates old cached values.
 _DHASH_BITS = _DHASH_SIZE * _DHASH_SIZE
+# Images hashed at once on the first scan. More threads give little extra
+# speed and use more memory (each holds a fully decoded image).
+_MAX_HASH_WORKERS = 4
 
 
 def compute_dhash(image_path) -> int | None:
@@ -228,37 +232,66 @@ def find_duplicate_groups(images, threshold: int,
         cache = DuplicateCache()
         cache.load()
 
-    records: list[ImageRecord] = []
     image_list = list(images)
     total = len(image_list)
-    for done, image in enumerate(image_list):
-        if should_cancel is not None and should_cancel():
-            # Keep the hashes computed so far for the next scan.
-            cache.save_if_dirty()
-            return []
+    records: list[ImageRecord | None] = [None] * total
+    # (record index, needs a new SHA-256) for files not answered by the cache.
+    to_hash: list[tuple[int, bool]] = []
+    done = 0
+    for index, image in enumerate(image_list):
         path = Path(image.path)
         size, mtime_ns = _stat_size_mtime(path)
         cached = cache.get(path, mtime_ns)
+        record = ImageRecord(
+            path=path, dimensions=getattr(image, 'dimensions', None),
+            size=size, mtime_ns=mtime_ns, sha256=None, dhash=None)
+        records[index] = record
         if cached is not None:
-            sha256 = cached.get('sha256')
+            record.sha256 = cached.get('sha256')
             # Reuse the cached dHash only if it was computed at the current
             # resolution; otherwise recompute just the dHash (the SHA-256 is
             # unaffected by hash-size changes, so no need to re-read the file
             # for it).
             if cached.get('dhash_bits') == _DHASH_BITS:
-                dhash = cached.get('dhash')
-            else:
-                dhash = compute_dhash(path)
-                cache.put(path, mtime_ns, sha256, dhash)
+                record.dhash = cached.get('dhash')
+                done += 1
+                continue
+            to_hash.append((index, False))
         else:
-            sha256 = _hash_file(path)
-            dhash = compute_dhash(path)
-            cache.put(path, mtime_ns, sha256, dhash)
-        records.append(ImageRecord(
-            path=path, dimensions=getattr(image, 'dimensions', None),
-            size=size, mtime_ns=mtime_ns, sha256=sha256, dhash=dhash))
-        if progress_callback is not None:
-            progress_callback('hashing', done + 1, total)
+            to_hash.append((index, True))
+    if progress_callback is not None:
+        progress_callback('hashing', done, total)
+
+    def hash_record(job):
+        index, needs_sha = job
+        path = records[index].path
+        sha256 = _hash_file(path) if needs_sha else records[index].sha256
+        return index, sha256, compute_dhash(path)
+
+    # Decoding large images dominates scan time. Pillow and hashlib release
+    # the GIL while working, so several threads give a near-linear speed-up
+    # with exactly the same hashes.
+    if to_hash:
+        workers = max(1, min(_MAX_HASH_WORKERS, os.cpu_count() or 1,
+                             len(to_hash)))
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = [executor.submit(hash_record, job) for job in to_hash]
+            for future in as_completed(futures):
+                index, sha256, dhash = future.result()
+                record = records[index]
+                record.sha256, record.dhash = sha256, dhash
+                cache.put(record.path, record.mtime_ns, sha256, dhash)
+                done += 1
+                if progress_callback is not None:
+                    progress_callback('hashing', done, total)
+                if should_cancel is not None and should_cancel():
+                    # Keep the hashes computed so far for the next scan.
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    cache.save_if_dirty()
+                    return []
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     cache.prune([record.path for record in records])
     cache.save_if_dirty()

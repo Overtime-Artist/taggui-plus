@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 
+import shiboken6
 from PySide6.QtCore import (QEvent, QEventLoop, QItemSelectionModel,
                             QKeyCombination, QModelIndex,
                             QObject, QPoint, QRunnable, QThreadPool, QTimer,
@@ -661,6 +662,9 @@ class MainWindow(QMainWindow):
     def set_windows_title_bar_theme(self, widget: QWidget, use_dark_mode: bool,
                                     force_frame_refresh: bool = True):
         if sys.platform != 'win32':
+            return
+        # Delayed calls can arrive after the window was already deleted.
+        if not shiboken6.isValid(widget):
             return
         window_handle = widget.windowHandle()
         if window_handle is None or not window_handle.isTopLevel():

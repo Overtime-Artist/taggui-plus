@@ -13,13 +13,15 @@ from pathlib import Path
 
 from PySide6.QtCore import (QObject, QRunnable, Qt, QThread, QThreadPool,
                             QTimer, Signal, Slot)
-from PySide6.QtGui import QImageReader, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import (QFont, QImageReader, QKeySequence, QPalette, QPixmap,
+                           QShortcut)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
                                QComboBox, QDialog,
                                QFileDialog, QFrame, QGridLayout, QGroupBox,
                                QHBoxLayout, QLabel, QMessageBox,
                                QProgressDialog, QPushButton, QRadioButton,
-                               QScrollArea, QSlider, QVBoxLayout, QWidget)
+                               QScrollArea, QSizePolicy, QSlider, QVBoxLayout,
+                               QWidget)
 
 from models.image_list_model import ImageListModel, Scope
 from utils.duplicate_detection import (DuplicateCache, find_duplicate_groups,
@@ -65,6 +67,19 @@ class _ClickableLabel(QLabel):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+
+def _strictness_text(value: int) -> str:
+    """Describe a strictness slider value."""
+    if value == 0:
+        return 'Exact / identical only'
+    if value <= 2:
+        return f'Very strict \u2014 near-identical (\u2264 {value})'
+    if value <= 6:
+        return f'Strict (\u2264 {value})'
+    if value <= 12:
+        return f'Medium (\u2264 {value})'
+    return f'Loose (\u2264 {value})'
 
 
 def _format_size(num_bytes) -> str:
@@ -299,7 +314,13 @@ class FindDuplicatesDialog(QDialog):
         _get_thumbnail_emitter().loaded.connect(self._on_thumbnail_loaded)
 
         self.setWindowTitle('Find Duplicates')
-        self.resize(940, 700)
+        # Tall enough to show a whole group of cards, but never taller than
+        # the screen.
+        screen = QApplication.primaryScreen()
+        height = 800
+        if screen is not None:
+            height = min(height, int(screen.availableGeometry().height() * 0.9))
+        self.resize(940, height)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -312,8 +333,12 @@ class FindDuplicatesDialog(QDialog):
         layout.addWidget(description)
 
         # --- Scan controls --------------------------------------------------
-        scan_row = QHBoxLayout()
-        scan_row.addWidget(QLabel('Scope:'))
+        # Strictness gets its own row so the slider keeps a usable width next
+        # to the longest strictness description.
+        scan_grid = QGridLayout()
+        scan_grid.setHorizontalSpacing(8)
+        scan_grid.addWidget(QLabel('Scope:'), 0, 0)
+        scope_row = QHBoxLayout()
         self.scope_combo_box = FocusedScrollSettingsComboBox(
             key='duplicate_scan_scope', default=Scope.ALL_IMAGES.value)
         self.scope_combo_box.addItems(list(Scope))
@@ -321,36 +346,53 @@ class FindDuplicatesDialog(QDialog):
             self.scope_combo_box.setCurrentText(Scope.ALL_IMAGES.value)
         self.scope_combo_box.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.scope_combo_box.setSizePolicy(QSizePolicy.Policy.Fixed,
+                                           QSizePolicy.Policy.Fixed)
         self.scope_combo_box.currentTextChanged.connect(
             self._update_scope_count_label)
-        scan_row.addWidget(self.scope_combo_box)
+        scope_row.addWidget(self.scope_combo_box)
         self.scope_count_label = QLabel()
-        scan_row.addWidget(self.scope_count_label)
-        scan_row.addSpacing(16)
-        scan_row.addWidget(QLabel('Strictness:'))
+        scope_row.addSpacing(6)
+        scope_row.addWidget(self.scope_count_label)
+        scope_row.addStretch()
+        scan_grid.addLayout(scope_row, 0, 1, 1, 3)
+        scan_grid.addWidget(QLabel('Strictness:'), 1, 0)
         self.strictness_slider = QSlider(Qt.Orientation.Horizontal)
         self.strictness_slider.setMinimum(0)
         self.strictness_slider.setMaximum(_MAX_THRESHOLD)
         self.strictness_slider.setValue(self._initial_threshold())
         self.strictness_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.strictness_slider.setTickInterval(2)
+        self.strictness_slider.setMinimumWidth(200)
         self.strictness_slider.valueChanged.connect(self._update_strictness_label)
-        scan_row.addWidget(self.strictness_slider, 1)
+        scan_grid.addWidget(self.strictness_slider, 1, 1)
         self.strictness_label = QLabel()
-        scan_row.addWidget(self.strictness_label)
+        # Reserve room for the longest description so the slider doesn't
+        # change width while it is dragged.
+        metrics = self.strictness_label.fontMetrics()
+        self.strictness_label.setMinimumWidth(max(
+            metrics.horizontalAdvance(_strictness_text(value))
+            for value in range(_MAX_THRESHOLD + 1)) + 4)
+        scan_grid.addWidget(self.strictness_label, 1, 2)
         self.scan_button = QPushButton('Scan')
         self.scan_button.clicked.connect(self.start_scan)
-        scan_row.addWidget(self.scan_button)
-        layout.addLayout(scan_row)
+        scan_grid.addWidget(self.scan_button, 1, 3)
+        scan_grid.setColumnStretch(1, 1)
+        layout.addLayout(scan_grid)
         self._update_scope_count_label()
         self._update_strictness_label(self.strictness_slider.value())
 
         # --- Results area ---------------------------------------------------
+        # A darker background (the color of input fields) sets the results
+        # apart from the controls, and each group sits on it as a panel.
         self.results_scroll_area = QScrollArea()
         self.results_scroll_area.setWidgetResizable(True)
         self.results_container = QWidget()
+        self.results_container.setObjectName('duplicateResults')
+        self.results_container.setBackgroundRole(QPalette.ColorRole.Base)
+        self.results_container.setAutoFillBackground(True)
         self.results_layout = QVBoxLayout(self.results_container)
-        self.results_layout.setContentsMargins(0, 0, 0, 0)
+        self.results_layout.setContentsMargins(10, 10, 10, 10)
         self.results_layout.setSpacing(12)
         self.results_layout.addStretch()
         self.results_scroll_area.setWidget(self.results_container)
@@ -440,17 +482,7 @@ class FindDuplicatesDialog(QDialog):
 
     @Slot(int)
     def _update_strictness_label(self, value: int):
-        if value == 0:
-            text = 'Exact / identical only'
-        elif value <= 2:
-            text = f'Very strict \u2014 near-identical (\u2264 {value})'
-        elif value <= 6:
-            text = f'Strict (\u2264 {value})'
-        elif value <= 12:
-            text = f'Medium (\u2264 {value})'
-        else:
-            text = f'Loose (\u2264 {value})'
-        self.strictness_label.setText(text)
+        self.strictness_label.setText(_strictness_text(value))
 
     # ------------------------------------------------------------------
     # Scanning
@@ -664,6 +696,9 @@ class FindDuplicatesDialog(QDialog):
         thumbnail_label.setFixedSize(_THUMBNAIL_SIZE, _THUMBNAIL_SIZE)
         thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumbnail_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        # A darker well behind the image sets it apart from the controls.
+        thumbnail_label.setBackgroundRole(QPalette.ColorRole.Base)
+        thumbnail_label.setAutoFillBackground(True)
         self._request_thumbnail(member.path, thumbnail_label)
         thumbnail_label.clicked.connect(
             lambda m=member, gc=group_cards: self._show_preview(gc, m))
@@ -1106,7 +1141,15 @@ class _GroupCards:
         kind_label = 'Exact duplicates' if group.kind == 'exact' \
             else 'Near duplicates'
         self.box = QGroupBox(f'{kind_label} \u2014 {len(group.members)} images')
+        # A panel in the normal window color, standing out against the
+        # darker results background.
+        self.box.setBackgroundRole(QPalette.ColorRole.Window)
+        self.box.setAutoFillBackground(True)
+        title_font = self.box.font()
+        title_font.setBold(True)
+        self.box.setFont(title_font)
         box_layout = QVBoxLayout(self.box)
+        box_layout.setContentsMargins(10, 8, 10, 10)
 
         # "Ignore this group" lets the user protect a whole group: when checked,
         # none of its images are deleted, moved, or tagged by the action
@@ -1114,9 +1157,14 @@ class _GroupCards:
         self.ignore_checkbox = QCheckBox(
             'Ignore this group (leave all its images untouched)')
         self.ignore_checkbox.toggled.connect(self._on_ignore_toggled)
+        # Only the group's title is bold.
+        normal_font = QFont(title_font)
+        normal_font.setBold(False)
+        self.ignore_checkbox.setFont(normal_font)
         box_layout.addWidget(self.ignore_checkbox)
 
         self.cards_scroll = QScrollArea()
+        self.cards_scroll.setFont(normal_font)
         self.cards_scroll.setWidgetResizable(True)
         self.cards_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.cards_scroll.setVerticalScrollBarPolicy(
@@ -1166,6 +1214,8 @@ class _GroupCards:
             more_tile.setFixedSize(_THUMBNAIL_SIZE, _THUMBNAIL_SIZE)
             more_tile.setAlignment(Qt.AlignmentFlag.AlignCenter)
             more_tile.setFrameShape(QFrame.Shape.StyledPanel)
+            more_tile.setBackgroundRole(QPalette.ColorRole.Base)
+            more_tile.setAutoFillBackground(True)
             more_tile.setCursor(Qt.CursorShape.PointingHandCursor)
             more_tile.clicked.connect(self.expand)
             cards_layout.addWidget(more_tile)
