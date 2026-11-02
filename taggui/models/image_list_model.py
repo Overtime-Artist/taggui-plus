@@ -1411,33 +1411,62 @@ class ImageListModel(QAbstractListModel):
     def get_text_match_count(self, text: str, scope: Scope | str,
                              whole_tags_only: bool, use_regex: bool) -> int:
         """Get the number of instances of a text in all captions."""
-        match_count = 0
-        for image_index, image in enumerate(self.images):
-            if not self.is_image_in_scope(scope, image_index, image):
-                continue
-            if whole_tags_only:
-                if use_regex:
-                    match_count += len([
-                        tag for tag in image.tags
-                        if re.fullmatch(pattern=text, string=tag)
-                    ])
-                else:
-                    match_count += image.tags.count(text)
-            else:
-                caption = self.tag_separator.join(image.tags)
-                if use_regex:
-                    match_count += len(re.findall(pattern=text,
-                                                  string=caption))
-                else:
-                    match_count += caption.count(text)
-        return match_count
+        return self.get_text_matches(text, scope, whole_tags_only,
+                                     use_regex)[0]
+
+    def split_tag_text(self, text: str) -> list[str]:
+        """Split text on the tag separator into stripped, non-empty tags."""
+        return [tag.strip() for tag in text.split(self.tag_separator)
+                if tag.strip()]
+
+    def find_text_spans_tags(self, find_text: str) -> bool:
+        """Whether substring Find and Replace should search the whole caption
+        (across tag boundaries) instead of inside each tag separately. Only
+        find text that contains the tag separator (e.g. a comma) can
+        deliberately match across tags; anything else is matched per tag so
+        that, for example, replacing spaces never touches the separators."""
+        separator = self.tag_separator.strip() or self.tag_separator
+        return separator in find_text
+
+    @staticmethod
+    def count_text_matches(text: str, find_text: str,
+                           pattern: re.Pattern | None) -> int:
+        """Count matches of `find_text` (or `pattern`) in `text`, ignoring
+        zero-length regex matches."""
+        if pattern is None:
+            return text.count(find_text)
+        return sum(1 for match in pattern.finditer(text) if match.group(0))
+
+    @staticmethod
+    def substitute_text(text: str, find_text: str, replace_text: str,
+                        pattern: re.Pattern | None) -> str:
+        """Replace matches in `text`. Regex replacements support group
+        references (\\1, \\g<name>); zero-length matches (e.g. from "x*")
+        are left alone instead of inserting the replacement between every
+        character."""
+        if pattern is None:
+            return text.replace(find_text, replace_text)
+        return pattern.sub(
+            lambda match: (match.expand(replace_text) if match.group(0)
+                           else ''), text)
+
+    @staticmethod
+    def validate_regex_replacement(pattern: re.Pattern, replace_text: str):
+        """Raise re.error if `replace_text` is not a valid replacement for
+        `pattern` (e.g. a reference to a group that does not exist)."""
+        try:
+            pattern.sub(replace_text, '')
+        except IndexError as exception:
+            raise re.error(str(exception)) from exception
 
     def get_text_matches(self, text: str, scope: Scope | str,
                          whole_tags_only: bool, use_regex: bool
                          ) -> tuple[int, list[tuple[str, int]]]:
         """Return the total instance count and a per-tag breakdown in one pass.
 
-        The first value mirrors ``get_text_match_count`` exactly. The second is
+        Substring matches are counted inside each tag unless the find text
+        contains the tag separator (see ``find_text_spans_tags``), so the
+        count matches what ``find_and_replace`` will change. The second is
         a list of ``(tag, occurrences)`` for every distinct tag that contains a
         match, ordered most frequent first (ties broken alphabetically), so the
         Find and Replace dialog can preview which tags will be affected. The
@@ -1447,6 +1476,7 @@ class ImageListModel(QAbstractListModel):
         match_count = 0
         tag_counts: dict[str, int] = {}
         pattern = re.compile(text) if use_regex else None
+        spans_tags = self.find_text_spans_tags(text)
         for image_index, image in enumerate(self.images):
             if not self.is_image_in_scope(scope, image_index, image):
                 continue
@@ -1457,14 +1487,16 @@ class ImageListModel(QAbstractListModel):
                         match_count += 1
                         tag_counts[tag] = tag_counts.get(tag, 0) + 1
             else:
-                caption = self.tag_separator.join(image.tags)
-                if use_regex:
-                    match_count += len(pattern.findall(caption))
+                tag_occurrences = [
+                    self.count_text_matches(tag, text, pattern)
+                    for tag in image.tags]
+                if spans_tags:
+                    caption = self.tag_separator.join(image.tags)
+                    match_count += self.count_text_matches(caption, text,
+                                                           pattern)
                 else:
-                    match_count += caption.count(text)
-                for tag in image.tags:
-                    occurrences = (len(pattern.findall(tag)) if use_regex
-                                   else tag.count(text))
+                    match_count += sum(tag_occurrences)
+                for tag, occurrences in zip(image.tags, tag_occurrences):
                     if occurrences:
                         tag_counts[tag] = (tag_counts.get(tag, 0)
                                            + occurrences)
@@ -1476,30 +1508,44 @@ class ImageListModel(QAbstractListModel):
     def find_and_replace(self, find_text: str, replace_text: str,
                          scope: Scope | str, use_regex: bool):
         """
-        Find and replace arbitrary text in captions, within and across tag
-        boundaries.
+        Find and replace arbitrary text in captions. Matches are replaced
+        inside each tag separately, unless the find text contains the tag
+        separator, in which case the whole caption is searched so a match can
+        span several tags. Replacements containing the separator are split
+        into separate tags.
         """
         if not find_text:
             return
+        pattern = re.compile(find_text) if use_regex else None
+        if pattern is not None:
+            # Raise before touching the undo stack or any image.
+            self.validate_regex_replacement(pattern, replace_text)
+        spans_tags = self.find_text_spans_tags(find_text)
         self.add_to_undo_stack(action_name='Find and Replace',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
             if not self.is_image_in_scope(scope, image_index, image):
                 continue
-            caption = self.tag_separator.join(image.tags)
-            if use_regex:
-                if not re.search(pattern=find_text, string=caption):
+            if spans_tags:
+                caption = self.tag_separator.join(image.tags)
+                if not self.count_text_matches(caption, find_text, pattern):
                     continue
-                caption = re.sub(pattern=find_text, repl=replace_text,
-                                 string=caption)
+                new_tags = self.split_tag_text(self.substitute_text(
+                    caption, find_text, replace_text, pattern))
             else:
-                if find_text not in caption:
+                if not any(self.count_text_matches(tag, find_text, pattern)
+                           for tag in image.tags):
                     continue
-                caption = caption.replace(find_text, replace_text)
-            new_tags = list(dict.fromkeys(
-                t.strip() for t in caption.split(self.tag_separator)
-                if t.strip()))
+                new_tags = []
+                for tag in image.tags:
+                    if self.count_text_matches(tag, find_text, pattern):
+                        new_tags.extend(self.split_tag_text(
+                            self.substitute_text(tag, find_text,
+                                                 replace_text, pattern)))
+                    else:
+                        new_tags.append(tag)
+            new_tags = list(dict.fromkeys(new_tags))
             if new_tags == image.tags:
                 continue
             changed_image_indices.append(image_index)
@@ -1512,12 +1558,15 @@ class ImageListModel(QAbstractListModel):
             self.discard_last_undo_entry()
 
     @collect_write_errors
-    def sort_tags_alphabetically(self, do_not_reorder_first_tag: bool):
+    def sort_tags_alphabetically(self, do_not_reorder_first_tag: bool,
+                                 scope: Scope | str = Scope.ALL_IMAGES):
         """Sort the tags for each image in alphabetical order."""
         self.add_to_undo_stack(action_name='Sort Tags',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
             old_caption = self.tag_separator.join(image.tags)
@@ -1538,7 +1587,8 @@ class ImageListModel(QAbstractListModel):
 
     @collect_write_errors
     def sort_tags_by_frequency(self, tag_counter: Counter,
-                               do_not_reorder_first_tag: bool):
+                               do_not_reorder_first_tag: bool,
+                               scope: Scope | str = Scope.ALL_IMAGES):
         """
         Sort the tags for each image by the total number of times a tag appears
         across all images.
@@ -1547,6 +1597,8 @@ class ImageListModel(QAbstractListModel):
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
             old_caption = self.tag_separator.join(image.tags)
@@ -1568,12 +1620,15 @@ class ImageListModel(QAbstractListModel):
             self.discard_last_undo_entry()
 
     @collect_write_errors
-    def reverse_tags_order(self, do_not_reorder_first_tag: bool):
+    def reverse_tags_order(self, do_not_reorder_first_tag: bool,
+                           scope: Scope | str = Scope.ALL_IMAGES):
         """Reverse the order of the tags for each image."""
         self.add_to_undo_stack(action_name='Reverse Order of Tags',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
             if do_not_reorder_first_tag:
@@ -1592,12 +1647,15 @@ class ImageListModel(QAbstractListModel):
             self.discard_last_undo_entry()
 
     @collect_write_errors
-    def shuffle_tags(self, do_not_reorder_first_tag: bool):
+    def shuffle_tags(self, do_not_reorder_first_tag: bool,
+                     scope: Scope | str = Scope.ALL_IMAGES):
         """Shuffle the tags for each image randomly."""
         self.add_to_undo_stack(action_name='Shuffle Tags',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
             if do_not_reorder_first_tag:
@@ -1619,14 +1677,22 @@ class ImageListModel(QAbstractListModel):
             self.discard_last_undo_entry()
 
     @collect_write_errors
-    def move_tags_to_front(self, tags_to_move: list[str]):
+    def move_tags_to_front(self, tags_to_move: list[str],
+                           scope: Scope | str = Scope.ALL_IMAGES):
         """
         Move one or more tags to the front of the tags list for each image.
         """
+        # Repeated or empty entries (e.g. "zz, zz" or a trailing comma) would
+        # otherwise duplicate tags in the image.
+        tags_to_move = list(dict.fromkeys(tag for tag in tags_to_move if tag))
+        if not tags_to_move:
+            return
         self.add_to_undo_stack(action_name='Move Tags to Front',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if not any(tag in image.tags for tag in tags_to_move):
                 continue
             old_caption = self.tag_separator.join(image.tags)
@@ -1649,7 +1715,8 @@ class ImageListModel(QAbstractListModel):
     @collect_write_errors
     def sort_tags_by_category(self, get_category_for_tag,
                               category_order_map: dict[str, int],
-                              do_not_reorder_first_tag: bool):
+                              do_not_reorder_first_tag: bool,
+                              scope: Scope | str = Scope.ALL_IMAGES):
         """
         Move categorized tags to the front using the configured category order,
         while preserving the relative order of tags within each category and for
@@ -1660,6 +1727,8 @@ class ImageListModel(QAbstractListModel):
         changed_image_indices = []
         uncategorized_sort_index = len(category_order_map)
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
             old_caption = self.tag_separator.join(image.tags)
@@ -1869,9 +1938,18 @@ class ImageListModel(QAbstractListModel):
                     scope: Scope | str = Scope.ALL_IMAGES,
                     use_regex: bool = False):
         # A list of new tags replaces each old tag with all of them, in order.
-        new_tags = [new_tag] if isinstance(new_tag, str) else list(new_tag)
+        # A new name containing the tag separator (e.g. "a, b") is split into
+        # several tags, so the list matches what the caption file reloads as.
+        raw_new_tags = ([new_tag] if isinstance(new_tag, str)
+                        else list(new_tag))
+        new_tags = [tag for raw_tag in raw_new_tags
+                    for tag in self.split_tag_text(raw_tag)]
         if use_regex:
-            new_tag = new_tags[0]
+            # The regex replacement may use group references (\1); it is
+            # expanded per matching tag and split afterwards.
+            new_tag = raw_new_tags[0]
+            pattern = re.compile(old_tags[0])
+            self.validate_regex_replacement(pattern, new_tag)
         self.add_to_undo_stack(
             action_name=f'Rename {pluralize("Tag", len(old_tags))}',
             should_ask_for_confirmation=True)
@@ -1880,13 +1958,18 @@ class ImageListModel(QAbstractListModel):
             if not self.is_image_in_scope(scope, image_index, image):
                 continue
             if use_regex:
-                pattern = old_tags[0]
-                if not any(re.fullmatch(pattern=pattern, string=image_tag)
+                if not any(pattern.fullmatch(image_tag)
                            for image_tag in image.tags):
                     continue
-                image.tags = list(dict.fromkeys(
-                    new_tag if re.fullmatch(pattern=pattern, string=image_tag)
-                    else image_tag for image_tag in image.tags))
+                renamed_tags = []
+                for image_tag in image.tags:
+                    match = pattern.fullmatch(image_tag)
+                    if match:
+                        renamed_tags.extend(self.split_tag_text(
+                            match.expand(new_tag)))
+                    else:
+                        renamed_tags.append(image_tag)
+                image.tags = list(dict.fromkeys(renamed_tags))
             else:
                 if not any(old_tag in image.tags for old_tag in old_tags):
                     continue

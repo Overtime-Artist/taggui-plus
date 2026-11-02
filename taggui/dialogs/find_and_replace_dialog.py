@@ -50,8 +50,9 @@ class FindAndReplaceDialog(QDialog):
         layout.setSpacing(20)
         description_label = QLabel(
             'This is for finding and replacing arbitrary text in captions. '
-            'You can also use the All Tags pane to rename or delete all '
-            'instances of a tag.')
+            'Text is replaced inside each tag, unless the find text contains '
+            'the tag separator. You can also use the All Tags pane to rename '
+            'or delete all instances of a tag.')
         description_label.setWordWrap(True)
         layout.addWidget(description_label)
         grid_layout = QGridLayout()
@@ -71,6 +72,10 @@ class FindAndReplaceDialog(QDialog):
         grid_layout.addWidget(self.find_text_line_edit, 0, 1)
         self.replace_text_line_edit = SettingsLineEdit(key='replace_text')
         self.replace_text_line_edit.setClearButtonEnabled(True)
+        # Regex replacements are validated (e.g. a reference to a missing
+        # group), so re-check when the replacement changes.
+        self.replace_text_line_edit.textChanged.connect(
+            self.display_match_count)
         grid_layout.addWidget(self.replace_text_line_edit, 1, 1)
         self.scope_combo_box = FocusedScrollSettingsComboBox(key='replace_scope')
         self.scope_combo_box.addItems(list(Scope))
@@ -109,6 +114,10 @@ class FindAndReplaceDialog(QDialog):
         results_layout.addWidget(self.matches_list)
         layout.addLayout(results_layout, stretch=1)
         self.replace_button = QPushButton('Replace')
+        # Enter in a text box must not run a bulk replace; the button has to
+        # be clicked (or activated with Space when it has focus).
+        self.replace_button.setAutoDefault(False)
+        self.replace_button.setDefault(False)
         self.replace_button.clicked.connect(self.replace)
         self.replace_button.clicked.connect(self.display_match_count)
         layout.addWidget(self.replace_button)
@@ -120,10 +129,12 @@ class FindAndReplaceDialog(QDialog):
         self.find_text_line_edit.setFocus()
         self.find_text_line_edit.selectAll()
 
-    def disable_replace_button(self):
+    def disable_replace_button(self, message: str = ''):
         self.replace_button.setText('Replace')
         self.replace_button.setEnabled(False)
         self.clear_matches_list()
+        if message:
+            self.matches_label.setText(message)
 
     def clear_matches_list(self):
         self.matches_list.clear()
@@ -135,16 +146,24 @@ class FindAndReplaceDialog(QDialog):
         if not text:
             self.disable_replace_button()
             return
-        self.replace_button.setEnabled(True)
         scope = self.scope_combo_box.currentText()
         whole_tags_only = self.whole_tags_only_check_box.isChecked()
         use_regex = self.use_regex_check_box.isChecked()
         try:
             match_count, matched_tags = self.image_list_model.get_text_matches(
                 text, scope, whole_tags_only, use_regex)
-        except re.error:
-            self.disable_replace_button()
+        except re.error as exception:
+            self.disable_replace_button(f'Invalid find regex: {exception}')
             return
+        if use_regex:
+            try:
+                self.image_list_model.validate_regex_replacement(
+                    re.compile(text), self.replace_text_line_edit.text())
+            except re.error as exception:
+                self.disable_replace_button(
+                    f'Invalid replacement: {exception}')
+                return
+        self.replace_button.setEnabled(match_count > 0)
         self.replace_button.setText(f'Replace {match_count} '
                                     f'{pluralize("instance", match_count)}')
         self.populate_matches_list(matched_tags)
