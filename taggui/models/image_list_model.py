@@ -1579,11 +1579,14 @@ class ImageListModel(QAbstractListModel):
             if len(image.tags) < 2:
                 continue
             old_caption = self.tag_separator.join(image.tags)
+            # Case-insensitive, like the app's other tag lists; the sort is
+            # stable, so tags differing only in case keep their order.
             if do_not_reorder_first_tag:
                 first_tag = image.tags[0]
-                image.tags = [first_tag] + sorted(image.tags[1:])
+                image.tags = [first_tag] + sorted(image.tags[1:],
+                                                  key=str.casefold)
             else:
-                image.tags.sort()
+                image.tags.sort(key=str.casefold)
             new_caption = self.tag_separator.join(image.tags)
             if new_caption != old_caption:
                 changed_image_indices.append(image_index)
