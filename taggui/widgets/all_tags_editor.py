@@ -13,7 +13,7 @@ from utils.big_widgets import TallPushButton
 from utils.elided_tooltip import ElidedToolTipListView
 from utils.enums import AllTagsFilterLogic, AllTagsSortBy, SortOrder
 from utils.settings import get_settings, get_tag_separator
-from utils.settings_widgets import SettingsComboBox
+from utils.settings_widgets import FocusedScrollSettingsComboBox
 from utils.tag_filter import TagFilterLineEdit
 from utils.text_edit_item_delegate import TextEditItemDelegate
 from utils.utils import get_confirmation_dialog_reply, list_with_and, pluralize
@@ -273,16 +273,16 @@ class AllTagsEditor(QDockWidget):
         # Combined click action + filter logic row (idea 4)
         combined_layout = QHBoxLayout()
         combined_layout.addWidget(QLabel('Click action'))
-        self.click_action_combo_box = SettingsComboBox(
+        self.click_action_combo_box = FocusedScrollSettingsComboBox(
             key='all_tags_click_action')
         self.click_action_combo_box.addItems(list(ClickAction))
         self.click_action_combo_box.setSizeAdjustPolicy(
-            SettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            FocusedScrollSettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.click_action_combo_box.setMinimumContentsLength(3)
         combined_layout.addWidget(self.click_action_combo_box, stretch=1)
         combined_layout.addSpacing(8)
         combined_layout.addWidget(QLabel('Logic'))
-        self.filter_logic_combo_box = SettingsComboBox(
+        self.filter_logic_combo_box = FocusedScrollSettingsComboBox(
             key='all_tags_filter_logic', default='AND')
         self.filter_logic_combo_box.addItems(list(AllTagsFilterLogic))
         self.filter_logic_combo_box.setMinimumContentsLength(2)
@@ -293,11 +293,11 @@ class AllTagsEditor(QDockWidget):
         # Sort row with toggle button (idea 3)
         sort_layout = QHBoxLayout()
         sort_label = QLabel('Sort by')
-        self.sort_by_combo_box = SettingsComboBox(key='all_tags_sort_by',
+        self.sort_by_combo_box = FocusedScrollSettingsComboBox(key='all_tags_sort_by',
                                                   default='Frequency')
         self.sort_by_combo_box.addItems(list(AllTagsSortBy))
         self.sort_by_combo_box.setSizeAdjustPolicy(
-            SettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            FocusedScrollSettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.sort_by_combo_box.setMinimumContentsLength(6)
         self.sort_by_combo_box.currentTextChanged.connect(self.sort_tags)
         self.sort_order_button = QPushButton()

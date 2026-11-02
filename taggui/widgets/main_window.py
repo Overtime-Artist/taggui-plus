@@ -780,6 +780,11 @@ class MainWindow(QMainWindow):
         self.proxy_image_list_model.set_tokenizer(tokenizer)
         self.image_tags_editor.set_tokenizer(tokenizer)
         self.image_list_model.set_tokenizer(tokenizer)
+        filter_line_edit = self.image_list.filter_line_edit
+        filter_line_edit.tokens_filter_available = True
+        if 'tokens' in filter_line_edit.text().casefold():
+            # A `tokens:` filter was rejected while the tokenizer loaded.
+            self.set_image_list_filter()
         # Re-sort if images are currently sorted by token count, which was not
         # computable before the tokenizer finished loading.
         if (self.image_list.sort_by_combo_box.currentData()

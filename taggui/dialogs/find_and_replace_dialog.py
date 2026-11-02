@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QDialog, QGridLayout, QLabel,
 
 from models.image_list_model import ImageListModel, Scope
 from utils.settings import get_settings
-from utils.settings_widgets import (SettingsBigCheckBox, SettingsComboBox,
+from utils.settings_widgets import (SettingsBigCheckBox, FocusedScrollSettingsComboBox,
                                     SettingsLineEdit)
 from utils.utils import pluralize
 
@@ -72,7 +72,7 @@ class FindAndReplaceDialog(QDialog):
         self.replace_text_line_edit = SettingsLineEdit(key='replace_text')
         self.replace_text_line_edit.setClearButtonEnabled(True)
         grid_layout.addWidget(self.replace_text_line_edit, 1, 1)
-        self.scope_combo_box = SettingsComboBox(key='replace_scope')
+        self.scope_combo_box = FocusedScrollSettingsComboBox(key='replace_scope')
         self.scope_combo_box.addItems(list(Scope))
         self.scope_combo_box.currentTextChanged.connect(
             self.display_match_count)

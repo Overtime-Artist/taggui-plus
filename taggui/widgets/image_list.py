@@ -37,7 +37,7 @@ from utils.image_file_operations import (count_caption_users,
                                          resolve_clashes_by_renaming)
 from utils.settings import DEFAULT_SETTINGS, get_settings
 from utils.completion_store import get_completion_store
-from utils.settings_widgets import SettingsComboBox
+from utils.settings_widgets import FocusedScrollSettingsComboBox
 from utils.utils import get_confirmation_dialog_reply, pluralize
 
 
@@ -62,6 +62,8 @@ class FilterLineEdit(QLineEdit):
         self.setPlaceholderText('Filter Images')
         self.setTextMargins(8, 0, 8, 0)
         self.setClearButtonEnabled(True)
+        # Set by the main window once the tokenizer has loaded.
+        self.tokens_filter_available = False
         optionally_quoted_string = (QuotedString(quote_char='"', esc_char='\\')
                                     | QuotedString(quote_char="'",
                                                    esc_char='\\')
@@ -89,27 +91,59 @@ class FilterLineEdit(QLineEdit):
              (CaselessKeyword('OR'), 2, OpAssoc.LEFT)])
 
     def parse_filter_text(self) -> list | str | None:
+        """Return the parsed filter, or `None` if the field is empty or the
+        filter can't be used (the field turns red, with the reason as its
+        tooltip)."""
         filter_text = self.text()
         if not filter_text:
-            self.setPalette(QApplication.palette(self))
+            self._show_filter_valid()
             return None
         try:
             filter_ = self.filter_text_parser.parse_string(
                 filter_text, parse_all=True).as_list()[0]
-            filter_ = replace_filter_wildcards(filter_)
-            self.setPalette(QApplication.palette(self))
-            return filter_
         except ParseException:
-            # Change the background color when the filter text is invalid.
-            invalid_palette = QPalette(self.palette())
-            if self.palette().color(self.backgroundRole()).lightness() < 128:
-                # Dark red for dark mode.
-                invalid_palette.setColor(QPalette.ColorRole.Base, QColor('#442222'))
-            else:
-                # Light red for light mode.
-                invalid_palette.setColor(QPalette.ColorRole.Base, QColor('#ffdddd'))
-            self.setPalette(invalid_palette)
+            self._show_filter_invalid('This filter text is not valid.')
             return None
+        problem = self._find_filter_problem(filter_)
+        if problem is not None:
+            self._show_filter_invalid(problem)
+            return None
+        self._show_filter_valid()
+        return replace_filter_wildcards(filter_)
+
+    def _find_filter_problem(self, filter_: list | str) -> str | None:
+        if isinstance(filter_, str):
+            return None
+        if (len(filter_) == 2 and filter_[0] == 'complete'
+                and filter_[1].casefold() not in ('true', 'false')):
+            return '"complete:" only accepts true or false.'
+        if (len(filter_) == 3 and filter_[0] == 'tokens'
+                and filter_[1] not in ('AND', 'OR')
+                and not self.tokens_filter_available):
+            return ('"tokens:" is not available yet: the tokenizer has not '
+                    'finished loading.')
+        for element in filter_:
+            if isinstance(element, list):
+                problem = self._find_filter_problem(element)
+                if problem is not None:
+                    return problem
+        return None
+
+    def _show_filter_valid(self):
+        self.setPalette(QApplication.palette(self))
+        self.setToolTip('')
+
+    def _show_filter_invalid(self, reason: str):
+        # Change the background color when the filter text is invalid.
+        invalid_palette = QPalette(self.palette())
+        if self.palette().color(self.backgroundRole()).lightness() < 128:
+            # Dark red for dark mode.
+            invalid_palette.setColor(QPalette.ColorRole.Base, QColor('#442222'))
+        else:
+            # Light red for light mode.
+            invalid_palette.setColor(QPalette.ColorRole.Base, QColor('#ffdddd'))
+        self.setPalette(invalid_palette)
+        self.setToolTip(reason)
 
 
 class SelectionMode(str, Enum):
@@ -1323,18 +1357,18 @@ class ImageList(QDockWidget):
         self.filter_line_edit = FilterLineEdit()
         selection_mode_layout = QHBoxLayout()
         selection_mode_label = QLabel('Selection mode')
-        self.selection_mode_combo_box = SettingsComboBox(
+        self.selection_mode_combo_box = FocusedScrollSettingsComboBox(
             key='image_list_selection_mode')
         self.selection_mode_combo_box.addItems(list(SelectionMode))
         self.selection_mode_combo_box.setSizeAdjustPolicy(
-            SettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            FocusedScrollSettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.selection_mode_combo_box.setMinimumContentsLength(4)
         selection_mode_layout.addWidget(selection_mode_label)
         selection_mode_layout.addWidget(self.selection_mode_combo_box,
                                         stretch=1)
         sort_layout = QHBoxLayout()
         sort_label = QLabel('Sort by')
-        self.sort_by_combo_box = SettingsComboBox(key='image_list_sort_by')
+        self.sort_by_combo_box = FocusedScrollSettingsComboBox(key='image_list_sort_by')
         for sort_by in ImageListSortBy:
             self.sort_by_combo_box.addItem(
                 IMAGE_LIST_SORT_DISPLAY_LABELS.get(sort_by, sort_by.value),
@@ -1348,7 +1382,7 @@ class ImageList(QDockWidget):
                 ImageListSortBy.PATH.value)
         self.sort_by_combo_box.setCurrentIndex(max(saved_sort_by_index, 0))
         self.sort_by_combo_box.setSizeAdjustPolicy(
-            SettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            FocusedScrollSettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.sort_by_combo_box.setMinimumContentsLength(6)
         self.sort_order_button = QPushButton()
         self.sort_order_button.setFixedWidth(
