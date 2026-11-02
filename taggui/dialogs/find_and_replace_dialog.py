@@ -50,9 +50,8 @@ class FindAndReplaceDialog(QDialog):
         layout.setSpacing(20)
         description_label = QLabel(
             'This is for finding and replacing arbitrary text in captions. '
-            'Text is replaced inside each tag, unless the find text contains '
-            'the tag separator. You can also use the All Tags pane to rename '
-            'or delete all instances of a tag.')
+            'You can also use the All Tags pane to rename or delete all '
+            'instances of a tag.')
         description_label.setWordWrap(True)
         layout.addWidget(description_label)
         grid_layout = QGridLayout()
@@ -166,13 +165,25 @@ class FindAndReplaceDialog(QDialog):
         self.replace_button.setEnabled(match_count > 0)
         self.replace_button.setText(f'Replace {match_count} '
                                     f'{pluralize("instance", match_count)}')
-        self.populate_matches_list(matched_tags)
+        spans_tags = (not whole_tags_only
+                      and self.image_list_model.find_text_spans_tags(text))
+        self.populate_matches_list(matched_tags, spans_tags, match_count)
 
-    def populate_matches_list(self, matched_tags: list[tuple[str, int]]):
+    def populate_matches_list(self, matched_tags: list[tuple[str, int]],
+                              spans_tags: bool = False,
+                              match_count: int = 0):
+        """List the matching tags, or, when the find text contains the tag
+        separator (so matches span tags), the matched text itself."""
         self.matches_list.clear()
         tag_count = len(matched_tags)
-        self.matches_label.setText(
-            f'Found in {tag_count} {pluralize("tag", tag_count)}:')
+        if spans_tags:
+            self.matches_label.setText(
+                f'Found {match_count} '
+                f'{"match" if match_count == 1 else "matches"} '
+                f'across tags:')
+        else:
+            self.matches_label.setText(
+                f'Found in {tag_count} {pluralize("tag", tag_count)}:')
         shown = matched_tags[:self.MAX_LISTED_MATCHES]
         self.matches_list.addItems(
             [f'{tag}  ({count})' for tag, count in shown])

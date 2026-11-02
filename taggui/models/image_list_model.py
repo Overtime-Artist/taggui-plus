@@ -1469,7 +1469,9 @@ class ImageListModel(QAbstractListModel):
         count matches what ``find_and_replace`` will change. The second is
         a list of ``(tag, occurrences)`` for every distinct tag that contains a
         match, ordered most frequent first (ties broken alphabetically), so the
-        Find and Replace dialog can preview which tags will be affected. The
+        Find and Replace dialog can preview which tags will be affected. When
+        the search spans tags, no single tag contains a match, so the list
+        holds ``(matched text, occurrences)`` instead. The
         regex is compiled once up front; an invalid pattern raises ``re.error``
         for the caller to handle, matching ``get_text_match_count``.
         """
@@ -1486,16 +1488,23 @@ class ImageListModel(QAbstractListModel):
                             else tag == text):
                         match_count += 1
                         tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            elif spans_tags:
+                caption = self.tag_separator.join(image.tags)
+                if pattern is None:
+                    matched_texts = [text] * caption.count(text)
+                else:
+                    matched_texts = [match.group(0) for match
+                                     in pattern.finditer(caption)
+                                     if match.group(0)]
+                match_count += len(matched_texts)
+                for matched_text in matched_texts:
+                    tag_counts[matched_text] = (
+                        tag_counts.get(matched_text, 0) + 1)
             else:
                 tag_occurrences = [
                     self.count_text_matches(tag, text, pattern)
                     for tag in image.tags]
-                if spans_tags:
-                    caption = self.tag_separator.join(image.tags)
-                    match_count += self.count_text_matches(caption, text,
-                                                           pattern)
-                else:
-                    match_count += sum(tag_occurrences)
+                match_count += sum(tag_occurrences)
                 for tag, occurrences in zip(image.tags, tag_occurrences):
                     if occurrences:
                         tag_counts[tag] = (tag_counts.get(tag, 0)
