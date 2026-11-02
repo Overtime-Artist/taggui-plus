@@ -1860,9 +1860,13 @@ class ImageListModel(QAbstractListModel):
 
     @Slot(list, str)
     @collect_write_errors
-    def rename_tags(self, old_tags: list[str], new_tag: str,
+    def rename_tags(self, old_tags: list[str], new_tag: str | list[str],
                     scope: Scope | str = Scope.ALL_IMAGES,
                     use_regex: bool = False):
+        # A list of new tags replaces each old tag with all of them, in order.
+        new_tags = [new_tag] if isinstance(new_tag, str) else list(new_tag)
+        if use_regex:
+            new_tag = new_tags[0]
         self.add_to_undo_stack(
             action_name=f'Rename {pluralize("Tag", len(old_tags))}',
             should_ask_for_confirmation=True)
@@ -1882,8 +1886,10 @@ class ImageListModel(QAbstractListModel):
                 if not any(old_tag in image.tags for old_tag in old_tags):
                     continue
                 image.tags = list(dict.fromkeys(
-                    new_tag if image_tag in old_tags else image_tag
-                    for image_tag in image.tags))
+                    replacement
+                    for image_tag in image.tags
+                    for replacement in (new_tags if image_tag in old_tags
+                                        else [image_tag])))
             changed_image_indices.append(image_index)
             self.write_image_tags_to_disk(image)
         if changed_image_indices:

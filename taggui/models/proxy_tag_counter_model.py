@@ -23,7 +23,8 @@ class ProxyTagCounterModel(QSortFilterProxyModel):
         if self.sort_by == AllTagsSortBy.FREQUENCY:
             return left_count < right_count
         elif self.sort_by == AllTagsSortBy.NAME:
-            return left_tag < right_tag
+            return ((left_tag.casefold(), left_tag)
+                    < (right_tag.casefold(), right_tag))
         elif self.sort_by == AllTagsSortBy.LENGTH:
             return len(left_tag) < len(right_tag)
         elif self.sort_by == AllTagsSortBy.CATEGORY:

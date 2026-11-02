@@ -111,13 +111,20 @@ class TextEditItemDelegate(QStyledItemDelegate):
     def eventFilter(self, editor, event: QEvent):
         if (event.type() == QEvent.KeyPress
                 and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
+            view = self.parent()
+            edited_tag = editor.index.data(Qt.ItemDataRole.EditRole)
             self._commit_and_close_editor(editor)
-            self.parent().setCurrentIndex(
-                self.parent().model().index(editor.index.row(), 0))
-            self.parent().selectionModel().select(
-                self.parent().model().index(editor.index.row(), 0),
+            # Views whose rows move after an edit (e.g. All Tags, which
+            # re-counts and re-sorts) re-select the tag by name instead.
+            if hasattr(view, 'select_tag_after_edit'):
+                view.select_tag_after_edit(edited_tag)
+                view.setFocus()
+                return True
+            view.setCurrentIndex(view.model().index(editor.index.row(), 0))
+            view.selectionModel().select(
+                view.model().index(editor.index.row(), 0),
                 QItemSelectionModel.SelectionFlag.ClearAndSelect)
-            self.parent().setFocus()
+            view.setFocus()
             return True
         # This is required to prevent crashing when the user clicks on another
         # tag in the All Tags list.

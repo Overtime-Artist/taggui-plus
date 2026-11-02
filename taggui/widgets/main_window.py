@@ -2021,6 +2021,8 @@ class MainWindow(QMainWindow):
         the all tags list.
         """
         if not selected_tags:
+            # The last selected tag was deselected: stop filtering by it.
+            self.image_list.filter_line_edit.clear()
             return
         escaped_selected_tags = []
         for selected_tag in selected_tags:
@@ -2370,9 +2372,9 @@ class MainWindow(QMainWindow):
         self.image_list_model.delete_tags(tags)
         self.image_list.filter_line_edit.clear()
 
-    @Slot(list, str)
-    def handle_all_tags_rename(self, old_tags: list[str], new_tag: str):
-        self.image_list_model.rename_tags(old_tags, new_tag)
+    @Slot(list, list)
+    def handle_all_tags_rename(self, old_tags: list[str], new_tags: list[str]):
+        self.image_list_model.rename_tags(old_tags, new_tags)
         self.image_list.filter_line_edit.clear()
 
     def connect_all_tags_editor_signals(self):
