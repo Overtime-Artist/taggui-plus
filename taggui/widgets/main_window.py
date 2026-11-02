@@ -1651,6 +1651,14 @@ class MainWindow(QMainWindow):
     @Slot()
     def set_image_list_filter(self):
         filter_ = self.image_list.filter_line_edit.parse_filter_text()
+        current_index = self.image_list.list_view.currentIndex()
+        current_image = (current_index.data(Qt.ItemDataRole.UserRole)
+                         if current_index.isValid() else None)
+        if (self.proxy_image_list_model.filter is None
+                and filter_ is not None and current_image is not None):
+            # Remember the image (not its row, which changes when re-sorted)
+            # to return to when the filter is cleared.
+            self._image_path_before_filter = current_image.path
         self.proxy_image_list_model.filter = filter_
         # Apply the new filter.
         self.proxy_image_list_model.invalidateFilter()
@@ -1662,13 +1670,26 @@ class MainWindow(QMainWindow):
             self.all_tags_editor.all_tags_list.setCurrentIndex(QModelIndex())
             # Select the previously selected image in the unfiltered image
             # list.
-            select_index = self.settings.value('image_index', type=int) or 0
+            select_index = self._find_proxy_row_of_image(
+                getattr(self, '_image_path_before_filter', None))
+            if select_index is None:
+                select_index = self.settings.value('image_index', type=int) or 0
             self.image_list.list_view.setCurrentIndex(
                 self.proxy_image_list_model.index(select_index, 0))
         else:
             # Select the first image.
             self.image_list.list_view.setCurrentIndex(
                 self.proxy_image_list_model.index(0, 0))
+
+    def _find_proxy_row_of_image(self, image_path) -> int | None:
+        if image_path is None:
+            return None
+        for proxy_row in range(self.proxy_image_list_model.rowCount()):
+            image = self.proxy_image_list_model.index(proxy_row, 0).data(
+                Qt.ItemDataRole.UserRole)
+            if image is not None and image.path == image_path:
+                return proxy_row
+        return None
 
     @Slot()
     def save_image_index(self, proxy_image_index: QModelIndex):
@@ -1995,7 +2016,12 @@ class MainWindow(QMainWindow):
             return
         escaped_selected_tags = []
         for selected_tag in selected_tags:
-            escaped_selected_tag = (selected_tag.replace('\\', '\\\\')
+            # `[`, `*` and `?` are wildcards in the filter; wrap them in
+            # brackets so only this exact tag matches.
+            literal_tag = ''.join(f'[{character}]'
+                                  if character in '[*?' else character
+                                  for character in selected_tag)
+            escaped_selected_tag = (literal_tag.replace('\\', '\\\\')
                                     .replace('"', r'\"')
                                     .replace("'", r"\'"))
             escaped_selected_tags.append(f'tag:"{escaped_selected_tag}"')

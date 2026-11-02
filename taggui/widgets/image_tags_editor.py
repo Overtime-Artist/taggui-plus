@@ -396,6 +396,11 @@ class TagInputBox(QLineEdit):
         else:
             selected_image_indices = self.image_list.get_selected_image_indices()
         selected_image_count = len(selected_image_indices)
+        if selected_image_count == 0:
+            # No image to add to: don't add the tag to the Tag Library or
+            # show the "added" feedback. Keep the typed text.
+            self._flash_duplicate()
+            return
         if (not self.group_mode_active and len(tags) == 1
                 and selected_image_count == 1):
             resolved_tag = tags[0]

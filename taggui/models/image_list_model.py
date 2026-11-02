@@ -1750,7 +1750,7 @@ class ImageListModel(QAbstractListModel):
         for image_index in image_indices:
             image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
             existing = set(image.tags)
-            new_tags = [t for t in tags if t not in existing]
+            new_tags = [t for t in dict.fromkeys(tags) if t not in existing]
             if not new_tags:
                 continue
             image.tags.extend(new_tags)

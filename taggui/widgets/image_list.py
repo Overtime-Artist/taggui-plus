@@ -1,4 +1,5 @@
 from html import escape
+import os
 import shutil
 import subprocess
 from enum import Enum
@@ -9,7 +10,7 @@ from pathlib import Path
 from PySide6.QtCore import (QEvent, QFile, QItemSelection, QItemSelectionModel,
                             QItemSelectionRange, QMimeData, QModelIndex,
                             QPersistentModelIndex, QPointF, QRectF, QSize,
-                            QUrl, Qt, Signal, Slot)
+                            QTimer, QUrl, Qt, Signal, Slot)
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QDrag, QFont,
                            QIcon, QImageReader, QKeyEvent, QMouseEvent,
                            QPainter, QPalette, QPen, QTextDocument)
@@ -23,10 +24,17 @@ from pyparsing import (CaselessKeyword, CaselessLiteral, Group, OpAssoc,
                        ParseException, QuotedString, Suppress, Word,
                        infix_notation, nums, one_of, printables)
 
+from models.image_list_model import get_caption_key
 from models.proxy_image_list_model import ProxyImageListModel
 from utils.elided_tooltip import ElidedToolTipListView
 from utils.enums import ImageListSortBy, SortOrder
 from utils.image import Image, build_caption_text
+from utils.image_file_operations import (count_caption_users,
+                                         execute_transfer, find_caption_file,
+                                         format_error_summary,
+                                         get_invalid_file_name_reason,
+                                         plan_transfer,
+                                         resolve_clashes_by_renaming)
 from utils.settings import DEFAULT_SETTINGS, get_settings
 from utils.completion_store import get_completion_store
 from utils.settings_widgets import SettingsComboBox
@@ -488,6 +496,64 @@ class ImageListView(ElidedToolTipListView):
         self.context_menu.addAction(self.mark_incomplete_action)
         self.selectionModel().selectionChanged.connect(
             self.update_context_menu_actions)
+        # The current image can change within a selection (arrow keys), and
+        # its caption file can appear (first tag added): keep the
+        # condition-based actions and their shortcuts up to date.
+        self.selectionModel().currentChanged.connect(
+            self.update_context_menu_actions)
+        self.proxy_image_list_model.dataChanged.connect(
+            self._update_actions_if_current_changed)
+        self._selected_rows_being_removed = False
+        # Qt clears the selection before the view's rowsAboutToBeRemoved
+        # slot runs, so remember the rows whose deselection emptied it.
+        self._rows_deselected_into_empty: set[int] = set()
+        self.selectionModel().selectionChanged.connect(
+            self._note_selection_emptied)
+        self.proxy_image_list_model.rowsAboutToBeRemoved.connect(
+            self._note_selected_rows_removal)
+        self.proxy_image_list_model.rowsRemoved.connect(
+            self._reselect_current_after_removal)
+
+    @Slot()
+    def _update_actions_if_current_changed(self, top_left: QModelIndex,
+                                           bottom_right: QModelIndex,
+                                           roles=None):
+        current_row = self.currentIndex().row()
+        if top_left.row() <= current_row <= bottom_right.row():
+            self.update_context_menu_actions()
+
+    @Slot()
+    def _note_selection_emptied(self, selected: QItemSelection,
+                                deselected: QItemSelection):
+        if self.selectionModel().hasSelection() or deselected.isEmpty():
+            self._rows_deselected_into_empty = set()
+            return
+        self._rows_deselected_into_empty = {index.row() for index
+                                            in deselected.indexes()}
+        # Only relevant to a row removal happening in the same call.
+        QTimer.singleShot(0, self._rows_deselected_into_empty.clear)
+
+    @Slot()
+    def _note_selected_rows_removal(self, parent: QModelIndex, first: int,
+                                    last: int):
+        self._selected_rows_being_removed = any(
+            first <= row <= last for row in self._rows_deselected_into_empty)
+
+    @Slot()
+    def _reselect_current_after_removal(self, parent: QModelIndex, first: int,
+                                        last: int):
+        """When the selected image leaves the list (e.g. it no longer matches
+        the filter after Mark as Complete), Qt makes the next image current
+        but selects nothing, so actions like Add Tag had no target. Select the
+        new current image."""
+        if not self._selected_rows_being_removed:
+            return
+        self._selected_rows_being_removed = False
+        current_index = self.currentIndex()
+        if (current_index.isValid()
+                and not self.selectionModel().hasSelection()):
+            self.selectionModel().select(
+                current_index, QItemSelectionModel.SelectionFlag.Select)
 
     def viewportEvent(self, event):
         if event.type() == QEvent.Type.ToolTip:
@@ -741,6 +807,15 @@ class ImageListView(ElidedToolTipListView):
         selected_proxy_rows = {index.row() for index in self.selectedIndexes()}
         all_proxy_rows = set(range(self.proxy_image_list_model.rowCount()))
         unselected_proxy_rows = all_proxy_rows - selected_proxy_rows
+        if not unselected_proxy_rows:
+            # Everything is selected: keep only the current image, since an
+            # image must stay selected for the other panes.
+            current_index = self.currentIndex()
+            if current_index.isValid():
+                self.selectionModel().select(
+                    current_index,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            return
         first_unselected_proxy_row = min(unselected_proxy_rows, default=0)
         item_selection = QItemSelection()
         for row in unselected_proxy_rows:
@@ -829,6 +904,13 @@ class ImageListView(ElidedToolTipListView):
 
     @Slot()
     def paste_tags(self):
+        # Text copied from several images has one caption per line.
+        clipboard_text = QApplication.clipboard().text()
+        tags = [tag.strip() for line in clipboard_text.splitlines()
+                for tag in line.split(self.tag_separator)]
+        tags = list(dict.fromkeys(tag for tag in tags if tag))
+        if not tags:
+            return
         selected_image_count = len(self.selectedIndexes())
         if selected_image_count > 1:
             reply = get_confirmation_dialog_reply(
@@ -837,7 +919,6 @@ class ImageListView(ElidedToolTipListView):
                          f'images?')
             if reply != QMessageBox.StandardButton.Yes:
                 return
-        tags = QApplication.clipboard().text().split(self.tag_separator)
         selected_image_indices = self.get_selected_image_indices()
         self.tags_paste_requested.emit(tags, selected_image_indices)
 
@@ -877,78 +958,122 @@ class ImageListView(ElidedToolTipListView):
             return
         QApplication.clipboard().setImage(image)
 
-    @Slot()
-    def move_selected_images(self):
-        selected_images = self.get_selected_images()
-        selected_image_count = len(selected_images)
-        caption = (f'Select directory to move {selected_image_count} selected '
-                   f'{pluralize("Image", selected_image_count)} and '
-                   f'{pluralize("caption", selected_image_count)} to')
+    def _ask_directory(self, verb: str, image_count: int) -> Path | None:
+        caption = (f'Select directory to {verb} {image_count} selected '
+                   f'{pluralize("Image", image_count)} and '
+                   f'{pluralize("caption", image_count)} to')
         settings = get_settings()
-        move_directory_path = QFileDialog.getExistingDirectory(
+        directory_path = QFileDialog.getExistingDirectory(
             parent=self, caption=caption,
             dir=settings.value('directory_path', type=str))
-        if not move_directory_path:
+        if not directory_path:
+            return None
+        return Path(directory_path)
+
+    def ask_name_clash_action(self, clashes: list, image_count: int,
+                              verb: str) -> str | None:
+        """Ask once what to do with images whose name is already taken in the
+        target folder. Returns 'skip', 'keep_both' or None (cancel)."""
+        names = format_error_summary(
+            [item.image_path.name for item in clashes])
+        message_box = QMessageBox(self)
+        message_box.setIcon(QMessageBox.Icon.Warning)
+        message_box.setWindowTitle('Name Already Taken')
+        message_box.setText(
+            f'{len(clashes)} of {image_count} '
+            f'{pluralize("image", image_count)} cannot be {verb} without '
+            f'replacing a file of the same name in the target folder (or '
+            f'another selected image with the same name):\n\n{names}')
+        message_box.setInformativeText(
+            'Skip them, or keep both by adding a number to the new '
+            'file names, e.g. "image (2).png"?')
+        skip_button = message_box.addButton(
+            'Skip', QMessageBox.ButtonRole.AcceptRole)
+        keep_both_button = message_box.addButton(
+            'Keep Both', QMessageBox.ButtonRole.AcceptRole)
+        message_box.addButton(QMessageBox.StandardButton.Cancel)
+        message_box.setDefaultButton(keep_both_button)
+        message_box.exec()
+        clicked_button = message_box.clickedButton()
+        if clicked_button == skip_button:
+            return 'skip'
+        if clicked_button == keep_both_button:
+            return 'keep_both'
+        return None
+
+    def _transfer_selected_images(self, is_move: bool):
+        verb = 'move' if is_move else 'copy'
+        selected_images = self.get_selected_images()
+        if not selected_images:
             return
-        move_directory_path = Path(move_directory_path)
+        target_directory = self._ask_directory(verb, len(selected_images))
+        if target_directory is None:
+            return
+        plan = plan_transfer([image.path for image in selected_images],
+                             target_directory, is_move)
+        if not plan.items:
+            QMessageBox.information(
+                self, f'{verb.capitalize()} Images',
+                f'The selected {pluralize("image", len(selected_images))} '
+                f'{"is" if len(selected_images) == 1 else "are"} already in '
+                f'that folder.')
+            return
+        if plan.clashes:
+            action = self.ask_name_clash_action(
+                plan.clashes, len(plan.items),
+                'moved' if is_move else 'copied')
+            if action is None:
+                return
+            if action == 'keep_both':
+                resolve_clashes_by_renaming(plan)
+        source_model = self.proxy_image_list_model.sourceModel()
+        caption_users = count_caption_users(
+            image.path for image in source_model.images)
+        result = execute_transfer(plan, is_move, caption_users)
         completion_store = get_completion_store()
         completion_changed = False
-        for image in selected_images:
-            try:
-                target_image_path = move_directory_path / image.path.name
-                image.path.replace(target_image_path)
-                if completion_store.move_completion(image.path,
-                                                    target_image_path):
-                    completion_changed = True
-                caption_file_path = image.path.with_suffix('.txt')
-                if caption_file_path.exists():
-                    caption_file_path.replace(
-                        move_directory_path / caption_file_path.name)
-            except OSError:
-                QMessageBox.critical(self, 'Error',
-                                     f'Failed to move {image.path} to '
-                                     f'{move_directory_path}.')
+        for source_path, target_path in result.transferred:
+            if is_move:
+                changed = completion_store.move_completion(source_path,
+                                                           target_path)
+            else:
+                changed = completion_store.copy_completion(source_path,
+                                                           target_path)
+            completion_changed = completion_changed or changed
         if completion_changed:
             completion_store.save()
-        self.directory_reload_requested.emit()
+        if result.errors:
+            failed_count = len(plan.items) - len(result.transferred)
+            if failed_count:
+                heading = (f'{failed_count} of {len(plan.items)} '
+                           f'{pluralize("image", len(plan.items))} could not '
+                           f'be {"moved" if is_move else "copied"} to '
+                           f'{target_directory}:')
+            else:
+                heading = (f'Some caption files could not be '
+                           f'{"moved" if is_move else "copied"} to '
+                           f'{target_directory}:')
+            QMessageBox.critical(
+                self, 'Error',
+                f'{heading}\n\n{format_error_summary(result.errors)}')
+        if result.transferred:
+            # A copy into the open folder (or a subfolder) must show up too.
+            self.directory_reload_requested.emit()
+
+    @Slot()
+    def move_selected_images(self):
+        self._transfer_selected_images(is_move=True)
 
     @Slot()
     def copy_selected_images(self):
-        selected_images = self.get_selected_images()
-        selected_image_count = len(selected_images)
-        caption = (f'Select directory to copy {selected_image_count} selected '
-                   f'{pluralize("Image", selected_image_count)} and '
-                   f'{pluralize("caption", selected_image_count)} to')
-        settings = get_settings()
-        copy_directory_path = QFileDialog.getExistingDirectory(
-            parent=self, caption=caption,
-            dir=settings.value('directory_path', type=str))
-        if not copy_directory_path:
-            return
-        copy_directory_path = Path(copy_directory_path)
-        completion_store = get_completion_store()
-        completion_changed = False
-        for image in selected_images:
-            try:
-                shutil.copy(image.path, copy_directory_path)
-                target_image_path = copy_directory_path / image.path.name
-                if completion_store.copy_completion(image.path,
-                                                    target_image_path):
-                    completion_changed = True
-                caption_file_path = image.path.with_suffix('.txt')
-                if caption_file_path.exists():
-                    shutil.copy(caption_file_path, copy_directory_path)
-            except OSError:
-                QMessageBox.critical(self, 'Error',
-                                     f'Failed to copy {image.path} to '
-                                     f'{copy_directory_path}.')
-        if completion_changed:
-            completion_store.save()
+        self._transfer_selected_images(is_move=False)
 
     @Slot()
     def delete_selected_images(self):
         selected_images = self.get_selected_images()
         selected_image_count = len(selected_images)
+        if not selected_image_count:
+            return
         title = f'Delete {pluralize("Image", selected_image_count)}'
         question = (f'Delete {selected_image_count} selected '
                     f'{pluralize("image", selected_image_count)} and '
@@ -957,18 +1082,41 @@ class ImageListView(ElidedToolTipListView):
         reply = get_confirmation_dialog_reply(title, question)
         if reply != QMessageBox.StandardButton.Yes:
             return
+        source_model = self.proxy_image_list_model.sourceModel()
+        caption_users = count_caption_users(
+            image.path for image in source_model.images)
+        errors = []
+        deleted_count = 0
+        # Caption key -> caption file of a successfully deleted image.
+        orphaned_captions: dict[str, Path] = {}
         for image in selected_images:
-            image_file = QFile(image.path)
-            if not image_file.moveToTrash():
-                QMessageBox.critical(self, 'Error',
-                                     f'Failed to delete {image.path}.')
-            caption_file_path = image.path.with_suffix('.txt')
+            if not QFile(image.path).moveToTrash():
+                errors.append(f'{image.path.name} could not be moved to the '
+                              f'Recycle Bin.')
+                continue
+            deleted_count += 1
+            caption_key = get_caption_key(image.path.with_suffix('.txt'))
+            caption_users[caption_key] -= 1
+            caption_file_path = find_caption_file(image.path)
+            if caption_file_path is not None:
+                orphaned_captions[caption_key] = caption_file_path
+        # Only delete a caption once no remaining image uses it (an image
+        # that could not be deleted, or `a.jpg` sharing `a.txt` with `a.png`).
+        for caption_key, caption_file_path in orphaned_captions.items():
+            if caption_users[caption_key] > 0:
+                continue
             caption_file = QFile(caption_file_path)
-            if caption_file.exists():
-                if not caption_file.moveToTrash():
-                    QMessageBox.critical(self, 'Error',
-                                         f'Failed to delete '
-                                         f'{caption_file_path}.')
+            if caption_file.exists() and not caption_file.moveToTrash():
+                errors.append(f'Caption file {caption_file_path.name} could '
+                              f'not be moved to the Recycle Bin.')
+        if errors:
+            failed_count = selected_image_count - deleted_count
+            heading = (f'{failed_count} of {selected_image_count} '
+                       f'{pluralize("image", selected_image_count)} could not '
+                       f'be deleted:' if failed_count
+                       else 'Some caption files could not be deleted:')
+            QMessageBox.critical(
+                self, 'Error', f'{heading}\n\n{format_error_summary(errors)}')
         self.directory_reload_requested.emit()
 
     @Slot()
@@ -1020,40 +1168,63 @@ class ImageListView(ElidedToolTipListView):
             QMessageBox.critical(self, 'Error',
                                  'The file name cannot be empty.')
             return
-        new_image_path = image_path.with_name(f'{new_stem}{image_path.suffix}')
-        if new_image_path == image_path:
+        invalid_reason = get_invalid_file_name_reason(new_stem)
+        if invalid_reason is not None:
+            QMessageBox.critical(self, 'Error', invalid_reason)
             return
-        if new_image_path.exists():
+        new_image_path = image_path.with_name(f'{new_stem}{image_path.suffix}')
+        if str(new_image_path) == str(image_path):
+            return
+        # On Windows, `Photo.png` -> `photo.png` is the same file: allowed.
+        is_case_only_rename = new_image_path == image_path
+        if new_image_path.exists() and not is_case_only_rename:
             QMessageBox.critical(
                 self, 'Error',
                 f'File already exists: {new_image_path.name}.')
             return
-        old_caption_file_path = image_path.with_suffix('.txt')
+        old_caption_file_path = find_caption_file(image_path)
         new_caption_file_path = new_image_path.with_suffix('.txt')
-        if (old_caption_file_path.exists()
-                and old_caption_file_path != new_caption_file_path
-                and new_caption_file_path.exists()):
+        existing_new_caption = find_caption_file(new_image_path)
+        if (existing_new_caption is not None
+                and (old_caption_file_path is None
+                     or get_caption_key(existing_new_caption)
+                     != get_caption_key(old_caption_file_path))):
+            # The renamed image would silently take over that caption's tags.
             QMessageBox.critical(
                 self, 'Error',
-                f'Caption file already exists: {new_caption_file_path.name}.')
+                f'Caption file already exists: {existing_new_caption.name}.')
             return
+        # Another image (e.g. `a.jpg` next to `a.png`) using the same caption
+        # keeps it; the renamed image gets a copy.
+        source_model = self.proxy_image_list_model.sourceModel()
+        caption_users = count_caption_users(
+            image.path for image in source_model.images)
+        is_caption_shared = (old_caption_file_path is not None
+                             and caption_users[get_caption_key(
+                                 old_caption_file_path)] > 1)
         image_renamed = False
         try:
-            image_path.replace(new_image_path)
+            os.rename(image_path, new_image_path)
             image_renamed = True
-            if (old_caption_file_path.exists()
-                    and old_caption_file_path != new_caption_file_path):
-                old_caption_file_path.replace(new_caption_file_path)
-        except OSError:
+            if old_caption_file_path is not None:
+                if is_caption_shared:
+                    shutil.copy2(old_caption_file_path, new_caption_file_path)
+                else:
+                    os.rename(old_caption_file_path, new_caption_file_path)
+        except OSError as exception:
             if image_renamed:
                 try:
-                    new_image_path.replace(image_path)
+                    os.rename(new_image_path, image_path)
                 except OSError:
                     pass
             QMessageBox.critical(
                 self, 'Error',
-                f'Failed to rename {image_path.name}.')
+                f'Failed to rename {image_path.name}:\n'
+                f'{exception.strerror or exception}')
             return
+        completion_store = get_completion_store()
+        if completion_store.move_completion(image_path, new_image_path):
+            completion_store.save()
         self.directory_reload_requested.emit()
 
     @Slot()
@@ -1061,8 +1232,8 @@ class ImageListView(ElidedToolTipListView):
         current_image = self.get_current_image()
         if current_image is None:
             return
-        caption_file_path = current_image.path.with_suffix('.txt')
-        if not caption_file_path.exists():
+        caption_file_path = find_caption_file(current_image.path)
+        if caption_file_path is None:
             QMessageBox.critical(
                 self, 'Error',
                 f'Caption file does not exist for {current_image.path}.')
@@ -1091,8 +1262,8 @@ class ImageListView(ElidedToolTipListView):
         if selected_image_count > 0:
             current_image = self.get_current_image()
             if current_image is not None:
-                has_caption_file = current_image.path.with_suffix(
-                    '.txt').exists()
+                has_caption_file = (
+                    find_caption_file(current_image.path) is not None)
         self.open_image_action.setVisible(selected_image_count > 0)
         self.copy_image_to_clipboard_action.setVisible(
             selected_image_count > 0)
@@ -1283,7 +1454,10 @@ class ImageList(QDockWidget):
         image_count = self.proxy_image_list_model.rowCount()
         unfiltered_image_count = (self.proxy_image_list_model.sourceModel()
                                   .rowCount())
-        label_text = f'Image {proxy_image_index.row() + 1} / {image_count}'
+        if proxy_image_index.isValid():
+            label_text = f'Image {proxy_image_index.row() + 1} / {image_count}'
+        else:
+            label_text = f'No image selected / {image_count}'
         if image_count != unfiltered_image_count:
             label_text += f' ({unfiltered_image_count} total)'
         self.image_index_label.setText(label_text)
