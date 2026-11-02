@@ -50,7 +50,7 @@ import os
 import sys
 import threading
 import uuid
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen as _urllib_urlopen
 
@@ -755,6 +755,16 @@ def _try_plain_request(url, timeout):
         return None
 
 
+def _current_thread_interrupted() -> bool:
+    """True when the calling QThread has been asked to stop (e.g. its wiki
+    dialog closed)."""
+    try:
+        thread = QThread.currentThread()
+        return thread is not None and thread.isInterruptionRequested()
+    except Exception:
+        return False
+
+
 def danbooru_urlopen(url, timeout=10):
     """Drop-in ``urllib.request.urlopen`` replacement for Danbooru requests.
 
@@ -767,6 +777,10 @@ def danbooru_urlopen(url, timeout=10):
     if not _challenged_host(url):
         return _UrllibResponseAdapter(_urllib_urlopen(url, timeout=timeout))
 
+    # A worker whose dialog has closed must not start (or retry) a browser
+    # fetch: that would keep it busy long after nobody wants the result.
+    if _current_thread_interrupted():
+        raise URLError('request cancelled')
     try:
         host = urlparse(url).hostname or ''
     except Exception:
@@ -794,6 +808,8 @@ def danbooru_urlopen(url, timeout=10):
     body = holder.get('body', b'')
 
     if _looks_like_challenge(status, body):
+        if _current_thread_interrupted():
+            raise URLError('request cancelled')
         _log('page fetch was challenged; re-solving the Cloudflare challenge')
         holder = solver.fetch(url, timeout, force=True)
         status = holder.get('status', 0)
@@ -805,6 +821,8 @@ def danbooru_urlopen(url, timeout=10):
             _log('Danbooru request succeeded through the browser page')
 
     if status == 0 and not body:
+        if _current_thread_interrupted():
+            raise URLError('request cancelled')
         # The page machinery produced nothing usable; fall back so the caller
         # still gets a (likely 403) response rather than hanging.
         try:
