@@ -1803,6 +1803,11 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         menu.addAction(copy_action)
+        # Fusion leaves almost no gap before the shortcut in a one-item menu;
+        # the shortcut is right-aligned, so widening the menu adds the gap.
+        menu.ensurePolished()
+        menu.setMinimumWidth(menu.sizeHint().width()
+                             + 3 * menu.fontMetrics().horizontalAdvance('M'))
         menu.exec(global_point)
 
     @Slot(QModelIndex, QPoint)
