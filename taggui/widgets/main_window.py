@@ -1477,6 +1477,9 @@ class MainWindow(QMainWindow):
             'autocomplete_tags',
             defaultValue=DEFAULT_SETTINGS['autocomplete_tags'], type=bool)
         self.image_tags_editor.set_autocomplete_enabled(autocomplete_tags)
+        if getattr(self, '_tag_library_dialog', None) is not None:
+            self._tag_library_dialog.set_autocomplete_enabled(
+                autocomplete_tags)
 
     def reload_directory_for_settings_change(self):
         """Reload the current directory so a changed image-file-formats filter

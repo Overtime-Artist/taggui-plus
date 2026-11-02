@@ -24,6 +24,8 @@ from utils.settings_widgets import FocusedScrollComboBox
 from utils.utils import get_confirmation_dialog_reply, list_with_and, pluralize
 from utils.tag_filter import TagFilterLineEdit
 from widgets.tag_library_categories_editor import CategoryDialog
+from widgets.image_tags_editor import (CompleterModel, CompleterPopupList,
+                                       TagCompleter)
 from widgets.tag_library_editor import TagLibraryFilterProxyModel
 
 if TYPE_CHECKING:
@@ -34,6 +36,105 @@ class FocusedScrollElidedToolTipComboBox(FocusedScrollMixin,
                                          ElidedToolTipComboBox):
     """Only changes selection on mouse wheel when focused, like the other
     dropdowns in the app."""
+
+
+class LibraryTagCompleter(TagCompleter):
+    """Tag Library tag suggestions for the alias/implication/profile inputs.
+
+    With `multiple=True` only the text after the last comma is completed, and
+    choosing a suggestion keeps everything before it."""
+
+    def __init__(self, model, parent, multiple: bool):
+        super().__init__(model, parent)
+        self.multiple = multiple
+
+    def _split_last(self, text: str) -> tuple[str, str]:
+        if not self.multiple or ',' not in text:
+            return '', text
+        head, _, last = text.rpartition(',')
+        return head + ', ', last
+
+    def splitPath(self, path: str) -> list[str]:
+        segment = self._split_last(path)[1].strip()
+        # The base implementation returns the full completion prefix, not the
+        # given path, so return the segment ourselves (the call still reorders
+        # the candidates for it).
+        super().splitPath(segment)
+        return [segment]
+
+    def pathFromIndex(self, index: QModelIndex) -> str:
+        completion = super().pathFromIndex(index)
+        widget = self.widget()
+        if widget is None:
+            return completion
+        return self._split_last(widget.text())[0] + completion
+
+
+class LibraryTagLineEdit(QLineEdit):
+    """Line edit with optional Tag Library autocomplete.
+
+    Picking a suggestion with Enter only fills the field: Qt also forwards
+    that Enter to the line edit (emitting `returnPressed`), which would
+    otherwise submit the row straight away."""
+
+    def __init__(self, tag_library_model: TagLibraryModel,
+                 multiple: bool = False, parent=None):
+        super().__init__(parent)
+        self._tag_library_model = tag_library_model
+        self._multiple = multiple
+        self._completer = None
+        self._candidates_stale = True
+        self._just_completed = False
+        tag_library_model.modelReset.connect(self._mark_candidates_stale)
+
+    def set_autocomplete_enabled(self, enabled: bool):
+        if enabled == (self._completer is not None):
+            return
+        if not enabled:
+            # `setCompleter(None)` deletes the completer the line edit owns.
+            self.setCompleter(None)
+            self._completer = None
+            return
+        model = CompleterModel(self._tag_library_model, self)
+        self._completer = LibraryTagCompleter(model, self, self._multiple)
+        self._completer.setPopup(CompleterPopupList())
+        self.setCompleter(self._completer)
+        self._completer.activated[str].connect(self._on_completion_activated)
+        self._candidates_stale = True
+        if self.hasFocus():
+            self._refresh_candidates()
+
+    def _mark_candidates_stale(self):
+        # Refreshed lazily on focus so large libraries don't slow down every
+        # tag add elsewhere in the app.
+        self._candidates_stale = True
+        if self.hasFocus():
+            self._refresh_candidates()
+
+    def _refresh_candidates(self):
+        if self._completer is None or not self._candidates_stale:
+            return
+        self._candidates_stale = False
+        self._completer.set_candidates(list(self._tag_library_model.tags))
+
+    def focusInEvent(self, event):
+        self._refresh_candidates()
+        super().focusInEvent(event)
+
+    def _on_completion_activated(self, _text: str):
+        self._just_completed = True
+        QTimer.singleShot(0, self._clear_just_completed)
+
+    def _clear_just_completed(self):
+        self._just_completed = False
+
+    def keyPressEvent(self, event):
+        if (self._just_completed
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
+            self._just_completed = False
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class TagLibraryTableModel(QAbstractTableModel):
@@ -408,6 +509,9 @@ class TagLibraryDialog(QDialog):
         self._refresh_aliases_tab()
         self._refresh_implications_tab()
         self._refresh_profiles_tab()
+        self.set_autocomplete_enabled(get_settings().value(
+            'autocomplete_tags',
+            defaultValue=DEFAULT_SETTINGS['autocomplete_tags'], type=bool))
 
         # Window-level actions so the wiki keyboard shortcuts also work while
         # this dialog (a separate top-level window) is focused. Their shortcuts
@@ -422,6 +526,14 @@ class TagLibraryDialog(QDialog):
             Qt.ShortcutContext.WindowShortcut)
         self.gelbooru_wiki_action.triggered.connect(self._request_gelbooru_wiki)
         self.addAction(self.gelbooru_wiki_action)
+
+    def set_autocomplete_enabled(self, enabled: bool):
+        """Follow the "Show tag autocomplete suggestions" setting."""
+        for line_edit in (self.new_canonical_input, self.implication_tag_input,
+                          self.implication_implied_input,
+                          self.profile_original_input,
+                          self.profile_replacement_input):
+            line_edit.set_autocomplete_enabled(enabled)
 
     def set_wiki_shortcuts(self, danbooru_shortcut: QKeySequence,
                            gelbooru_shortcut: QKeySequence):
@@ -728,7 +840,8 @@ class TagLibraryDialog(QDialog):
         self.new_alias_input.setTextMargins(8, 0, 8, 0)
         arrow_label = QLabel('→')
         arrow_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.new_canonical_input = QLineEdit()
+        self.new_canonical_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=False)
         self.new_canonical_input.setPlaceholderText('Canonical Tag')
         self.new_canonical_input.setTextMargins(8, 0, 8, 0)
         self.add_alias_button = QPushButton('Add')
@@ -795,12 +908,14 @@ class TagLibraryDialog(QDialog):
     def _build_implications_tab(self) -> QWidget:
         tab = QWidget()
 
-        self.implication_tag_input = QLineEdit()
+        self.implication_tag_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=True)
         self.implication_tag_input.setPlaceholderText('Tags')
         self.implication_tag_input.setTextMargins(8, 0, 8, 0)
         implies_label = QLabel('implies')
         implies_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.implication_implied_input = QLineEdit()
+        self.implication_implied_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=True)
         self.implication_implied_input.setPlaceholderText('Implied Tags')
         self.implication_implied_input.setTextMargins(8, 0, 8, 0)
         self.add_implication_button = QPushButton('Add')
@@ -903,12 +1018,14 @@ class TagLibraryDialog(QDialog):
 
         self.profile_mappings_label = QLabel('Mappings')
 
-        self.profile_original_input = QLineEdit()
+        self.profile_original_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=False)
         self.profile_original_input.setPlaceholderText('Original Tag')
         self.profile_original_input.setTextMargins(8, 0, 8, 0)
         profile_arrow_label = QLabel('→')
         profile_arrow_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.profile_replacement_input = QLineEdit()
+        self.profile_replacement_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=False)
         self.profile_replacement_input.setPlaceholderText('Replacement')
         self.profile_replacement_input.setTextMargins(8, 0, 8, 0)
         self.add_mapping_button = QPushButton('Add')
