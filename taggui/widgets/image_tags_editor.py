@@ -1,5 +1,6 @@
 from typing import Optional
-from PySide6.QtCore import (QEvent, QItemSelectionModel, QModelIndex, QPoint,
+from PySide6.QtCore import (QEvent, QItemSelectionModel, QModelIndex,
+                            QPersistentModelIndex, QPoint,
                             QPropertyAnimation, QStringListModel, Qt, QTimer,
                             Signal, Slot)
 from PySide6.QtGui import QColor, QFocusEvent, QKeyEvent, QPalette
@@ -16,7 +17,7 @@ from models.proxy_image_list_model import ProxyImageListModel
 from utils.elided_tooltip import ElidedToolTipListView
 from utils.image import Image, build_caption_text
 from utils.settings import DEFAULT_SETTINGS, get_settings, get_tag_separator
-from utils.settings_widgets import SettingsComboBox
+from utils.settings_widgets import FocusedScrollComboBox, SettingsComboBox
 from utils.text_edit_item_delegate import TextEditItemDelegate
 from utils.utils import get_confirmation_dialog_reply
 from widgets.image_list import ImageList
@@ -76,7 +77,7 @@ def show_category_assignment_prompt(parent: QWidget,
         [(category['name'], category['id']) for category in categories])
 
     def create_category_combo_box(combo_parent: QWidget) -> QComboBox:
-        combo_box = QComboBox(combo_parent)
+        combo_box = FocusedScrollComboBox(combo_parent)
         for category_name, category_id in category_options:
             combo_box.addItem(category_name, category_id)
         default_index = combo_box.findData(default_category_id)
@@ -344,8 +345,9 @@ class TagInputBox(QLineEdit):
         if (event.modifiers() == Qt.KeyboardModifier.ControlModifier
                 and self.completer is not None
                 and self.completer.popup().isVisible()):
-            first_tag = self.completer.popup().model().data(
-                self.completer.model().index(0, 0), Qt.ItemDataRole.EditRole)
+            popup_model = self.completer.popup().model()
+            first_tag = popup_model.data(popup_model.index(0, 0),
+                                         Qt.ItemDataRole.EditRole)
             self.add_tag(self._completion_to_tag(first_tag))
         # Otherwise, add the tag in the input box.
         else:
@@ -404,9 +406,12 @@ class TagInputBox(QLineEdit):
         if (not self.group_mode_active and len(tags) == 1
                 and selected_image_count == 1):
             resolved_tag = tags[0]
-            if resolved_tag in self.image_tag_list_model.stringList():
-                # The tag is already on the image: reject it and give the user
-                # visual feedback instead of silently doing nothing.
+            existing_folded = {existing.casefold() for existing
+                               in self.image_tag_list_model.stringList()}
+            if resolved_tag.casefold() in existing_folded:
+                # The tag (in any letter case) is already on the image: reject
+                # it and give the user visual feedback instead of silently
+                # doing nothing.
                 self._flash_duplicate()
                 self.clear()
                 return
@@ -479,12 +484,12 @@ class TagInputBox(QLineEdit):
         multi-image and grouped views, mirroring the single-image path."""
         if not image_indices:
             return False
-        wanted = set(tags)
+        wanted = {tag.casefold() for tag in tags}
         for index in image_indices:
             image = index.model().data(index, Qt.ItemDataRole.UserRole)
             if image is None:
                 return False
-            if not wanted.issubset(image.tags):
+            if not wanted.issubset(tag.casefold() for tag in image.tags):
                 return False
         return True
 
@@ -759,10 +764,19 @@ class ImageTagsList(ElidedToolTipListView):
         tag = index.data(Qt.ItemDataRole.DisplayRole)
         if not tag:
             return
+        # Category actions apply to every selected tag (like Copy) when the
+        # clicked tag is part of the selection; otherwise just the clicked tag.
+        # The wiki look-ups can only open one page, so they use the clicked tag.
+        selected_tags = [str(selected.data(Qt.ItemDataRole.DisplayRole))
+                         for selected in sorted(self.selectedIndexes(),
+                                                key=lambda i: i.row())]
+        category_tags = (selected_tags if str(tag) in selected_tags
+                         else [str(tag)])
 
         categories = self.tag_library_model.get_categories()
-        current_category = self.tag_library_model.get_category_for_tag(
-            str(tag))
+        any_categorized = any(
+            self.tag_library_model.get_category_for_tag(category_tag)
+            is not None for category_tag in category_tags)
 
         context_menu = QMenu(self)
         selected_tag_count = len(self.selectedIndexes())
@@ -781,7 +795,7 @@ class ImageTagsList(ElidedToolTipListView):
         assign_menu.setEnabled(bool(categories))
 
         clear_action = context_menu.addAction('Clear Category')
-        clear_action.setEnabled(current_category is not None)
+        clear_action.setEnabled(any_categorized)
 
         selected_action = context_menu.exec(
             self.viewport().mapToGlobal(position))
@@ -792,13 +806,14 @@ class ImageTagsList(ElidedToolTipListView):
         elif selected_action == view_gelbooru_wiki_action:
             self.gelbooru_wiki_requested.emit(str(tag))
         elif selected_action == clear_action:
-            self.tag_library_model.clear_category([str(tag)])
+            self.tag_library_model.clear_category(category_tags)
         elif selected_action in category_actions:
-            tag_str = str(tag)
-            if not self.tag_library_model.has_tag(tag_str):
-                self.tag_library_model.add_tags([tag_str])
+            missing = [category_tag for category_tag in category_tags
+                       if not self.tag_library_model.has_tag(category_tag)]
+            if missing:
+                self.tag_library_model.add_tags(missing)
             self.tag_library_model.assign_category(
-                [tag_str], category_actions[selected_action])
+                category_tags, category_actions[selected_action])
 
     def keyPressEvent(self, event: QKeyEvent):
         """
@@ -946,6 +961,49 @@ class ImageTagsEditor(QDockWidget):
     # keyboard equivalent of hovering it). True on press, False on release.
     grid_peek_changed = Signal(bool)
 
+    # The images the pane edits are stored as persistent indices, which Qt
+    # keeps pointing at the same image when rows above it are added or removed
+    # (e.g. by a refresh). A plain index would silently point at a different
+    # image. The properties below hand out plain indices, or None when the
+    # image is gone.
+    @staticmethod
+    def _persist(index) -> Optional[QPersistentModelIndex]:
+        if index is None or not index.isValid():
+            return None
+        return QPersistentModelIndex(index)
+
+    @staticmethod
+    def _resolve(persistent) -> Optional[QModelIndex]:
+        if persistent is None or not persistent.isValid():
+            return None
+        return persistent.model().index(persistent.row(), persistent.column())
+
+    @property
+    def image_index(self) -> Optional[QModelIndex]:
+        return self._resolve(getattr(self, '_image_index_ref', None))
+
+    @image_index.setter
+    def image_index(self, index):
+        self._image_index_ref = self._persist(index)
+
+    @property
+    def _group_current_index(self) -> Optional[QModelIndex]:
+        return self._resolve(getattr(self, '_group_current_ref', None))
+
+    @_group_current_index.setter
+    def _group_current_index(self, index):
+        self._group_current_ref = self._persist(index)
+
+    @property
+    def _group_source_indices(self) -> list[QModelIndex]:
+        resolved = (self._resolve(ref)
+                    for ref in getattr(self, '_group_source_refs', []))
+        return [index for index in resolved if index is not None]
+
+    @_group_source_indices.setter
+    def _group_source_indices(self, indices):
+        self._group_source_refs = [ref for ref in map(self._persist, indices)
+                                   if ref is not None]
     def __init__(self, image_list_model: ImageListModel,
                  proxy_image_list_model: ProxyImageListModel,
                  tag_library_model: TagLibraryModel,
@@ -1036,6 +1094,12 @@ class ImageTagsEditor(QDockWidget):
         self._group_mode = False
         self._group_source_indices: list[QModelIndex] = []
         self._group_current_index: Optional[QModelIndex] = None
+        self.group_tags_panel.current_image_tags_provider = \
+            self._current_group_image_tags
+        # Save typed natural language text before a re-sort resets the image
+        # list (the stored image reference does not survive a reset).
+        self.image_list_model.modelAboutToBeReset.connect(
+            self.save_natural_language_prompt)
         # Widget that held focus when NL mode was entered via the keyboard
         # shortcut, so the same shortcut can hand focus back on exit. Only set
         # on the keybind-enter path; see toggle_editor_mode.
@@ -1286,6 +1350,14 @@ class ImageTagsEditor(QDockWidget):
             self.save_natural_language_prompt()
         next_image_index = self.proxy_image_list_model.mapToSource(
             proxy_image_index)
+        image: Image = self.proxy_image_list_model.data(
+            proxy_image_index, Qt.ItemDataRole.UserRole)
+        if image is None:
+            # No image is shown (e.g. the filter hides every image): show an
+            # empty, disabled pane so nothing can be typed into a stale view.
+            self.clear_for_no_image()
+            return
+        self._set_editing_enabled(True)
         # Auto-caption review markers belong to one image, so drop them when the
         # displayed image actually changes (but keep them across in-place tag
         # edits such as undo/redo of the same image).
@@ -1293,8 +1365,6 @@ class ImageTagsEditor(QDockWidget):
                 or self.image_index.row() != next_image_index.row()):
             self.image_tags_list.clear_recently_captioned()
         self.image_index = next_image_index
-        image: Image = self.proxy_image_list_model.data(
-            proxy_image_index, Qt.ItemDataRole.UserRole)
         self.complete_label.setVisible(bool(image.is_complete))
         # If the string list already contains the image's tags, do not reload
         # them. This is the case when the tags are edited directly through the
@@ -1317,6 +1387,24 @@ class ImageTagsEditor(QDockWidget):
         self.count_tokens()
         if self.image_tags_list.hasFocus():
             self.select_first_tag()
+
+    def _set_editing_enabled(self, enabled: bool):
+        for widget in (self.tag_input_box, self.image_tags_list,
+                       self.natural_language_text_edit,
+                       self.natural_language_mode_check_box):
+            widget.setEnabled(enabled)
+
+    def clear_for_no_image(self):
+        """Empty and disable the single-image view when no image is shown."""
+        self.image_index = None
+        self.image_tags_list.clear_recently_captioned()
+        self.complete_label.setVisible(False)
+        self.is_loading_image_tags = True
+        self.image_tag_list_model.setStringList([])
+        self.natural_language_text_edit.set_clean_plain_text('')
+        self.is_loading_image_tags = False
+        self.count_tokens()
+        self._set_editing_enabled(False)
 
     @Slot()
     def set_natural_language_mode(self):
@@ -1532,10 +1620,19 @@ class ImageTagsEditor(QDockWidget):
             return None
         return self._group_current_index
 
+    def _current_group_image_tags(self) -> Optional[set[str]]:
+        """Tags of the current image in grouped mode, or None if unknown."""
+        index = self.current_group_image_index()
+        if index is None:
+            return None
+        image = self.image_list_model.data(index, Qt.ItemDataRole.UserRole)
+        return set(image.tags) if image is not None else None
+
     def enter_group_mode(self, source_indices: list[QModelIndex],
                          current_index: Optional[QModelIndex]):
         """Switch the pane into the grouped Common/Differences view."""
         self.save_natural_language_prompt()
+        self._set_editing_enabled(True)
         self._group_mode = True
         self._group_source_indices = list(source_indices)
         self._group_current_index = current_index
@@ -1727,6 +1824,8 @@ class ImageTagsEditor(QDockWidget):
             return
         image: Image = self.image_list_model.data(self.image_index,
                                                   Qt.ItemDataRole.UserRole)
+        if image is None:
+            return
         natural_language_prompt = self.natural_language_text_edit.toPlainText()
         if image.natural_language_prompt == natural_language_prompt:
             self.natural_language_text_edit.mark_clean()

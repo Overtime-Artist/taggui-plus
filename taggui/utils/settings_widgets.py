@@ -38,6 +38,10 @@ class SettingsComboBox(QComboBox):
             self.setCurrentText(setting)
 
 
+class FocusedScrollComboBox(FocusedScrollMixin, QComboBox):
+    """Plain dropdown that ignores the mouse wheel until it is clicked."""
+
+
 class FocusedScrollSettingsComboBox(FocusedScrollMixin, SettingsComboBox):
     pass
 

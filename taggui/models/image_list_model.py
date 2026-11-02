@@ -846,7 +846,12 @@ class ImageListModel(QAbstractListModel):
                 [Qt.ItemDataRole.DecorationRole, Qt.ItemDataRole.SizeHintRole])
             return
 
-    def data(self, index, role=None) -> Image | str | QIcon | QSize:
+    def data(self, index, role=None) -> Image | str | QIcon | QSize | None:
+        # An invalid index has row -1, which Python would read as the last
+        # image. Return nothing instead so edits never land on the wrong image.
+        if (index is None or not index.isValid()
+                or not 0 <= index.row() < len(self.images)):
+            return None
         image = self.images[index.row()]
         if role == Qt.ItemDataRole.UserRole:
             return image
@@ -1708,9 +1713,16 @@ class ImageListModel(QAbstractListModel):
                                   [Qt.ItemDataRole.DecorationRole,
                                    Qt.ItemDataRole.UserRole])
 
+    def _valid_indices(self, image_indices: list) -> list[QModelIndex]:
+        """Drop indices that no longer point at an image (e.g. after the
+        image was removed), so a stale target can't write elsewhere."""
+        return [index for index in image_indices
+                if index is not None and index.isValid()
+                and 0 <= index.row() < len(self.images)]
+
     def update_image_tags(self, image_index: QModelIndex, tags: list[str]):
         image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-        if image.tags == tags:
+        if image is None or image.tags == tags:
             return
         image.tags = tags
         self.dataChanged.emit(image_index, image_index)
@@ -1719,6 +1731,8 @@ class ImageListModel(QAbstractListModel):
     def update_image_caption(self, image_index: QModelIndex, tags: list[str],
                              natural_language_prompt: str):
         image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
+        if image is None:
+            return
         tags = list(dict.fromkeys(tags))
         if (image.tags == tags
                 and image.natural_language_prompt == natural_language_prompt):
@@ -1731,7 +1745,8 @@ class ImageListModel(QAbstractListModel):
     def update_image_natural_language_prompt(self, image_index: QModelIndex,
                                              natural_language_prompt: str):
         image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-        if image.natural_language_prompt == natural_language_prompt:
+        if (image is None
+                or image.natural_language_prompt == natural_language_prompt):
             return
         image.natural_language_prompt = natural_language_prompt
         self.dataChanged.emit(image_index, image_index)
@@ -1741,6 +1756,7 @@ class ImageListModel(QAbstractListModel):
     @collect_write_errors
     def add_tags(self, tags: list[str], image_indices: list[QModelIndex]):
         """Add one or more tags to one or more images."""
+        image_indices = self._valid_indices(image_indices)
         if not image_indices:
             return
         action_name = f'Add {pluralize("Tag", len(tags))}'
@@ -1749,8 +1765,14 @@ class ImageListModel(QAbstractListModel):
         changed_indices = []
         for image_index in image_indices:
             image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-            existing = set(image.tags)
-            new_tags = [t for t in dict.fromkeys(tags) if t not in existing]
+            # A tag that only differs in letter case from one the image
+            # already has counts as a duplicate, like in the Image Tags pane.
+            existing = {tag.casefold() for tag in image.tags}
+            new_tags = []
+            for tag in tags:
+                if tag.casefold() not in existing:
+                    existing.add(tag.casefold())
+                    new_tags.append(tag)
             if not new_tags:
                 continue
             image.tags.extend(new_tags)
@@ -1775,6 +1797,7 @@ class ImageListModel(QAbstractListModel):
         current image"). Only images that actually contain one of the tags are
         modified and written to disk.
         """
+        image_indices = self._valid_indices(image_indices)
         if not image_indices or not tags:
             return
         tags_to_remove = set(tags)
@@ -1806,10 +1829,15 @@ class ImageListModel(QAbstractListModel):
         Mirrors ``remove_tags_from_images`` but for an in-place rename: only the
         given images that actually contain ``old_tag`` are modified, the new tag
         takes the old tag's position, and duplicates are collapsed. No-op when
-        the new tag is empty or unchanged.
+        the new tag is empty or unchanged. A new name containing the tag
+        separator (e.g. "a, b") is split into several tags, like the Add Tag
+        box does, so the list matches what the caption file reloads as.
         """
-        new_tag = new_tag.strip()
-        if not image_indices or not old_tag or not new_tag or old_tag == new_tag:
+        new_tags = [tag.strip() for tag in new_tag.split(self.tag_separator)
+                    if tag.strip()]
+        image_indices = self._valid_indices(image_indices)
+        if (not image_indices or not old_tag or not new_tags
+                or new_tags == [old_tag]):
             return
         targets = [index for index in image_indices
                    if old_tag in self.data(index,
@@ -1821,8 +1849,10 @@ class ImageListModel(QAbstractListModel):
             should_ask_for_confirmation=len(targets) > 1)
         for image_index in targets:
             image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-            image.tags = list(dict.fromkeys(
-                new_tag if tag == old_tag else tag for tag in image.tags))
+            renamed = []
+            for tag in image.tags:
+                renamed.extend(new_tags if tag == old_tag else [tag])
+            image.tags = list(dict.fromkeys(renamed))
             self.write_image_tags_to_disk(image)
         min_image_index = min(targets, key=lambda index: index.row())
         max_image_index = max(targets, key=lambda index: index.row())

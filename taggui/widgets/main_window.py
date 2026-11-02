@@ -1920,10 +1920,10 @@ class MainWindow(QMainWindow):
             # already ran once while group mode was still active and early
             # returned without refreshing the single-image tag list or the
             # green "Complete" indicator. Now that group mode is off, reload the
-            # current image so both reflect its real state.
+            # current image so both reflect its real state (or empty the pane
+            # if no image is current, e.g. the filter hides everything).
             current_proxy_index = self.image_list_selection_model.currentIndex()
-            if current_proxy_index.isValid():
-                self.image_tags_editor.load_image_tags(current_proxy_index)
+            self.image_tags_editor.load_image_tags(current_proxy_index)
         if was_grid:
             self.image_viewer.exit_grid()
             current_proxy_index = self.image_list_selection_model.currentIndex()
@@ -1953,6 +1953,9 @@ class MainWindow(QMainWindow):
         image_index = self.image_tags_editor.image_index
         image: Image = self.image_list_model.data(image_index,
                                                   Qt.ItemDataRole.UserRole)
+        if image is None:
+            # No image is shown (or it was removed): nothing to save to.
+            return
         old_tags = image.tags
         new_tags = list(dict.fromkeys(self.image_tag_list_model.stringList()))
         if old_tags == new_tags:

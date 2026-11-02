@@ -1439,6 +1439,13 @@ class ImageList(QDockWidget):
             current_image: Image = current_proxy_index.data(Qt.ItemDataRole.UserRole)
             if current_image is not None:
                 current_image_path = current_image.path
+        # Remember the whole selection by image, so re-sorting (e.g. after a
+        # refresh) doesn't collapse a multi-selection to the current image.
+        selected_paths = set()
+        for index in self.list_view.selectedIndexes():
+            image = index.data(Qt.ItemDataRole.UserRole)
+            if image is not None:
+                selected_paths.add(image.path)
         sort_by = self.sort_by_combo_box.currentData()
         sort_order = (SortOrder.DESCENDING
                       if self.is_sort_descending
@@ -1447,13 +1454,27 @@ class ImageList(QDockWidget):
         source_model.sort_images(sort_by, sort_order)
         if current_image_path is None:
             return
+        current_index = None
+        selection = QItemSelection()
         for proxy_row in range(self.proxy_image_list_model.rowCount()):
             proxy_index = self.proxy_image_list_model.index(proxy_row, 0)
             image: Image = proxy_index.data(Qt.ItemDataRole.UserRole)
-            if image is None or image.path != current_image_path:
+            if image is None:
                 continue
-            self.list_view.setCurrentIndex(proxy_index)
+            if image.path == current_image_path:
+                current_index = proxy_index
+            if image.path in selected_paths:
+                selection.select(proxy_index, proxy_index)
+        if current_index is None:
             return
+        if len(selected_paths) <= 1:
+            self.list_view.setCurrentIndex(current_index)
+            return
+        selection_model = self.list_view.selectionModel()
+        selection_model.setCurrentIndex(
+            current_index, QItemSelectionModel.SelectionFlag.NoUpdate)
+        selection_model.select(
+            selection, QItemSelectionModel.SelectionFlag.ClearAndSelect)
 
     def handle_sort_by_changed(self):
         sort_by = self.sort_by_combo_box.currentData()

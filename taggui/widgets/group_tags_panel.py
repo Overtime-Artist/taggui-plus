@@ -458,6 +458,10 @@ class GroupTagsPanel(QWidget):
     def __init__(self, tag_library_model: TagLibraryModel):
         super().__init__()
         self.tag_library_model = tag_library_model
+        # Optional callable returning the current image's tags (or None). Set
+        # by the Image Tags editor so the context menu only offers the
+        # "current image" actions when they would change something.
+        self.current_image_tags_provider = None
         self._model = _UnifiedTagModel(tag_library_model)
         # The active tag-list filter: 'all' shows every tag, 'common' shows only
         # tags on every selected image (k == N), 'differences' shows only tags
@@ -881,7 +885,8 @@ class GroupTagsPanel(QWidget):
     def _copy_tags(self):
         self.tag_list.copy_selected_tags_to_clipboard()
 
-    def _add_category_actions(self, menu: QMenu, tag: str) -> tuple[dict, object]:
+    def _add_category_actions(self, menu: QMenu,
+                              tags: list[str]) -> tuple[dict, object]:
         """Append an "Assign Category" submenu and a "Clear Category" action.
 
         Mirrors ImageTagsList.show_context_menu. Returns the mapping of assign
@@ -895,18 +900,21 @@ class GroupTagsPanel(QWidget):
             category_actions[action] = category['id']
         assign_menu.setEnabled(bool(categories))
         clear_action = menu.addAction('Clear Category')
-        clear_action.setEnabled(
-            self.tag_library_model.get_category_for_tag(tag) is not None)
+        clear_action.setEnabled(any(
+            self.tag_library_model.get_category_for_tag(tag) is not None
+            for tag in tags))
         return category_actions, clear_action
 
-    def _assign_category(self, tag: str, category_id):
-        if not self.tag_library_model.has_tag(tag):
-            self.tag_library_model.add_tags([tag])
-        self.tag_library_model.assign_category([tag], category_id)
+    def _assign_category(self, tags: list[str], category_id):
+        missing = [tag for tag in tags
+                   if not self.tag_library_model.has_tag(tag)]
+        if missing:
+            self.tag_library_model.add_tags(missing)
+        self.tag_library_model.assign_category(tags, category_id)
         self._refresh_tag_colors()
 
-    def _clear_category(self, tag: str):
-        self.tag_library_model.clear_category([tag])
+    def _clear_category(self, tags: list[str]):
+        self.tag_library_model.clear_category(tags)
         self._refresh_tag_colors()
 
     def _refresh_tag_colors(self):
@@ -929,8 +937,12 @@ class GroupTagsPanel(QWidget):
         # Keep the renamed tag in its slot. A new name would otherwise be
         # treated as a brand-new tag and sent to the end, so move the old name's
         # permanent slot to the new name in place. The pending anchor then
-        # restores the cursor to that row.
-        self._rename_slot(old_tag, new_tag)
+        # restores the cursor to that row. A name containing the separator
+        # becomes several tags; the first one takes the slot.
+        separator = get_tag_separator()
+        parts = [part.strip() for part in new_tag.split(separator)
+                 if part.strip()]
+        self._rename_slot(old_tag, parts[0] if parts else new_tag)
         self._pending_anchor = anchor
         self.rename_tag_requested.emit(old_tag, new_tag)
         self._pending_anchor = None
@@ -961,22 +973,41 @@ class GroupTagsPanel(QWidget):
         # "Add" only makes sense for tags missing from some images; offer it
         # when any selected tag is a difference (adding a common tag is a no-op).
         any_difference = any(tag in differences for tag in tags)
+        # The current-image actions are only offered when they would do
+        # something to the current image.
+        current_tags = None
+        if self.current_image_tags_provider is not None:
+            current_tags = self.current_image_tags_provider()
+        if current_tags is None:
+            can_add_current = any_difference
+            can_remove_current = True
+        else:
+            can_add_current = any(tag not in current_tags for tag in tags)
+            can_remove_current = any(tag in current_tags for tag in tags)
+        # Category actions apply to all selected tags (like Copy) when the
+        # clicked tag is one of them. The wiki look-ups open a single page, so
+        # they use the clicked tag.
+        category_tags = (tags if clicked_tag in tags
+                         else [clicked_tag] if clicked_tag else [])
         menu = QMenu(self)
         copy_action = menu.addAction(
             'Copy Tags' if len(tags) > 1 else 'Copy Tag')
         menu.addSeparator()
         add_all_action = None
         add_current_action = None
+        remove_current_action = None
         # Group by scope (all selected vs. current image) so choosing a scope is
         # a deliberate top-block vs. bottom-block decision, with a separator to
         # make the boundary unmistakable. Add sits before Remove within each.
         if any_difference:
             add_all_action = menu.addAction('Add to all selected')
         remove_all_action = menu.addAction('Remove from all selected')
-        menu.addSeparator()
-        if any_difference:
+        if can_add_current or can_remove_current:
+            menu.addSeparator()
+        if can_add_current:
             add_current_action = menu.addAction('Add to current image')
-        remove_current_action = menu.addAction('Remove from current image')
+        if can_remove_current:
+            remove_current_action = menu.addAction('Remove from current image')
         view_danbooru_action = None
         view_gelbooru_action = None
         category_actions = {}
@@ -987,7 +1018,7 @@ class GroupTagsPanel(QWidget):
             view_gelbooru_action = menu.addAction('View Gelbooru Wiki')
             menu.addSeparator()
             category_actions, clear_action = self._add_category_actions(
-                menu, clicked_tag)
+                menu, category_tags)
         chosen = menu.exec(self.tag_list.viewport().mapToGlobal(position))
         if chosen is None:
             return
@@ -1002,10 +1033,10 @@ class GroupTagsPanel(QWidget):
             self.gelbooru_wiki_requested.emit(clicked_tag)
             return
         if chosen == clear_action:
-            self._clear_category(clicked_tag)
+            self._clear_category(category_tags)
             return
         if chosen in category_actions:
-            self._assign_category(clicked_tag, category_actions[chosen])
+            self._assign_category(category_tags, category_actions[chosen])
             return
         # Preserve the cursor position across the refresh the edit triggers.
         self._pending_anchor = self._anchor_row(self.tag_list)
