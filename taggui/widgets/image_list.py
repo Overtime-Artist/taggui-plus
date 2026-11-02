@@ -734,7 +734,27 @@ class ImageListView(ElidedToolTipListView):
             event.accept()
             return
         super().mouseMoveEvent(event)
+
+    def set_current_image_index(self, index: QModelIndex):
+        """
+        Make `index` the current image for a programmatic move (filter change,
+        go to next image, etc.). In extended selection mode only that image is
+        selected, regardless of any held modifier keys (e.g. Ctrl still held
+        from a Ctrl+click in another pane would otherwise add it to the
+        selection).
+        """
+        self._programmatic_current_change = True
+        try:
+            self.setCurrentIndex(index)
+        finally:
+            self._programmatic_current_change = False
+
     def selectionCommand(self, index, event=None):
+        if (event is None
+                and getattr(self, '_programmatic_current_change', False)
+                and self.selectionMode()
+                == QAbstractItemView.SelectionMode.ExtendedSelection):
+            return QItemSelectionModel.SelectionFlag.ClearAndSelect
         # A mouse release that ends a drag-out must not change the selection
         # (e.g. narrow a multi-image selection to the pressed image).
         if (isinstance(event, QMouseEvent)
@@ -1468,7 +1488,7 @@ class ImageList(QDockWidget):
         if current_index is None:
             return
         if len(selected_paths) <= 1:
-            self.list_view.setCurrentIndex(current_index)
+            self.list_view.set_current_image_index(current_index)
             return
         selection_model = self.list_view.selectionModel()
         selection_model.setCurrentIndex(
@@ -1524,7 +1544,7 @@ class ImageList(QDockWidget):
         self.list_view.clearSelection()
         previous_image_index = self.proxy_image_list_model.index(
             self.list_view.selectionModel().currentIndex().row() - 1, 0)
-        self.list_view.setCurrentIndex(previous_image_index)
+        self.list_view.set_current_image_index(previous_image_index)
 
     @Slot()
     def go_to_next_image(self):
@@ -1534,7 +1554,7 @@ class ImageList(QDockWidget):
         self.list_view.clearSelection()
         next_image_index = self.proxy_image_list_model.index(
             self.list_view.selectionModel().currentIndex().row() + 1, 0)
-        self.list_view.setCurrentIndex(next_image_index)
+        self.list_view.set_current_image_index(next_image_index)
 
     @Slot()
     def jump_to_first_untagged_image(self):
@@ -1552,7 +1572,7 @@ class ImageList(QDockWidget):
         if proxy_image_index is None:
             return
         self.list_view.clearSelection()
-        self.list_view.setCurrentIndex(
+        self.list_view.set_current_image_index(
             self.proxy_image_list_model.index(proxy_image_index, 0))
 
     @Slot()
@@ -1571,7 +1591,7 @@ class ImageList(QDockWidget):
         if proxy_image_index is None:
             return
         self.list_view.clearSelection()
-        self.list_view.setCurrentIndex(
+        self.list_view.set_current_image_index(
             self.proxy_image_list_model.index(proxy_image_index, 0))
 
     def get_selected_image_indices(self) -> list[QModelIndex]:

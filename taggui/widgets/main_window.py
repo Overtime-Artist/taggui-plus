@@ -820,7 +820,7 @@ class MainWindow(QMainWindow):
         row_count = self.proxy_image_list_model.rowCount()
         if row_count:
             select_index = max(0, min(select_index, row_count - 1))
-        self.image_list.list_view.setCurrentIndex(
+        self.image_list.list_view.set_current_image_index(
             self.proxy_image_list_model.index(select_index, 0))
         self.centralWidget().setCurrentWidget(self.image_viewer)
         self.reload_directory_action.setDisabled(False)
@@ -1679,11 +1679,11 @@ class MainWindow(QMainWindow):
                 getattr(self, '_image_path_before_filter', None))
             if select_index is None:
                 select_index = self.settings.value('image_index', type=int) or 0
-            self.image_list.list_view.setCurrentIndex(
+            self.image_list.list_view.set_current_image_index(
                 self.proxy_image_list_model.index(select_index, 0))
         else:
             # Select the first image.
-            self.image_list.list_view.setCurrentIndex(
+            self.image_list.list_view.set_current_image_index(
                 self.proxy_image_list_model.index(0, 0))
 
     def _find_proxy_row_of_image(self, image_path) -> int | None:
