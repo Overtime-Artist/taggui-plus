@@ -409,6 +409,16 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent):
         """Save the window geometry and state before closing."""
+        # Closing while the captioning thread runs would destroy it mid-run and
+        # crash the app. Cancel it and close once it has stopped instead.
+        if self.auto_captioner.is_captioning:
+            event.ignore()
+            if not getattr(self, '_close_after_captioning', False):
+                self._close_after_captioning = True
+                self.auto_captioner.cancel_captioning()
+                self.auto_captioner.update_console_text_edit(
+                    'TagGUI Plus will close as soon as captioning stops.')
+            return
         # When removing app data for an uninstall, skip every save so nothing
         # that was just deleted (settings, completion store, etc.) is recreated.
         if self.is_removing_app_data:
@@ -892,6 +902,12 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def select_and_load_directory(self):
+        if self.auto_captioner.is_captioning:
+            QMessageBox.information(
+                self, 'Auto-captioning in progress',
+                'Cancel or finish auto-captioning before loading another '
+                'folder.')
+            return
         initial_directory = (str(self.directory_path)
                              if self.directory_path else '')
         load_directory_path = QFileDialog.getExistingDirectory(
@@ -943,6 +959,10 @@ class MainWindow(QMainWindow):
         if structure_changed:
             self.image_list.apply_current_sort()
             self.tag_counter_model.count_tags(self.image_list_model.images)
+            # Rebuild the grid from the current selection now, so the cell
+            # refresh below doesn't work from rows that have since moved.
+            if self.image_viewer.is_grid_mode():
+                self._sync_variant_group_view()
         if not changed_rows:
             return
         if self.image_viewer.is_grid_mode():
@@ -1678,17 +1698,21 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def update_undo_and_redo_actions(self):
+        # Undo/redo are unavailable while auto-captioning runs: undoing part
+        # way through would roll back some captions while the rest kept being
+        # written with no way to undo them.
+        is_captioning = self.auto_captioner.is_captioning
         if self.image_list_model.undo_stack:
             undo_action_name = self.image_list_model.undo_stack[-1].action_name
             self.undo_action.setText(f'Undo "{undo_action_name}"')
-            self.undo_action.setDisabled(False)
+            self.undo_action.setDisabled(is_captioning)
         else:
             self.undo_action.setText('Undo')
             self.undo_action.setDisabled(True)
         if self.image_list_model.redo_stack:
             redo_action_name = self.image_list_model.redo_stack[-1].action_name
             self.redo_action.setText(f'Redo "{redo_action_name}"')
-            self.redo_action.setDisabled(False)
+            self.redo_action.setDisabled(is_captioning)
         else:
             self.redo_action.setText('Redo')
             self.redo_action.setDisabled(True)
@@ -1762,6 +1786,14 @@ class MainWindow(QMainWindow):
             self._sync_variant_group_view)
         self.image_list_selection_model.currentChanged.connect(
             self._sync_variant_group_view)
+        # The grid holds row positions, and rows can be removed, added or
+        # reordered without the selection signals firing (e.g. a refresh that
+        # removes a selected file), so rebuild it whenever the rows change.
+        for signal in (self.proxy_image_list_model.rowsRemoved,
+                       self.proxy_image_list_model.rowsInserted,
+                       self.proxy_image_list_model.layoutChanged,
+                       self.proxy_image_list_model.modelReset):
+            signal.connect(self._schedule_variant_group_resync)
         self.image_list_model.dataChanged.connect(
             lambda: self.tag_counter_model.count_tags(
                 self.image_list_model.images))
@@ -1925,6 +1957,20 @@ class MainWindow(QMainWindow):
         self.image_tags_editor.tag_input_box.add_new_tags_to_library(
             new_implied)
         return tags_to_add + new_implied
+
+    @Slot()
+    def _schedule_variant_group_resync(self, *args):
+        if (not self.image_viewer.is_grid_mode()
+                or getattr(self, '_is_variant_group_resync_pending', False)):
+            return
+        self._is_variant_group_resync_pending = True
+
+        def resync():
+            self._is_variant_group_resync_pending = False
+            if self.image_viewer.is_grid_mode():
+                self._sync_variant_group_view()
+
+        QTimer.singleShot(0, resync)
 
     @Slot()
     def _sync_variant_group_view(self, *args):
@@ -2457,6 +2503,12 @@ class MainWindow(QMainWindow):
 
     def connect_auto_captioner_signals(self):
         self.auto_captioner.captioning_started.connect(
+            self.update_undo_and_redo_actions)
+        self.auto_captioner.captioning_finished.connect(
+            self.update_undo_and_redo_actions)
+        self.auto_captioner.captioning_finished.connect(
+            self._close_if_waiting_for_captioning)
+        self.auto_captioner.captioning_started.connect(
             self.clear_pending_auto_caption_category_tags)
         self.auto_captioner.captioning_started.connect(
             self.image_tags_editor.begin_auto_caption_run)
@@ -2475,6 +2527,12 @@ class MainWindow(QMainWindow):
         self.auto_captioner.visibilityChanged.connect(
             lambda: self.toggle_auto_captioner_action.setChecked(
                 self.auto_captioner.isVisible()))
+
+    @Slot()
+    def _close_if_waiting_for_captioning(self):
+        if getattr(self, '_close_after_captioning', False):
+            self._close_after_captioning = False
+            QTimer.singleShot(0, self.close)
 
     @Slot(QModelIndex, str, list, str)
     def handle_auto_caption_generated(self, image_index: QModelIndex,

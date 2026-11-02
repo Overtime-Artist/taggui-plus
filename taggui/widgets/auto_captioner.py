@@ -11,7 +11,8 @@ from PySide6.QtWidgets import (QComboBox, QDockWidget, QFormLayout,
                                QScrollArea, QVBoxLayout, QWidget)
 
 from auto_captioning.auto_captioning_model import release_memory
-from auto_captioning.captioning_thread import CaptioningThread
+from auto_captioning.captioning_thread import (CaptioningThread,
+                                               get_generated_caption_data)
 from auto_captioning.models.wd_tagger import WdTagger
 from auto_captioning.models.pixai_tagger import (PixAiTagger,
                                                  supports_precision_selection)
@@ -763,13 +764,17 @@ class AutoCaptioner(QDockWidget):
     @Slot()
     def start_or_cancel_captioning(self):
         if self.is_captioning:
-            # Cancel captioning.
-            self.captioning_thread.is_canceled = True
-            self.set_start_cancel_button_enabled(False)
-            self.set_start_cancel_button_text('Canceling Auto-Captioning...')
+            self.cancel_captioning()
         else:
             # Start captioning.
             self.generate_captions()
+
+    def cancel_captioning(self):
+        if not self.is_captioning or self.captioning_thread is None:
+            return
+        self.captioning_thread.is_canceled = True
+        self.set_start_cancel_button_enabled(False)
+        self.set_start_cancel_button_text('Canceling Auto-Captioning...')
 
     def set_is_captioning(self, is_captioning: bool):
         self.is_captioning = is_captioning
@@ -849,10 +854,27 @@ class AutoCaptioner(QDockWidget):
         self._has_shown_device_warning = True
         QMessageBox.warning(self, 'Running on CPU', message)
 
-    @Slot(QModelIndex, str, list, str)
-    def forward_caption_generated(self, image_index: QModelIndex,
-                                  caption: str, tags: list[str],
-                                  natural_language_prompt: str):
+    @Slot(object, str)
+    def forward_caption_generated(self, image_path: Path, caption: str):
+        # Find where the image is now: the list may have been refreshed,
+        # re-sorted or replaced since captioning started.
+        image_index = None
+        image = None
+        for row, candidate in enumerate(self.image_list_model.images):
+            if candidate.path == image_path:
+                image_index = self.image_list_model.index(row, 0)
+                image = candidate
+                break
+        if image is None:
+            self.update_console_text_edit(
+                f'{image_path.name} is no longer in the image list, so its '
+                f'caption was not saved.')
+            return
+        caption_settings = self.captioning_thread.caption_settings
+        tags, natural_language_prompt = get_generated_caption_data(
+            image, caption, caption_settings['caption_destination'],
+            caption_settings['caption_position'],
+            caption_settings['natural_language_position'])
         self.caption_generated.emit(image_index, caption, tags,
                                     natural_language_prompt)
 
@@ -897,6 +919,16 @@ class AutoCaptioner(QDockWidget):
 
     def generate_captions(self):
         selected_image_indices = self.image_list.get_selected_image_indices()
+        if not selected_image_indices:
+            QMessageBox.information(
+                self, 'No images selected',
+                'Select one or more images to caption.')
+            return
+        # Caption in the order shown in the Images pane, not the order the
+        # images were selected in.
+        proxy_model = self.image_list.proxy_image_list_model
+        selected_image_indices.sort(
+            key=lambda index: proxy_model.mapFromSource(index).row())
         selected_image_count = len(selected_image_indices)
         show_alert_when_finished = False
         if selected_image_count > 1:
@@ -945,8 +977,11 @@ class AutoCaptioner(QDockWidget):
             defaultValue=DEFAULT_SETTINGS['models_directory_path'], type=str)
         models_directory_path = (Path(models_directory_path)
                                  if models_directory_path else None)
+        selected_images = [
+            self.image_list_model.data(index, Qt.ItemDataRole.UserRole)
+            for index in selected_image_indices]
         self.captioning_thread = CaptioningThread(
-            self, self.image_list_model, selected_image_indices,
+            self, self.image_list_model, selected_images,
             caption_settings, tag_separator, models_directory_path)
         self.captioning_thread.text_outputted.connect(
             self.update_console_text_edit)
