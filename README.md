@@ -362,6 +362,11 @@ The scrollable list of thumbnails for the loaded folder.
   under a thumbnail are colored by their category.
 - Select multiple images with `Ctrl`/`Shift`+click to edit or caption them as a
   batch.
+- **Use images outside the app:** right-click → **`Copy Image to Clipboard`**
+  (`Ctrl`+`Shift`+`I`) copies the current image itself, ready to paste into a
+  chat or image editor. You can also **drag** thumbnails out of the list into a
+  file upload field or folder; dragging always copies the files and never moves
+  them out of your dataset.
 
 <p align='center'>
   <img src='images/TagGUI_Images_Pane.png' alt='TagGUI Plus Images Pane'>
@@ -374,6 +379,7 @@ The large view of the currently selected image.
 - **Zoom** with the mouse wheel or `Ctrl`+`+` / `Ctrl`+`-`.
 - **Pan** a zoomed image by dragging, or with `Alt`+arrow keys.
 - **Reset** the view by double-clicking or pressing `Ctrl`+`0`.
+- **Right-click** the image to copy it to the clipboard.
 - Select **multiple images** to switch the preview into a **synchronized grid**:
   zooming, panning, and resetting apply to every cell at once. The current image
   is outlined in blue; press `Left` / `Right` to move through the selection. See
@@ -498,6 +504,8 @@ vocabulary — the source of autocomplete and category coloring.
   `replacement`). Apply a profile to swap every matching tag across the loaded
   directory in one step, or revert it to change those tags back — handy for
   switching a folder between different tag vocabularies or naming conventions.
+  All mappings apply at once (so swapping two tags works), and a mapping with
+  an **empty replacement removes** that tag.
 
 <p align='center'>
   <img src='images/TagGUI_Tag_Library.png' alt='TagGUI Plus Tag Library'>
@@ -508,18 +516,25 @@ vocabulary — the source of autocomplete and category coloring.
 **`Edit` → `Find and Replace…`** (`Ctrl`+`R`). Batch-replace text in tags and
 captions.
 
-- **Scope:** current image, all selected images, or the entire folder.
+- **Scope:** all images, the images shown by the current filter, or the
+  selected images.
 - **`Whole tags only`** matches complete tags as units (leave the replace box
   empty to *delete* matching tags, or fill it to *rename* them).
+- Otherwise text is found and replaced **inside each tag**. Only find text that
+  contains your tag separator (a comma by default) can match across neighbouring tags.
+  A replacement containing the separator splits into separate tags.
 - **`Use regex for find text`** enables regular-expression patterns.
 - The button shows a live count of how many instances will change.
 
 ### Batch Reorder Tags
 
-**`Edit` → `Batch Reorder Tags…`** (`Ctrl`+`B`). Reorder tags across all
-selected images in one action:
+**`Edit` → `Batch Reorder Tags…`** (`Ctrl`+`B`). Reorder tags across many
+images in one action. The **Scope** option picks all images, the images shown
+by the current filter, or the selected images; the default-reorder shortcut
+below uses the same scope.
 
-- Sort **alphabetically**, by **frequency**, or by **category order**.
+- Sort **alphabetically** (ignoring upper/lower case), by **frequency**, or by
+  **category order**.
 - **Reverse** or **shuffle** the tag order.
 - **Move specific tags to the front** (comma-separated).
 - Optionally **keep the first tag fixed** during any operation.
@@ -741,6 +756,10 @@ small **amber dot** in the tag list (in both the single-image and grouped views)
 so you can review what changed at a glance. Selecting a flagged tag clears its
 dot.
 
+You can keep working while captioning runs, but **Undo/Redo are unavailable**
+until it finishes, and loading another folder asks you to cancel or wait first.
+Closing the app cancels the run.
+
 ### Supported models
 
 TagGUI Plus supports two kinds of models:
@@ -873,7 +892,12 @@ Click a tag in the **All Tags** pane to filter for it, or type a filter in the
 - `complete:` — completion state (`complete:true`, `complete:false`)
 - `name:` — the term appears in the file name
 - `path:` — the term appears in the full file path
+- `category:` — the image has a tag in a category whose name contains the term
+  (`category:character`); `category:none` or `category:uncategorized` finds
+  images with a tag that has no category
 - No prefix — matches the caption **or** file path
+
+Matching ignores upper/lower case.
 
 **Numeric prefixes** (operators `=`/`==`, `!=`, `<`, `>`, `<=`, `>=`)
 
@@ -976,7 +1000,9 @@ shortcuts`**; the defaults are listed below.
 - Switch between selected images without changing the selection: `Left` /
   `Right`
 - Mark complete / incomplete: `Ctrl`+`K` / `Ctrl`+`Shift`+`K`
-- **Right-click menu:** copy tags/caption/name/path, paste tags, open image or
+- Copy the current image to the clipboard: `Ctrl`+`Shift`+`I`; drag thumbnails
+  out to copy the files elsewhere
+- **Right-click menu:** copy tags/caption/name/path/image, paste tags, open image or
   caption file, open in your configured editor, rename the image file, move or
   copy images to another folder, delete images, and mark complete/incomplete.
   When several images are selected, the open/rename actions target the **current**
