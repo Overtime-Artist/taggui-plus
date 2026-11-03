@@ -522,6 +522,30 @@ using perceptual hashing and shows each group side by side.
 - For each group you **keep one image**; the rest can be sent to the **Recycle
   Bin/Trash**, **moved to a folder**, or **tagged as `duplicate`** for later
   review.
+- **Keep in each group** picks the kept image automatically: *Largest
+  resolution*, *Largest file*, *Newest file*, *Oldest file* or *Most tags*.
+  *Newest* and *Oldest* compare each file's **modified** date, which is shown
+  on every image. **Apply to all groups** replaces any picks you made by hand
+  and skips groups marked *Ignore this group*.
+- **Copy the tags of the other images to the kept image** adds any tags the
+  kept image is missing (at the end of its tag list) before the others are
+  deleted, moved or tagged.
+- Each image is labelled with how it relates to the kept one: **Identical
+  file** means byte-for-byte the same file; **Looks identical** or **Differs
+  by N** compare a 256-bit visual fingerprint, where N is how many of those
+  bits differ (lower = more alike).
+- Mouse-wheel scrolling over a group's row scrolls the results list; use
+  `Shift`+wheel (or sideways scrolling on a touchpad) to scroll along the row.
+- **Click a thumbnail** to open the group in a larger viewer:
+  - Zoom with the mouse wheel, `+`/`-` or the main window's zoom keys
+    (`Ctrl`+`+`, `Ctrl`+`-`), drag to pan, and press `0`/`Ctrl`+`0` or
+    double-click to reset the zoom. The zoom level is kept when moving between
+    images, so you can compare the same detail.
+  - `←`/`→` move between the group's images, `G` toggles a grid of the whole
+    group (in the grid, double-click or `Enter` opens an image; if the grid is
+    zoomed, the first double-click only resets the zoom), `K` or `Enter` keeps
+    the shown image, `F11` toggles full screen and `Esc` leaves full screen or
+    closes the viewer.
 
 > [!WARNING]
 > The strictness slider is **very sensitive to variant sets** — groups of images

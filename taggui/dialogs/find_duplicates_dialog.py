@@ -9,6 +9,7 @@ the kept image first.
 """
 
 import itertools
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject,
@@ -154,6 +155,47 @@ def _format_size(num_bytes) -> str:
             return f'{size:.1f} {unit}'
         size /= 1024
     return f'{size:.1f} GB'
+
+
+def _format_modified(mtime_ns) -> str:
+    """Return the file's modified date (what "Newest file" and "Oldest file"
+    compare), e.g. 'Modified 2024-05-01 14:32'."""
+    if mtime_ns is None:
+        return 'Modified ?'
+    try:
+        stamp = datetime.fromtimestamp(mtime_ns / 1e9)
+    except (OverflowError, OSError, ValueError):
+        return 'Modified ?'
+    return f'Modified {stamp:%Y-%m-%d %H:%M}'
+
+
+class _VerticalWheelForwarder(QObject):
+    """Sends plain vertical mouse-wheel scrolling over a group's row of cards
+    (including its horizontal scroll bar) to the results list, so scrolling
+    down the results never gets caught by a row that slides under the cursor.
+    Shift+wheel and sideways (touchpad) scrolling scroll the row."""
+
+    def __init__(self, target_scroll_area: QScrollArea, row_scroll_area:
+                 QScrollArea, parent=None):
+        super().__init__(parent)
+        self.target_scroll_area = target_scroll_area
+        self.row_scroll_area = row_scroll_area
+
+    def eventFilter(self, watched, event):
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        delta = event.angleDelta()
+        if delta.x() != 0 or delta.y() == 0:
+            return False
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            bar = self.row_scroll_area.horizontalScrollBar()
+            steps = (-delta.y() / 120 * QApplication.wheelScrollLines()
+                     * bar.singleStep())
+            bar.setValue(bar.value() + round(steps))
+            return True
+        QApplication.sendEvent(self.target_scroll_area.verticalScrollBar(),
+                               event)
+        return True
 
 
 class DuplicateScanner(QObject, QRunnable):
@@ -335,23 +377,20 @@ def choose_keeper(members: list, rule: str, tag_counts: dict):
     return best
 
 
-def describe_relation(member, keeper) -> tuple[str, str]:
-    """Return a short label (and tooltip) describing how `member` compares
-    with the kept image."""
+def describe_relation(member, keeper) -> str:
+    """Return a short label describing how `member` compares with the kept
+    image ("Differs by N" counts differing bits of the 256-bit visual
+    fingerprint; see the README)."""
     if member is keeper:
-        return 'Kept', 'This is the image that will be kept.'
+        return 'Kept'
     if member.sha256 is not None and member.sha256 == keeper.sha256:
-        return ('Identical file',
-                'Byte-for-byte the same file as the kept image.')
+        return 'Identical file'
     if member.dhash is None or keeper.dhash is None:
-        return '', ''
+        return ''
     distance = hamming_distance(member.dhash, keeper.dhash)
-    tooltip = ('How many of the 256 bits of the visual fingerprint differ '
-               'from the kept image. 0 means it looks identical; higher '
-               'numbers mean bigger visual differences.')
     if distance == 0:
-        return 'Looks identical', tooltip
-    return f'Differs by {distance}', tooltip
+        return 'Looks identical'
+    return f'Differs by {distance}'
 
 
 class FindDuplicatesDialog(QDialog):
@@ -379,13 +418,15 @@ class FindDuplicatesDialog(QDialog):
         _get_thumbnail_emitter().loaded.connect(self._on_thumbnail_loaded)
 
         self.setWindowTitle('Find Duplicates')
-        # Tall enough to show a whole group of cards, but never taller than
-        # the screen.
+        # Roomy enough for several groups of cards, but never bigger than the
+        # screen.
         screen = QApplication.primaryScreen()
-        height = 800
+        width, height = 1120, 900
         if screen is not None:
-            height = min(height, int(screen.availableGeometry().height() * 0.9))
-        self.resize(940, height)
+            available = screen.availableGeometry()
+            width = min(width, int(available.width() * 0.9))
+            height = min(height, int(available.height() * 0.9))
+        self.resize(width, height)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -393,7 +434,8 @@ class FindDuplicatesDialog(QDialog):
         description = QLabel(
             'Finds identical files and near duplicates (resizes, re-saves or '
             'minor edits). In each group, choose the image to keep, then act '
-            'on the others. Deleted images go to the Recycle Bin.')
+            'on the others. Click a thumbnail to view it larger. Deleted '
+            'images go to the Recycle Bin.')
         description.setWordWrap(True)
         layout.addWidget(description)
 
@@ -484,25 +526,14 @@ class FindDuplicatesDialog(QDialog):
         self.keep_rule_combo_box.addItems(KEEP_RULES)
         if self.keep_rule_combo_box.currentText() not in KEEP_RULES:
             self.keep_rule_combo_box.setCurrentText(KEEP_LARGEST_RESOLUTION)
-        self.keep_rule_combo_box.setToolTip(
-            'Which image is picked as the keeper when results appear, or when '
-            'you click "Apply to all groups". You can still pick a different '
-            'image in any group.')
         actions_layout.addWidget(self.keep_rule_combo_box, 0, 1)
         self.apply_rule_button = QPushButton('Apply to all groups')
-        self.apply_rule_button.setToolTip(
-            'Pick the keeper in every group (except ignored ones) using the '
-            'rule on the left. This replaces any keepers you picked by hand.')
         self.apply_rule_button.clicked.connect(self.apply_keep_rule)
         actions_layout.addWidget(self.apply_rule_button, 0, 2)
 
         self.merge_tags_check_box = SettingsBigCheckBox(
             key='duplicate_merge_tags', default=False,
             text='Copy the tags of the other images to the kept image')
-        self.merge_tags_check_box.setToolTip(
-            'Before deleting, moving or tagging the other images, add any of '
-            'their tags that the kept image does not have yet to the end of '
-            'its tag list.')
         actions_layout.addWidget(self.merge_tags_check_box, 1, 0, 1, 5)
 
         actions_layout.addWidget(QLabel('Other images:'), 2, 0)
@@ -715,12 +746,10 @@ class FindDuplicatesDialog(QDialog):
         message = (
             f'Found {len(groups)} duplicate '
             f'{pluralize("group", len(groups))} ({duplicate_total} images) '
-            f'among {self._scanned_count} scanned. '
-            f'Click a thumbnail to enlarge it.')
-        notes = []
+            f'among {self._scanned_count} scanned.')
         remaining = len(groups) - shown
         if remaining > 0:
-            notes.append(f'{shown} groups are shown so far')
+            message += f' Showing {shown}.'
             next_count = min(_MAX_GROUPS_SHOWN, remaining)
             self.show_more_button.setText(
                 f'Show next {next_count} {pluralize("group", next_count)}')
@@ -729,11 +758,8 @@ class FindDuplicatesDialog(QDialog):
             self.show_more_button.hide()
         if max(len(group.members) for group in groups) \
                 > _MAX_MEMBERS_PER_GROUP:
-            notes.append(
-                'some groups are very large, which usually means the '
-                'strictness is too loose \u2014 try dragging the slider left')
-        if notes:
-            message += ' Note: ' + '; '.join(notes) + '.'
+            message += (' Some groups are very large; try a stricter '
+                        'setting.')
         self.status_label.setText(message)
 
     def _card_info_text(self, member) -> str:
@@ -747,6 +773,7 @@ class FindDuplicatesDialog(QDialog):
                      else f'{tag_count} {pluralize("tag", tag_count)}')
         return (f'{_elide(member.path.name)}\n'
                 f'{dimensions_text}  \u2022  {_format_size(member.size)}\n'
+                f'{_format_modified(member.mtime_ns)}\n'
                 f'{tags_text}')
 
     def _build_card(self, member, group_cards) -> tuple:
@@ -1065,6 +1092,21 @@ _OVERLAY_HIDE_DELAY_MS = 2500
 _OVERLAY_MARGIN = 10
 
 
+def _main_window_key_sequences(widget, shortcut_id: str,
+                               attribute: str) -> list[QKeySequence] | None:
+    """Return the keys the main window currently uses for one of its
+    QShortcut-based actions (including any extra bindings), or None when no
+    ancestor of ``widget`` has that shortcut."""
+    window = widget
+    while window is not None and not hasattr(window, attribute):
+        window = window.parentWidget()
+    if window is None:
+        return None
+    shortcuts = [getattr(window, attribute)]
+    shortcuts += getattr(window, '_extra_qshortcuts', {}).get(shortcut_id, [])
+    return [shortcut.key() for shortcut in shortcuts]
+
+
 class _PreviewDialog(QDialog):
     """Large viewer for a duplicate group, built on the main image viewer:
     zoom (mouse wheel, + / -), pan (drag) and double-click to reset, a
@@ -1083,6 +1125,7 @@ class _PreviewDialog(QDialog):
         self.index = index
         self._grid = False
         self._was_maximized = False
+        self._zoomed_at_double_click = False
         members = [member for _radio, member in radio_members]
         self.model = _GroupImagesModel(members, thumbnails or {}, self)
 
@@ -1151,6 +1194,7 @@ class _PreviewDialog(QDialog):
         self.viewer.scroll_area.reset_requested.connect(
             self._on_double_click)
 
+        own_keys = []
         for key, slot in (
                 (Qt.Key.Key_Left, lambda: self._step(-1)),
                 (Qt.Key.Key_Right, lambda: self._step(1)),
@@ -1162,9 +1206,32 @@ class _PreviewDialog(QDialog):
                 (Qt.Key.Key_Plus, self.viewer.zoom_in),
                 (Qt.Key.Key_Equal, self.viewer.zoom_in),
                 (Qt.Key.Key_Minus, self.viewer.zoom_out),
-                (Qt.Key.Key_0, self.viewer.reset_view)):
-            shortcut = QShortcut(QKeySequence(key), self)
-            shortcut.activated.connect(slot)
+                (Qt.Key.Key_0, self.viewer.reset_view),
+                (Qt.Key.Key_Escape, None)):
+            sequence = QKeySequence(key)
+            own_keys.append(sequence.toString())
+            if slot is not None:
+                QShortcut(sequence, self).activated.connect(slot)
+        # The main window's zoom keys (Ctrl+0 / Ctrl++ / Ctrl+- unless
+        # customized) work here too. A key is never bound twice, since Qt
+        # ignores a key that two shortcuts share.
+        for shortcut_id, attribute, slot, defaults in (
+                ('reset_image_zoom', 'reset_image_zoom_shortcut',
+                 self.viewer.reset_view, ['Ctrl+0']),
+                ('zoom_in', 'zoom_in_shortcut', self.viewer.zoom_in,
+                 ['Ctrl++', 'Ctrl+=']),
+                ('zoom_out', 'zoom_out_shortcut', self.viewer.zoom_out,
+                 ['Ctrl+-'])):
+            sequences = _main_window_key_sequences(parent, shortcut_id,
+                                                   attribute)
+            if sequences is None:
+                sequences = [QKeySequence(text) for text in defaults]
+            for sequence in sequences:
+                text = sequence.toString()
+                if sequence.isEmpty() or text in own_keys:
+                    continue
+                own_keys.append(text)
+                QShortcut(sequence, self).activated.connect(slot)
 
         screen = self.screen() or QApplication.primaryScreen()
         available = screen.availableGeometry()
@@ -1207,15 +1274,24 @@ class _PreviewDialog(QDialog):
                 return member
         return None
 
-    def _show_current(self):
-        """Show the current image, in the single-image or the grid view."""
+    def _show_current(self, keep_zoom: bool = False):
+        """Show the current image, in the single-image or the grid view.
+        With ``keep_zoom`` a zoomed-in view keeps its zoom and position, so
+        the same detail can be compared across the group."""
         if self._grid:
             self.viewer.update_grid_current(self._indices(), self.index,
                                             self._grid_cell_cap())
         else:
             self.viewer.exit_grid()
-            self.viewer.load_image(self.model.index(self.index))
+            index = self.model.index(self.index)
+            if keep_zoom and not self._at_fit_zoom():
+                self.viewer.reload_image(index)
+            else:
+                self.viewer.load_image(index)
         self._update_info()
+
+    def _at_fit_zoom(self) -> bool:
+        return abs(self.viewer.zoom_factor - 1.0) < 1e-9
 
     def _update_info(self):
         _radio, member = self.radio_members[self.index]
@@ -1230,9 +1306,10 @@ class _PreviewDialog(QDialog):
             parts.append(f'{width}\u00d7{height}')
         if member.size is not None:
             parts.append(_format_size(member.size))
+        parts.append(_format_modified(member.mtime_ns))
         kept = self._kept_member()
         if kept is not None:
-            relation, _tooltip = describe_relation(member, kept)
+            relation = describe_relation(member, kept)
             if relation:
                 parts.append(relation)
         self.details_label.setText('  \u2022  '.join(parts))
@@ -1262,7 +1339,7 @@ class _PreviewDialog(QDialog):
         if len(self.radio_members) < 2:
             return
         self.index = (self.index + delta) % len(self.radio_members)
-        self._show_current()
+        self._show_current(keep_zoom=True)
         self._show_overlays()
 
     def _keep_current(self):
@@ -1297,7 +1374,9 @@ class _PreviewDialog(QDialog):
             self._show_current()
 
     def _on_double_click(self):
-        if self._grid:
+        # In a zoomed grid, a double-click only resets the zoom (the viewer
+        # does that itself); once the whole grid fits, it opens the cell.
+        if self._grid and not self._zoomed_at_double_click:
             # The first click of the double-click already made the cell
             # under the cursor current.
             QTimer.singleShot(0, lambda: self._open_in_single_view(
@@ -1319,6 +1398,9 @@ class _PreviewDialog(QDialog):
                 self.showNormal()
         else:
             self._was_maximized = self.isMaximized()
+            # Without this, QDialog re-centres itself when shown and lands a
+            # few pixels off the monitor, so the Windows taskbar stays on top.
+            self.setAttribute(Qt.WidgetAttribute.WA_Moved, True)
             self.showFullScreen()
         self._update_info()
         self._show_overlays()
@@ -1372,7 +1454,10 @@ class _PreviewDialog(QDialog):
 
     def eventFilter(self, watched, event):
         event_type = event.type()
-        if event_type == QEvent.Type.MouseMove:
+        if event_type == QEvent.Type.MouseButtonDblClick:
+            # Seen before the viewer resets the zoom for the same event.
+            self._zoomed_at_double_click = not self._at_fit_zoom()
+        elif event_type == QEvent.Type.MouseMove:
             if not all(overlay.isVisible() for overlay in self.overlays):
                 self._show_overlays()
             else:
@@ -1438,6 +1523,11 @@ class _GroupCards:
         self.cards_scroll.viewport().setAutoFillBackground(False)
         self.cards_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._wheel_forwarder = _VerticalWheelForwarder(
+            dialog.results_scroll_area, self.cards_scroll, self.box)
+        self.cards_scroll.viewport().installEventFilter(self._wheel_forwarder)
+        self.cards_scroll.horizontalScrollBar().installEventFilter(
+            self._wheel_forwarder)
         box_layout.addWidget(self.cards_scroll)
         self._populate()
 
@@ -1508,10 +1598,9 @@ class _GroupCards:
     def update_relations(self):
         """Refresh the "Kept" / "Differs by N" label on every shown card."""
         for relation_label, _info_label, member in self.card_labels:
-            text, tooltip = describe_relation(member, self.keep_member)
+            text = describe_relation(member, self.keep_member)
             relation_label.setText(f'<b>{text}</b>' if member
                                    is self.keep_member else text)
-            relation_label.setToolTip(tooltip)
         for card, member in self.cards:
             card.set_kept(member is self.keep_member)
 
