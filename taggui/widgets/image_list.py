@@ -628,6 +628,16 @@ class ImageListView(ElidedToolTipListView):
         self.mark_incomplete_action.setShortcut('Ctrl+Shift+K')
         self.mark_incomplete_action.triggered.connect(
             lambda: self.set_selected_images_complete(False))
+        self.mark_tags_unviewed_action = self.addAction(
+            'Mark Tags as Unviewed')
+        self.mark_tags_unviewed_action.setShortcut('Ctrl+U')
+        self.mark_tags_unviewed_action.triggered.connect(
+            lambda: self.set_selected_images_tags_unviewed(True))
+        self.clear_unviewed_markers_action = self.addAction(
+            'Clear Unviewed Tag Markers')
+        self.clear_unviewed_markers_action.setShortcut('Ctrl+Shift+U')
+        self.clear_unviewed_markers_action.triggered.connect(
+            lambda: self.set_selected_images_tags_unviewed(False))
         self.select_all_images_action = self.addAction('Select All Images')
         self.select_all_images_action.setShortcut('Ctrl+A')
         # Scope Ctrl+A to the Images pane so it doesn't fire window-wide. Without
@@ -660,6 +670,8 @@ class ImageListView(ElidedToolTipListView):
         self.context_menu.addSeparator()
         self.context_menu.addAction(self.mark_complete_action)
         self.context_menu.addAction(self.mark_incomplete_action)
+        self.context_menu.addAction(self.mark_tags_unviewed_action)
+        self.context_menu.addAction(self.clear_unviewed_markers_action)
         self.selectionModel().selectionChanged.connect(
             self.update_context_menu_actions)
         # The current image can change within a selection (arrow keys), and
@@ -1088,6 +1100,18 @@ class ImageListView(ElidedToolTipListView):
         self.proxy_image_list_model.sourceModel().set_images_complete(
             selected_image_indices, is_complete)
 
+    def set_selected_images_tags_unviewed(self, unviewed: bool):
+        """Add or remove the amber "unviewed" dot on every tag of the
+        selected images."""
+        images = self.get_selected_images()
+        if not images:
+            return
+        model = self.proxy_image_list_model.sourceModel()
+        if unviewed:
+            model.mark_tags_unviewed(images)
+        else:
+            model.clear_unviewed_tags(images)
+
     @Slot()
     def paste_tags(self):
         # Text copied from several images has one caption per line.
@@ -1359,6 +1383,9 @@ class ImageListView(ElidedToolTipListView):
         self.mark_incomplete_action.setText(mark_incomplete_action_name)
         self.mark_complete_action.setVisible(selected_image_count > 0)
         self.mark_incomplete_action.setVisible(selected_image_count > 0)
+        self.mark_tags_unviewed_action.setVisible(selected_image_count > 0)
+        self.clear_unviewed_markers_action.setVisible(
+            selected_image_count > 0)
 
     def get_shortcut_actions(self) -> dict[str, tuple[str, QAction]]:
         return {
@@ -1384,6 +1411,10 @@ class ImageListView(ElidedToolTipListView):
             'mark_complete': ('Mark as Complete', self.mark_complete_action),
             'mark_incomplete': ('Mark as Incomplete',
                                 self.mark_incomplete_action),
+            'mark_tags_unviewed': ('Mark Tags as Unviewed',
+                                   self.mark_tags_unviewed_action),
+            'clear_unviewed_markers': ('Clear Unviewed Tag Markers',
+                                       self.clear_unviewed_markers_action),
             'select_all_images': ('Select All Images',
                                   self.select_all_images_action)
         }

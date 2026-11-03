@@ -761,7 +761,9 @@ the tag list, so you can review what changed at a glance. Each image remembers
 its dots, even after you switch to other images, until you select the tag (or
 close the app). In the grid view a tag shows a dot if any selected image has
 it flagged, and selecting it there clears the dot for all of them. Renaming a
-flagged tag keeps the dot; deleting it removes the dot.
+flagged tag keeps the dot; deleting it removes the dot. To start a review pass
+on any images, select them and press `Ctrl`+`U` to flag all their tags;
+`Ctrl`+`Shift`+`U` clears the dots.
 
 You can keep working while captioning runs, but **Undo/Redo are unavailable**
 until it finishes, and loading another folder asks you to cancel or wait first.
@@ -1007,11 +1009,15 @@ shortcuts`**; the defaults are listed below.
 - Switch between selected images without changing the selection: `Left` /
   `Right`
 - Mark complete / incomplete: `Ctrl`+`K` / `Ctrl`+`Shift`+`K`
+- Add / clear amber "unviewed" dots on every tag of the selected images (see
+  [Automatic captioning](#automatic-captioning)): `Ctrl`+`U` /
+  `Ctrl`+`Shift`+`U`
 - Copy the current image to the clipboard: `Ctrl`+`Shift`+`I`; drag thumbnails
   out to copy the files elsewhere
 - **Right-click menu:** copy tags/caption/name/path/image, paste tags, open image or
   caption file, open in your configured editor, rename the image file, move or
-  copy images to another folder, delete images, and mark complete/incomplete.
+  copy images to another folder, delete images, mark complete/incomplete, and
+  mark tags as unviewed / clear unviewed tag markers.
   When several images are selected, the open/rename actions target the **current**
   (highlighted) image.
 

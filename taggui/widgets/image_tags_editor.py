@@ -1714,14 +1714,6 @@ class ImageTagsEditor(QDockWidget):
         self.image_list_model.clear_unviewed_tags(self._displayed_images(),
                                                   tags)
 
-    def mark_displayed_tags_unviewed(self):
-        """Put an unviewed marker on every tag of the displayed image(s)."""
-        self.image_list_model.mark_tags_unviewed(self._displayed_images())
-
-    def clear_displayed_unviewed_tags(self):
-        """Remove every unviewed marker from the displayed image(s)."""
-        self.image_list_model.clear_unviewed_tags(self._displayed_images())
-
     def _refresh_group_panel(self, restore_positions: bool = False,
                              renames: dict[str, list[str]] | None = None,
                              saved_order=None):
