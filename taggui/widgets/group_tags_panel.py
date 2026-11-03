@@ -532,6 +532,7 @@ class GroupTagsPanel(QWidget):
             self._show_context_menu)
         self.tag_list.selectionModel().selectionChanged.connect(
             self._on_selection_changed)
+        self.tag_list.clicked.connect(self._on_tag_clicked)
         self.tag_list.edge_navigation.connect(self._on_edge)
         self.tag_list.escape_navigation.connect(
             self.escape_selection_requested)
@@ -826,6 +827,17 @@ class GroupTagsPanel(QWidget):
                 self.tag_list.viewport().update()
                 self.unviewed_tags_viewed.emit(sorted(newly_cleared))
         self.partial_focus_changed.emit(self._selected_difference_tags())
+
+    @Slot(QModelIndex)
+    def _on_tag_clicked(self, index: QModelIndex):
+        # Clicking a tag that was already selected doesn't change the
+        # selection, so clear its marker on the click itself.
+        tag = index.data(Qt.ItemDataRole.DisplayRole)
+        if (tag in self._recently_captioned
+                and self.tag_list.selectionModel().isSelected(index)):
+            self._recently_captioned.discard(tag)
+            self.tag_list.viewport().update()
+            self.unviewed_tags_viewed.emit([tag])
 
     def set_recently_captioned(self, tags):
         """Show unviewed markers on the given tags and repaint."""

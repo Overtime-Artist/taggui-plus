@@ -712,6 +712,19 @@ class ImageTagsList(ElidedToolTipListView):
         self._recently_captioned: set[str] = set()
         self.selectionModel().selectionChanged.connect(
             self._clear_captioned_markers_on_selection)
+        # Clicking a tag that was already selected (e.g. it was marked
+        # unviewed while selected) doesn't change the selection, so clear its
+        # marker on the click itself.
+        self.clicked.connect(self._clear_captioned_marker_on_click)
+
+    @Slot(QModelIndex)
+    def _clear_captioned_marker_on_click(self, index: QModelIndex):
+        tag = index.data(Qt.ItemDataRole.DisplayRole)
+        if (tag in self._recently_captioned
+                and self.selectionModel().isSelected(index)):
+            self._recently_captioned.discard(tag)
+            self.viewport().update()
+            self.unviewed_tags_viewed.emit([tag])
 
     def set_recently_captioned(self, tags):
         """Show unviewed markers on the given tags and repaint."""

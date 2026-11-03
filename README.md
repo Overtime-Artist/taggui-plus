@@ -759,7 +759,8 @@ image runs immediately without this prompt.
 Tags the captioner **adds** to an image are flagged with a small **amber dot** in
 the tag list, so you can review what changed at a glance. Each image remembers
 its dots, even after you switch to other images, until you select the tag (or
-close the app). In the grid view a tag shows a dot if any selected image has
+close the app). Clicking an already-selected dotted tag also clears its dot. In
+the grid view a tag shows a dot if any selected image has
 it flagged, and selecting it there clears the dot for all of them. Renaming a
 flagged tag keeps the dot; deleting it removes the dot. To start a review pass
 on any images, select them and press `Ctrl`+`U` to flag all their tags;
