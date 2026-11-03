@@ -21,6 +21,7 @@ from transformers import AutoTokenizer
 from dialogs.batch_reorder_tags_dialog import (BatchReorderTagsDialog,
                                                apply_batch_reorder)
 from dialogs.danbooru_wiki_dialog import DanbooruWikiDialog
+from dialogs import directory_analytics_dialog
 from dialogs.directory_analytics_dialog import DirectoryAnalyticsDialog
 from dialogs.export_settings_dialog import ExportSettingsDialog
 from dialogs.find_and_replace_dialog import FindAndReplaceDialog
@@ -128,6 +129,8 @@ class MainWindow(QMainWindow):
         # The path of the currently loaded directory. This is set later when a
         # directory is loaded.
         self.directory_path = None
+        # The open (modeless) Directory Analytics dialog, if any.
+        self._directory_analytics_dialog = None
         # Tracks an in-flight background refresh (RefreshScanner) so re-focusing
         # the window repeatedly does not start overlapping scans.
         self._refresh_scanner = None
@@ -794,7 +797,13 @@ class MainWindow(QMainWindow):
         # `self.directory_path`); otherwise, for folders on mapped network
         # drives or reached through links, every refresh would see all images
         # as removed and re-added.
-        self.directory_path = path.resolve()
+        new_directory_path = path.resolve()
+        # An open Directory Analytics report describes the old folder; reloading
+        # the same folder keeps it open.
+        if new_directory_path != self.directory_path:
+            self._close_directory_analytics_dialog()
+        self.directory_path = new_directory_path
+        self.directory_analytics_action.setEnabled(True)
         if save_path_to_settings:
             self.settings.setValue('directory_path', str(self.directory_path))
         self.setWindowTitle(path.name)
@@ -810,6 +819,7 @@ class MainWindow(QMainWindow):
         previous_path, previous_title, was_saved = (
             self._directory_state_before_load)
         self.directory_path = previous_path
+        self.directory_analytics_action.setEnabled(previous_path is not None)
         self.setWindowTitle(previous_title)
         if was_saved:
             # Never save an empty path: on the next launch `Path('')` would
@@ -1507,10 +1517,44 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def show_directory_analytics_dialog(self):
-        directory_analytics_dialog = DirectoryAnalyticsDialog(
+        # Modeless, so the user can keep working while it is open; reuse an
+        # open one rather than stacking several.
+        dialog = self._directory_analytics_dialog
+        if dialog is not None:
+            dialog.showNormal()
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        dialog = DirectoryAnalyticsDialog(
             parent=self, image_list_model=self.image_list_model,
-            directory_path=self.directory_path)
-        directory_analytics_dialog.exec()
+            directory_path=self.directory_path,
+            select_image_callback=self._select_image_from_analytics)
+        self._directory_analytics_dialog = dialog
+
+        def forget_dialog():
+            if self._directory_analytics_dialog is dialog:
+                self._directory_analytics_dialog = None
+            dialog.deleteLater()
+
+        dialog.finished.connect(forget_dialog)
+        dialog.show()
+
+    def _close_directory_analytics_dialog(self):
+        if self._directory_analytics_dialog is not None:
+            self._directory_analytics_dialog.reject()
+
+    def _select_image_from_analytics(self, image_path) -> str:
+        """Select ``image_path`` in the Images pane for Directory Analytics."""
+        target = Path(image_path)
+        if not any(image.path == target
+                   for image in self.image_list_model.images):
+            return directory_analytics_dialog.NOT_LOADED
+        proxy_row = self._find_proxy_row_of_image(target)
+        if proxy_row is None:
+            return directory_analytics_dialog.HIDDEN_BY_FILTER
+        self.image_list.list_view.set_current_image_index(
+            self.proxy_image_list_model.index(proxy_row, 0))
+        return directory_analytics_dialog.SELECTED
 
     @Slot()
     def show_batch_reorder_tags_dialog(self):
@@ -1687,6 +1731,9 @@ class MainWindow(QMainWindow):
                                                   parent=self)
         self.directory_analytics_action.triggered.connect(
             self.show_directory_analytics_dialog)
+        # Only available once a folder is loaded (see load_directory).
+        self.directory_analytics_action.setEnabled(
+            self.directory_path is not None)
         tools_menu.addAction(self.directory_analytics_action)
         tools_menu.addSeparator()
         self.tag_library_action = QAction('Tag Library...', parent=self)

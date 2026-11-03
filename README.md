@@ -562,11 +562,20 @@ using perceptual hashing and shows each group side by side.
 
 ### Directory Analytics
 
-**`Tools` → `Directory Analytics…`**. A read-only report on the loaded folder —
-nothing is changed. Tabs cover an **overview** (counts, size, formats),
-**resolution** stats, **captions & tags** coverage, **housekeeping** (orphaned
-or missing caption files), and a **per-subfolder** breakdown. Results can be
-exported to CSV or Markdown.
+**`Tools` → `Directory Analytics…`** (available once a folder is loaded). A
+read-only report on the loaded folder — nothing is changed. Tabs cover an
+**overview** (counts, size, formats), **resolution** stats, **captions & tags**
+coverage (including images missing a caption file), **housekeeping** (orphaned
+caption files and other non-image files), and a **per-subfolder** breakdown you
+can sort by clicking a column header. Results can be exported to CSV or
+Markdown; listed paths are shown relative to the loaded folder.
+
+The window can stay open while you work. Click a listed image to select it in
+the Images pane (an image hidden by the current filter can't be selected — clear
+the filter first), or a listed non-image file to show it in your file manager.
+The report isn't updated automatically; press **Rescan** after making changes.
+Common system files (`Thumbs.db`, `desktop.ini`, `.DS_Store`) are not counted
+as non-image files.
 
 <p align='center'>
   <img src='images/TagGUI_Directory_Analytics.png' alt='TagGUI Plus Directory Analytics'>
