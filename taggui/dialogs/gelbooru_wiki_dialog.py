@@ -396,9 +396,9 @@ class GelbooruWikiDialog(BaseWikiDialog):
             return
         self._torn_down = True
         # Stop the animated (indeterminate) loading bar first, on the GUI
-        # thread, so its internal timer isn't left running while we block
-        # below waiting for worker threads to finish.
+        # thread, so its internal timer isn't left running after close.
         self.show_status_message('')
+        # Never blocks: running workers are parked until they finish.
         self.stop_all_fetch_threads()
         self.stop_all_autocomplete_threads(wait=True)
         self.search_autocomplete_timer.stop()
@@ -568,7 +568,7 @@ class GelbooruWikiDialog(BaseWikiDialog):
             cleaned = AUTOCOMPLETE_COUNT_SUFFIX_PATTERN.sub('', text).strip()
             if cleaned and cleaned != text:
                 self.search_line_edit.setText(cleaned)
-                return
+                text = cleaned
         trimmed = text.strip()
         if len(trimmed) < 1:
             self.current_autocomplete_query = ''

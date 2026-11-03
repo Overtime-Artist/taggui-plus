@@ -18,31 +18,201 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
 from models.tag_library_model import TagLibraryModel
 from utils.elided_tooltip import (ElidedToolTipComboBox,
                                   ElidedToolTipListWidget)
+from utils.focused_scroll_mixin import FocusedScrollMixin
 from utils.settings import get_tag_separator, get_settings, DEFAULT_SETTINGS
+from utils.settings_widgets import FocusedScrollComboBox
 from utils.utils import get_confirmation_dialog_reply, list_with_and, pluralize
 from utils.tag_filter import TagFilterLineEdit
 from widgets.tag_library_categories_editor import CategoryDialog
+from widgets.image_tags_editor import (CompleterModel, CompleterPopupList,
+                                       TagCompleter)
 from widgets.tag_library_editor import TagLibraryFilterProxyModel
 
 if TYPE_CHECKING:
     from models.image_list_model import ImageListModel
 
 
+class FocusedScrollElidedToolTipComboBox(FocusedScrollMixin,
+                                         ElidedToolTipComboBox):
+    """Only changes selection on mouse wheel when focused, like the other
+    dropdowns in the app."""
+
+
+class LibraryTagCompleter(TagCompleter):
+    """Tag Library tag suggestions for the alias/implication/profile inputs.
+
+    With `multiple=True` only the text after the last comma is completed, and
+    choosing a suggestion keeps everything before it."""
+
+    def __init__(self, model, parent, multiple: bool):
+        super().__init__(model, parent)
+        self.multiple = multiple
+
+    def _split_last(self, text: str) -> tuple[str, str]:
+        if not self.multiple or ',' not in text:
+            return '', text
+        head, _, last = text.rpartition(',')
+        return head + ', ', last
+
+    def splitPath(self, path: str) -> list[str]:
+        segment = self._split_last(path)[1].strip()
+        # The base implementation returns the full completion prefix, not the
+        # given path, so return the segment ourselves (the call still reorders
+        # the candidates for it).
+        super().splitPath(segment)
+        return [segment]
+
+    def pathFromIndex(self, index: QModelIndex) -> str:
+        completion = super().pathFromIndex(index)
+        widget = self.widget()
+        if widget is None:
+            return completion
+        return self._split_last(widget.text())[0] + completion
+
+
+class LibraryTagLineEdit(QLineEdit):
+    """Line edit with optional Tag Library autocomplete.
+
+    Pressing Enter on a highlighted suggestion only fills the field. Qt sends
+    that Enter to the line edit before applying the suggestion, and the line
+    edit would emit `returnPressed` (submitting the row) even though the popup
+    is open."""
+
+    def __init__(self, tag_library_model: TagLibraryModel,
+                 multiple: bool = False, parent=None):
+        super().__init__(parent)
+        self._tag_library_model = tag_library_model
+        self._multiple = multiple
+        self._completer = None
+        self._candidates_stale = True
+        tag_library_model.modelReset.connect(self._mark_candidates_stale)
+
+    def set_autocomplete_enabled(self, enabled: bool):
+        if enabled == (self._completer is not None):
+            return
+        if not enabled:
+            # `setCompleter(None)` deletes the completer the line edit owns.
+            self.setCompleter(None)
+            self._completer = None
+            return
+        model = CompleterModel(self._tag_library_model, self)
+        self._completer = LibraryTagCompleter(model, self, self._multiple)
+        self._completer.setPopup(CompleterPopupList())
+        self.setCompleter(self._completer)
+        self._candidates_stale = True
+        if self.hasFocus():
+            self._refresh_candidates()
+
+    def _mark_candidates_stale(self):
+        # Refreshed lazily on focus so large libraries don't slow down every
+        # tag add elsewhere in the app.
+        self._candidates_stale = True
+        if self.hasFocus():
+            self._refresh_candidates()
+
+    def _refresh_candidates(self):
+        if self._completer is None or not self._candidates_stale:
+            return
+        self._candidates_stale = False
+        self._completer.set_candidates(list(self._tag_library_model.tags))
+
+    def focusInEvent(self, event):
+        self._refresh_candidates()
+        super().focusInEvent(event)
+
+    def _suggestion_highlighted(self) -> bool:
+        if self._completer is None:
+            return False
+        popup = self._completer.popup()
+        return popup.isVisible() and popup.currentIndex().isValid()
+
+    def keyPressEvent(self, event):
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and self._suggestion_highlighted()):
+            # Leave it unaccepted so the completer applies the suggestion.
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+
 class TagLibraryTableModel(QAbstractTableModel):
+    """Two-column (tag, category) view of the tag library, presented in the
+    chosen sort order.
+
+    Sorting is done here with one Python `sorted()` call rather than by
+    QSortFilterProxyModel, whose comparison-based sort calls back into Python
+    hundreds of thousands of times for large libraries and made every tag add
+    take several seconds. The proxy on top only filters."""
     COLUMN_TAG = 0
     COLUMN_CATEGORY = 1
 
     def __init__(self, tag_library_model: TagLibraryModel):
         super().__init__()
         self._model = tag_library_model
+        self._sort_kind = 'tag'  # 'tag', 'category' or 'recent'
+        self._sort_order = Qt.SortOrder.AscendingOrder
+        # Table row → row in the tag library model.
+        self._order: list[int] = []
+        self._rebuild_order()
         tag_library_model.modelReset.connect(self._on_model_reset)
-        tag_library_model.rowsInserted.connect(self._on_rows_inserted)
-        tag_library_model.rowsRemoved.connect(self._on_rows_removed)
-        tag_library_model.dataChanged.connect(self._on_data_changed)
+        tag_library_model.rowsInserted.connect(self._on_model_reset)
+        tag_library_model.rowsRemoved.connect(self._on_model_reset)
+        tag_library_model.dataChanged.connect(self._on_model_reset)
         tag_library_model.categories_changed.connect(self._on_categories_changed)
 
+    def _rebuild_order(self):
+        tags = self._model.tags
+        rows = range(len(tags))
+        if self._sort_kind == 'recent':
+            # New tags are prepended (see TagLibraryModel.add_tags), so the
+            # library order is newest first.
+            order = list(rows)
+        elif self._sort_kind == 'category':
+            category_names = {category['id']: category['name'].casefold()
+                              for category in self._model.categories}
+            category_by_tag = self._model.category_by_tag
+            keys = [(category_names.get(category_by_tag.get(tag),
+                                        '\xff\xff\xff'),
+                     tag.casefold())
+                    for tag in tags]
+            order = sorted(rows, key=keys.__getitem__)
+        else:
+            keys = [tag.casefold() for tag in tags]
+            order = sorted(rows, key=keys.__getitem__)
+        if self._sort_order == Qt.SortOrder.DescendingOrder:
+            order.reverse()
+        self._order = order
+
+    def sort_mode(self) -> tuple[str, Qt.SortOrder]:
+        return self._sort_kind, self._sort_order
+
+    def set_sort_mode(self, kind: str, order: Qt.SortOrder):
+        """Reorder rows, keeping selections and the current row."""
+        if (kind, order) == (self._sort_kind, self._sort_order):
+            return
+        self._sort_kind = kind
+        self._sort_order = order
+        self.layoutAboutToBeChanged.emit()
+        old_order = self._order
+        self._rebuild_order()
+        new_row_by_library_row = {library_row: row for row, library_row
+                                  in enumerate(self._order)}
+        old_indexes = self.persistentIndexList()
+        new_indexes = []
+        for index in old_indexes:
+            library_row = old_order[index.row()]
+            new_indexes.append(self.index(new_row_by_library_row[library_row],
+                                          index.column()))
+        self.changePersistentIndexList(old_indexes, new_indexes)
+        self.layoutChanged.emit()
+
+    def _library_row(self, row: int) -> int | None:
+        if 0 <= row < len(self._order):
+            return self._order[row]
+        return None
+
     def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else self._model.rowCount()
+        return 0 if parent.isValid() else len(self._order)
 
     def columnCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else 2
@@ -58,10 +228,11 @@ class TagLibraryTableModel(QAbstractTableModel):
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
-        row, col = index.row(), index.column()
-        if row >= self._model.rowCount():
+        col = index.column()
+        library_row = self._library_row(index.row())
+        if library_row is None:
             return None
-        source_index = self._model.index(row)
+        source_index = self._model.index(library_row)
         tag = self._model.data(source_index, Qt.ItemDataRole.EditRole)
 
         if col == self.COLUMN_TAG:
@@ -88,7 +259,10 @@ class TagLibraryTableModel(QAbstractTableModel):
                 or index.column() != self.COLUMN_CATEGORY
                 or role != Qt.ItemDataRole.EditRole):
             return False
-        source_index = self._model.index(index.row())
+        library_row = self._library_row(index.row())
+        if library_row is None:
+            return False
+        source_index = self._model.index(library_row)
         tag = self._model.data(source_index, Qt.ItemDataRole.EditRole)
         if not tag:
             return False
@@ -106,30 +280,19 @@ class TagLibraryTableModel(QAbstractTableModel):
             base |= Qt.ItemFlag.ItemIsEditable
         return base
 
-    @Slot()
-    def _on_model_reset(self):
+    def _on_model_reset(self, *args):
         self.beginResetModel()
+        self._rebuild_order()
         self.endResetModel()
-
-    @Slot(QModelIndex, int, int)
-    def _on_rows_inserted(self, parent, first, last):
-        self.beginInsertRows(QModelIndex(), first, last)
-        self.endInsertRows()
-
-    @Slot(QModelIndex, int, int)
-    def _on_rows_removed(self, parent, first, last):
-        self.beginRemoveRows(QModelIndex(), first, last)
-        self.endRemoveRows()
-
-    @Slot(QModelIndex, QModelIndex, list)
-    def _on_data_changed(self, top_left, bottom_right, roles):
-        new_top = self.index(top_left.row(), 0)
-        new_bottom = self.index(bottom_right.row(), 1)
-        self.dataChanged.emit(new_top, new_bottom, roles)
 
     @Slot()
     def _on_categories_changed(self):
-        row_count = self._model.rowCount()
+        if self._sort_kind == 'category':
+            # Category names may have changed, which changes the order.
+            kind, order = self._sort_kind, self._sort_order
+            self._sort_kind = None
+            self.set_sort_mode(kind, order)
+        row_count = len(self._order)
         if row_count > 0:
             top = self.index(0, self.COLUMN_CATEGORY)
             bottom = self.index(row_count - 1, self.COLUMN_CATEGORY)
@@ -274,37 +437,26 @@ class TagLibrarySortFilterProxyModel(TagLibraryFilterProxyModel):
         # a more recently added tag. This is what powers the "Recently added"
         # and "Oldest first" sort modes.
         self.recency_sort = False
+        self._sort_column = TagLibraryTableModel.COLUMN_TAG
+        self._sort_order = Qt.SortOrder.AscendingOrder
 
-    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+    def sort(self, column: int, order=Qt.SortOrder.AscendingOrder):
+        """Sorting is delegated to the table model (see TagLibraryTableModel);
+        this proxy keeps the source order and only filters."""
+        self._sort_column = column
+        self._sort_order = order
+        self.resort()
+
+    def resort(self):
         if self.recency_sort:
-            # Compare by source-model row so the natural (insertion) order of
-            # the tag library list is used. The sort order (ascending vs
-            # descending) passed to sort() then decides newest-first vs
-            # oldest-first.
-            return left.row() < right.row()
-        if left.column() == TagLibraryTableModel.COLUMN_CATEGORY:
-            left_cat = self._category_sort_key(left)
-            right_cat = self._category_sort_key(right)
-            if left_cat != right_cat:
-                return left_cat < right_cat
-            left_tag = (self.sourceModel()
-                        .index(left.row(), TagLibraryTableModel.COLUMN_TAG)
-                        .data(Qt.ItemDataRole.EditRole) or '')
-            right_tag = (self.sourceModel()
-                         .index(right.row(), TagLibraryTableModel.COLUMN_TAG)
-                         .data(Qt.ItemDataRole.EditRole) or '')
-            return left_tag.casefold() < right_tag.casefold()
-
-        left_tag = left.data(Qt.ItemDataRole.EditRole) or ''
-        right_tag = right.data(Qt.ItemDataRole.EditRole) or ''
-        return left_tag.casefold() < right_tag.casefold()
-
-    def _category_sort_key(self, index: QModelIndex) -> str:
-        tag_index = self.sourceModel().index(
-            index.row(), TagLibraryTableModel.COLUMN_TAG)
-        tag = tag_index.data(Qt.ItemDataRole.EditRole) or ''
-        cat = self._tag_model.get_category_for_tag(tag)
-        return cat['name'].casefold() if cat else '\xff\xff\xff'
+            # The library list is newest first, so ascending means newest
+            # first and descending means oldest first.
+            kind = 'recent'
+        elif self._sort_column == TagLibraryTableModel.COLUMN_CATEGORY:
+            kind = 'category'
+        else:
+            kind = 'tag'
+        self.sourceModel().set_sort_mode(kind, self._sort_order)
 
 
 class TagLibraryDialog(QDialog):
@@ -355,6 +507,9 @@ class TagLibraryDialog(QDialog):
         self._refresh_aliases_tab()
         self._refresh_implications_tab()
         self._refresh_profiles_tab()
+        self.set_autocomplete_enabled(get_settings().value(
+            'autocomplete_tags',
+            defaultValue=DEFAULT_SETTINGS['autocomplete_tags'], type=bool))
 
         # Window-level actions so the wiki keyboard shortcuts also work while
         # this dialog (a separate top-level window) is focused. Their shortcuts
@@ -369,6 +524,14 @@ class TagLibraryDialog(QDialog):
             Qt.ShortcutContext.WindowShortcut)
         self.gelbooru_wiki_action.triggered.connect(self._request_gelbooru_wiki)
         self.addAction(self.gelbooru_wiki_action)
+
+    def set_autocomplete_enabled(self, enabled: bool):
+        """Follow the "Show tag autocomplete suggestions" setting."""
+        for line_edit in (self.new_canonical_input, self.implication_tag_input,
+                          self.implication_implied_input,
+                          self.profile_original_input,
+                          self.profile_replacement_input):
+            line_edit.set_autocomplete_enabled(enabled)
 
     def set_wiki_shortcuts(self, danbooru_shortcut: QKeySequence,
                            gelbooru_shortcut: QKeySequence):
@@ -421,7 +584,7 @@ class TagLibraryDialog(QDialog):
         self.search_input = TagFilterLineEdit('Search Tags')
 
         # Sort row
-        self.sort_combo_box = QComboBox()
+        self.sort_combo_box = FocusedScrollComboBox()
         # Each entry stores a (kind, order) tuple as item data. `kind` is one of
         # 'tag', 'category' or 'recent'; `order` is the Qt sort order to apply.
         self.sort_combo_box.addItem(
@@ -497,7 +660,7 @@ class TagLibraryDialog(QDialog):
         self.remove_selected_button.setAutoDefault(False)
 
         # Category assignment controls
-        self.tags_category_combo_box = ElidedToolTipComboBox()
+        self.tags_category_combo_box = FocusedScrollElidedToolTipComboBox()
         self.tags_category_combo_box.setSizeAdjustPolicy(
             ElidedToolTipComboBox.SizeAdjustPolicy
             .AdjustToMinimumContentsLengthWithIcon)
@@ -588,11 +751,11 @@ class TagLibraryDialog(QDialog):
             else:
                 column = TagLibraryTableModel.COLUMN_TAG
             self.tags_table.sortByColumn(column, order)
-            # Force a re-sort even if the column/order happen to match the
+            # Re-sort explicitly even if the column/order happen to match the
             # previous ones (e.g. switching between "Name (A–Z)" and "Recently
-            # added", which both use column 0 ascending): only the recency flag
-            # changed, so lessThan() must run again.
-            self.proxy_model.invalidate()
+            # added", which both use column 0 ascending): only the recency
+            # flag changed.
+            self.proxy_model.sort(column, order)
         finally:
             self._applying_sort_mode = False
 
@@ -605,9 +768,9 @@ class TagLibraryDialog(QDialog):
         # A header click always means a plain column sort, never recency.
         self.proxy_model.recency_sort = False
         if was_recency:
-            # The click already sorted using the (now stale) recency comparison,
-            # so re-sort by the clicked column.
-            self.proxy_model.invalidate()
+            # The click already sorted using the (now stale) recency mode, so
+            # re-sort by the clicked column.
+            self.proxy_model.sort(column, order)
         target_kind = ('category'
                        if column == TagLibraryTableModel.COLUMN_CATEGORY
                        else 'tag')
@@ -675,7 +838,8 @@ class TagLibraryDialog(QDialog):
         self.new_alias_input.setTextMargins(8, 0, 8, 0)
         arrow_label = QLabel('→')
         arrow_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.new_canonical_input = QLineEdit()
+        self.new_canonical_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=False)
         self.new_canonical_input.setPlaceholderText('Canonical Tag')
         self.new_canonical_input.setTextMargins(8, 0, 8, 0)
         self.add_alias_button = QPushButton('Add')
@@ -729,6 +893,10 @@ class TagLibraryDialog(QDialog):
         self.add_alias_button.clicked.connect(self._add_alias)
         self.new_alias_input.returnPressed.connect(self._add_alias)
         self.new_canonical_input.returnPressed.connect(self._add_alias)
+        self._editing_alias = None
+        self.new_alias_input.textChanged.connect(self._on_alias_inputs_changed)
+        self.new_canonical_input.textChanged.connect(
+            self._on_alias_inputs_changed)
         self.alias_search_input.textChanged.connect(self._filter_aliases_table)
         self.edit_alias_button.clicked.connect(self._edit_selected_alias)
         self.remove_alias_button.clicked.connect(self._remove_selected_aliases)
@@ -738,12 +906,14 @@ class TagLibraryDialog(QDialog):
     def _build_implications_tab(self) -> QWidget:
         tab = QWidget()
 
-        self.implication_tag_input = QLineEdit()
+        self.implication_tag_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=True)
         self.implication_tag_input.setPlaceholderText('Tags')
         self.implication_tag_input.setTextMargins(8, 0, 8, 0)
         implies_label = QLabel('implies')
         implies_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.implication_implied_input = QLineEdit()
+        self.implication_implied_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=True)
         self.implication_implied_input.setPlaceholderText('Implied Tags')
         self.implication_implied_input.setTextMargins(8, 0, 8, 0)
         self.add_implication_button = QPushButton('Add')
@@ -797,6 +967,11 @@ class TagLibraryDialog(QDialog):
         self.add_implication_button.clicked.connect(self._add_implication)
         self.implication_tag_input.returnPressed.connect(self._add_implication)
         self.implication_implied_input.returnPressed.connect(self._add_implication)
+        self._editing_implication = None
+        self.implication_tag_input.textChanged.connect(
+            self._on_implication_inputs_changed)
+        self.implication_implied_input.textChanged.connect(
+            self._on_implication_inputs_changed)
         self.implication_search_input.textChanged.connect(
             self._filter_implications_table)
         self.edit_implication_button.clicked.connect(
@@ -841,12 +1016,14 @@ class TagLibraryDialog(QDialog):
 
         self.profile_mappings_label = QLabel('Mappings')
 
-        self.profile_original_input = QLineEdit()
+        self.profile_original_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=False)
         self.profile_original_input.setPlaceholderText('Original Tag')
         self.profile_original_input.setTextMargins(8, 0, 8, 0)
         profile_arrow_label = QLabel('→')
         profile_arrow_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.profile_replacement_input = QLineEdit()
+        self.profile_replacement_input = LibraryTagLineEdit(
+            self.tag_library_model, multiple=False)
         self.profile_replacement_input.setPlaceholderText('Replacement')
         self.profile_replacement_input.setTextMargins(8, 0, 8, 0)
         self.add_mapping_button = QPushButton('Add')
@@ -911,6 +1088,11 @@ class TagLibraryDialog(QDialog):
         self.add_mapping_button.clicked.connect(self._add_mapping)
         self.profile_original_input.returnPressed.connect(self._add_mapping)
         self.profile_replacement_input.returnPressed.connect(self._add_mapping)
+        self._editing_mapping = None
+        self.profile_original_input.textChanged.connect(
+            self._on_mapping_inputs_changed)
+        self.profile_replacement_input.textChanged.connect(
+            self._on_mapping_inputs_changed)
         self.edit_mapping_button.clicked.connect(self._edit_selected_mapping)
         self.remove_mapping_button.clicked.connect(self._remove_selected_mappings)
         self.profile_mapping_search_input.textChanged.connect(
@@ -972,6 +1154,9 @@ class TagLibraryDialog(QDialog):
 
     @Slot()
     def _on_profile_selected(self):
+        if (self._editing_mapping
+                and self._editing_mapping[0] != self._get_selected_profile_name()):
+            self._set_mapping_editing(None)
         self._refresh_profile_mappings()
 
     @Slot()
@@ -1020,6 +1205,18 @@ class TagLibraryDialog(QDialog):
             return
         self.tag_library_model.remove_profile(name)
 
+    def _set_mapping_editing(self, editing: tuple[str, str] | None):
+        """Track the (profile, original tag) mapping being edited. The
+        original mapping stays in the profile until the change is saved."""
+        self._editing_mapping = editing
+        self.add_mapping_button.setText('Save' if editing else 'Add')
+
+    @Slot()
+    def _on_mapping_inputs_changed(self):
+        if (not self.profile_original_input.text().strip()
+                and not self.profile_replacement_input.text().strip()):
+            self._set_mapping_editing(None)
+
     @Slot()
     def _add_mapping(self):
         profile_name = self._get_selected_profile_name()
@@ -1029,10 +1226,16 @@ class TagLibraryDialog(QDialog):
         replacement = self.profile_replacement_input.text().strip()
         if not original:
             return
+        if self._editing_mapping:
+            editing_profile, editing_original = self._editing_mapping
+            if editing_profile == profile_name and editing_original != original:
+                self.tag_library_model.remove_profile_mappings(
+                    profile_name, [editing_original])
         self.tag_library_model.set_profile_mapping(
             profile_name, original, replacement)
         self.profile_original_input.clear()
         self.profile_replacement_input.clear()
+        self._set_mapping_editing(None)
 
     @Slot()
     def _edit_selected_mapping(self):
@@ -1051,8 +1254,7 @@ class TagLibraryDialog(QDialog):
         self.profile_original_input.setText(orig_item.text())
         self.profile_replacement_input.setText(
             repl_item.text() if repl_item else '')
-        self.tag_library_model.remove_profile_mappings(
-            profile_name, [orig_item.text()])
+        self._set_mapping_editing((profile_name, orig_item.text()))
         self.profile_original_input.setFocus()
 
     @Slot()
@@ -1121,13 +1323,13 @@ class TagLibraryDialog(QDialog):
             question=(f'Apply profile "{profile_name}" to {affected} image(s) '
                       f'in the current directory?\n\n'
                       f'This will replace {len(mapping)} tag(s) across all '
-                      'matching images. This action can be undone.'))
+                      'matching images (mappings with an empty replacement '
+                      'remove the tag). This action can be undone.'))
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        for original, replacement in mapping.items():
-            if replacement:
-                self.image_list_model.rename_tags([original], replacement)
+        self.image_list_model.apply_tag_mapping(
+            mapping, action_name=f'Apply Profile "{profile_name}"')
 
         QMessageBox.information(
             self, 'Profile Applied',
@@ -1194,8 +1396,8 @@ class TagLibraryDialog(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        for replacement, original in inverted.items():
-            self.image_list_model.rename_tags([replacement], original)
+        self.image_list_model.apply_tag_mapping(
+            inverted, action_name=f'Revert Profile "{profile_name}"')
 
         QMessageBox.information(
             self, 'Profile Reverted',
@@ -1477,25 +1679,44 @@ class TagLibraryDialog(QDialog):
 
         tags, categories, category_by_tag, aliases, implications, profiles = parsed
 
+        if not any((tags, categories, aliases, implications, profiles)):
+            QMessageBox.warning(
+                self, 'Import Tag Library',
+                'No tags, categories, aliases, implications, or profiles '
+                'were found in this file. Nothing was imported.')
+            return
+
         choice_dialog = QMessageBox(self)
         choice_dialog.setWindowTitle('Import Tag Library')
-        choice_dialog.setText(
-            f'Found {len(tags)} tag(s), {len(categories)} '
-            f'category/categories, {len(aliases)} alias(es), and '
-            f'{len(implications)} implication rule(s), and '
-            f'{len(profiles)} profile(s).\n\n'
-            'Replace All — replaces your entire Tag Library with the imported data.\n'
-            'Merge — adds new tags, categories, aliases, implications, and profiles '
-            'without removing existing ones.')
-        replace_button = choice_dialog.addButton(
-            'Replace All', QMessageBox.ButtonRole.DestructiveRole)
+        summary = (f'Found {len(tags)} tag(s), {len(categories)} '
+                   f'category/categories, {len(aliases)} alias(es), '
+                   f'{len(implications)} implication rule(s), and '
+                   f'{len(profiles)} profile(s).\n\n')
+        replace_button = None
+        if tags:
+            choice_dialog.setText(
+                summary
+                + 'Replace All — replaces your entire Tag Library with the '
+                'imported data.\n'
+                'Merge — adds new tags, categories, aliases, implications, and '
+                'profiles without removing existing ones.')
+            replace_button = choice_dialog.addButton(
+                'Replace All', QMessageBox.ButtonRole.DestructiveRole)
+        else:
+            # Replacing with a file that has no tags would wipe the library.
+            choice_dialog.setText(
+                summary
+                + 'This file has no tags, so Replace All is not available '
+                '(it would empty your Tag Library).\n'
+                'Merge — adds the new categories, aliases, implications, and '
+                'profiles without removing existing ones.')
         merge_button = choice_dialog.addButton(
             'Merge', QMessageBox.ButtonRole.AcceptRole)
         choice_dialog.addButton(QMessageBox.StandardButton.Cancel)
         choice_dialog.exec()
 
         clicked = choice_dialog.clickedButton()
-        if clicked is replace_button:
+        if replace_button is not None and clicked is replace_button:
             self.tag_library_model.load_all_data(
                 tags, categories, category_by_tag,
                 aliases=aliases, implications=implications, profiles=profiles)
@@ -1504,7 +1725,7 @@ class TagLibraryDialog(QDialog):
                 f'Replaced Tag Library with '
                 f'{len(self.tag_library_model.tags)} tag(s), '
                 f'{len(self.tag_library_model.categories)} category/categories, '
-                f'{len(self.tag_library_model.aliases)} alias(es), and '
+                f'{len(self.tag_library_model.aliases)} alias(es), '
                 f'{len(self.tag_library_model.implications)} implication rule(s), '
                 f'and {len(self.tag_library_model.profiles)} profile(s).')
         elif clicked is merge_button:
@@ -1557,12 +1778,15 @@ class TagLibraryDialog(QDialog):
             self.tag_library_model.assign_category(tag_list, cat_id)
 
         added_aliases = 0
+        skipped_aliases = 0
         if aliases:
             existing_aliases = self.tag_library_model.aliases
             for alias, canonical in aliases.items():
                 if alias not in existing_aliases:
                     if self.tag_library_model.add_alias(alias, canonical):
                         added_aliases += 1
+                    else:
+                        skipped_aliases += 1
 
         added_implications = 0
         if implications:
@@ -1589,13 +1813,18 @@ class TagLibraryDialog(QDialog):
                         existing_mapping[original] = replacement
 
         added_count = len(new_tags)
+        skipped_note = ''
+        if skipped_aliases:
+            skipped_note = (f'\n\n{skipped_aliases} alias(es) were skipped '
+                            'because they would point to another alias or '
+                            'loop back on themselves.')
         QMessageBox.information(
             self, 'Merge Successful',
             f'Added {added_count} new tag(s), {added_categories} '
-            f'category/categories, {added_aliases} alias(es), and '
+            f'category/categories, {added_aliases} alias(es), '
             f'{added_implications} implication rule(s), {added_profiles} '
             f'profile(s), and {added_profile_mappings} profile mapping(s) '
-            'to your Tag Library.')
+            f'to your Tag Library.{skipped_note}')
 
     def _parse_xlsx(self, file_path: str):
         try:
@@ -1737,6 +1966,15 @@ class TagLibraryDialog(QDialog):
         try:
             with open(file_path, 'r', newline='', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
+                if reader.fieldnames:
+                    # Accept headers in any case, with stray spaces, and the
+                    # "Color (hex)" header used by the xlsx export.
+                    header_aliases = {'color (hex)': 'color'}
+                    reader.fieldnames = [
+                        header_aliases.get(name.strip().lower(),
+                                           name.strip().lower())
+                        if name else name
+                        for name in reader.fieldnames]
                 rows = list(reader)
         except Exception as e:
             QMessageBox.warning(self, 'Import Failed',
@@ -1754,12 +1992,12 @@ class TagLibraryDialog(QDialog):
         cat_name_to_color: dict[str, str] = {}
         tag_to_cat_name: dict[str, str] = {}
         for row in rows:
-            tag = row.get('tag', '').strip()
+            tag = (row.get('tag') or '').strip()
             if not tag:
                 continue
             tags.append(tag)
-            cat_name = row.get('category', '').strip()
-            cat_color = row.get('color', '').strip()
+            cat_name = (row.get('category') or '').strip()
+            cat_color = (row.get('color') or '').strip()
             if cat_name:
                 cat_name_to_color.setdefault(cat_name, cat_color)
                 tag_to_cat_name[tag] = cat_name
@@ -1807,25 +2045,57 @@ class TagLibraryDialog(QDialog):
                 self.categories_list.setCurrentItem(item)
                 return
 
+    def _set_alias_editing(self, original_alias: str | None):
+        """Track which alias is being edited. While editing, the original
+        stays in the library until the change is saved."""
+        self._editing_alias = original_alias
+        self.add_alias_button.setText('Save' if original_alias else 'Add')
+
+    @Slot()
+    def _on_alias_inputs_changed(self):
+        if (not self.new_alias_input.text().strip()
+                and not self.new_canonical_input.text().strip()):
+            self._set_alias_editing(None)
+
     @Slot()
     def _add_alias(self):
         aliases_text = self.new_alias_input.text().strip()
         canonical = self.new_canonical_input.text().strip()
         if not aliases_text or not canonical:
             return
-        aliases = [a.strip() for a in aliases_text.split(',') if a.strip()]
+        aliases = list(dict.fromkeys(
+            a.strip() for a in aliases_text.split(',') if a.strip()))
         if not aliases:
             return
+        editing_alias = self._editing_alias
+        if editing_alias not in self.tag_library_model.get_aliases():
+            editing_alias = None
         for alias in aliases:
-            if alias == canonical:
-                QMessageBox.warning(
-                    self, 'Invalid Alias',
-                    f'An alias cannot be the same as its canonical tag ("{canonical}").')
+            problem = self.tag_library_model.get_alias_problem(
+                alias, canonical, ignore_alias=editing_alias)
+            if problem:
+                QMessageBox.warning(self, 'Invalid Alias', problem)
                 return
+        library_tags = [alias for alias in aliases
+                        if alias != editing_alias
+                        and self.tag_library_model.has_tag(alias)]
+        if library_tags:
+            listed = ', '.join(f'"{tag}"' for tag in library_tags)
+            reply = get_confirmation_dialog_reply(
+                title='Alias Is Already a Tag',
+                question=(f'{listed} {"is" if len(library_tags) == 1 else "are"}'
+                          ' already in your Tag Library as a tag. Typing it '
+                          f'will now suggest "{canonical}" instead.\n\n'
+                          'Add the alias anyway?'))
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        if editing_alias:
+            self.tag_library_model.remove_aliases([editing_alias])
         for alias in aliases:
             self.tag_library_model.add_alias(alias, canonical)
         self.new_alias_input.clear()
         self.new_canonical_input.clear()
+        self._set_alias_editing(None)
 
     @Slot()
     def _filter_aliases_table(self):
@@ -1850,7 +2120,7 @@ class TagLibraryDialog(QDialog):
             return
         self.new_alias_input.setText(alias_item.text())
         self.new_canonical_input.setText(canonical_item.text())
-        self.tag_library_model.remove_aliases([alias_item.text()])
+        self._set_alias_editing(alias_item.text())
         self.new_alias_input.setFocus()
 
     @Slot()
@@ -1886,31 +2156,47 @@ class TagLibraryDialog(QDialog):
         self.alias_count_label.setText(f'{len(aliases)} Aliases')
         self._filter_aliases_table()
 
+    def _set_implication_editing(self, original_trigger: str | None):
+        """Track which implication rule is being edited. The original rule
+        stays in the library until the change is saved."""
+        self._editing_implication = original_trigger
+        self.add_implication_button.setText(
+            'Save' if original_trigger else 'Add')
+
+    @Slot()
+    def _on_implication_inputs_changed(self):
+        if (not self.implication_tag_input.text().strip()
+                and not self.implication_implied_input.text().strip()):
+            self._set_implication_editing(None)
+
     @Slot()
     def _add_implication(self):
         tag_text = self.implication_tag_input.text().strip()
         implied_text = self.implication_implied_input.text().strip()
         if not tag_text or not implied_text:
             return
-        trigger_tags = [t.strip() for t in tag_text.split(',') if t.strip()]
-        implied_tags = [t.strip() for t in implied_text.split(',') if t.strip()]
+        trigger_tags = list(dict.fromkeys(
+            t.strip() for t in tag_text.split(',') if t.strip()))
+        implied_tags = list(dict.fromkeys(
+            t.strip() for t in implied_text.split(',') if t.strip()))
         if not trigger_tags or not implied_tags:
             return
-        added_any = False
-        skipped_self = []
-        for trigger in trigger_tags:
-            remaining = [t for t in implied_tags if t != trigger]
-            if not remaining:
-                skipped_self.append(trigger)
-                continue
-            if self.tag_library_model.add_implication(trigger, remaining):
-                added_any = True
-        if skipped_self and not added_any:
+        if not any(t != trigger for trigger in trigger_tags
+                   for t in implied_tags):
             QMessageBox.warning(self, 'Invalid Implication',
                                 'A tag cannot imply itself.')
             return
+        editing_trigger = self._editing_implication
+        if editing_trigger in self.tag_library_model.get_implications():
+            # Replace the edited rule rather than merging into it.
+            self.tag_library_model.remove_implication_rule(editing_trigger)
+        for trigger in trigger_tags:
+            remaining = [t for t in implied_tags if t != trigger]
+            if remaining:
+                self.tag_library_model.add_implication(trigger, remaining)
         self.implication_tag_input.clear()
         self.implication_implied_input.clear()
+        self._set_implication_editing(None)
 
     @Slot()
     def _filter_implications_table(self):
@@ -1936,7 +2222,7 @@ class TagLibraryDialog(QDialog):
             return
         self.implication_tag_input.setText(tag_item.text())
         self.implication_implied_input.setText(implies_item.text())
-        self.tag_library_model.remove_implication_rule(tag_item.text())
+        self._set_implication_editing(tag_item.text())
         self.implication_tag_input.setFocus()
 
     @Slot()
@@ -1970,14 +2256,29 @@ class TagLibraryDialog(QDialog):
             f'{count} Implication Rule{"s" if count != 1 else ""}')
         self._filter_implications_table()
 
+    def _category_name_taken(self, name: str,
+                             ignore_category_id: str | None = None) -> bool:
+        return any(category['id'] != ignore_category_id
+                   and category['name'].casefold() == name.casefold()
+                   for category in self.tag_library_model.get_categories())
+
     @Slot()
     def _request_add_category(self):
-        dialog = CategoryDialog(self, title='Add Category')
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        name, color = dialog.get_values()
-        if name:
-            self.tag_library_model.add_category(name, color)
+        name, color = '', '#ffffff'
+        while True:
+            dialog = CategoryDialog(self, title='Add Category', name=name,
+                                    color=color)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            name, color = dialog.get_values()
+            if not name:
+                return
+            if not self._category_name_taken(name):
+                self.tag_library_model.add_category(name, color)
+                return
+            QMessageBox.warning(
+                self, 'Add Category',
+                f'A category named "{name}" already exists.')
 
     @Slot()
     def _request_edit_category(self):
@@ -1988,15 +2289,22 @@ class TagLibraryDialog(QDialog):
         for cat in self.tag_library_model.get_categories():
             if cat['id'] != category_id:
                 continue
-            dialog = CategoryDialog(self, title='Edit Category',
-                                    name=cat['name'],
-                                    color=cat['color'] or '#ffffff')
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            name, color = dialog.get_values()
-            if name:
-                self.tag_library_model.edit_category(category_id, name, color)
-            return
+            name, color = cat['name'], cat['color'] or '#ffffff'
+            while True:
+                dialog = CategoryDialog(self, title='Edit Category',
+                                        name=name, color=color)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                name, color = dialog.get_values()
+                if not name:
+                    return
+                if not self._category_name_taken(name, category_id):
+                    self.tag_library_model.edit_category(
+                        category_id, name, color)
+                    return
+                QMessageBox.warning(
+                    self, 'Edit Category',
+                    f'A category named "{name}" already exists.')
 
     @Slot()
     def _request_remove_category(self):

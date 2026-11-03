@@ -3,6 +3,8 @@ from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (QFrame, QMessageBox, QPlainTextEdit,
                                 QStyledItemDelegate)
 
+from utils.settings import get_tag_separator
+
 
 class TextEditItemDelegate(QStyledItemDelegate):
     def _commit_and_close_editor(self, editor):
@@ -17,32 +19,53 @@ class TextEditItemDelegate(QStyledItemDelegate):
         # edits in their own setData(), so for them just commit and close.
         string_list = (model.stringList()
                        if hasattr(model, 'stringList') else None)
+        row = editor.index.row()
         if not text:
             self.closeEditor.emit(editor)
             # Clearing a tag deletes it, but only for the editable string list.
-            if string_list is not None:
-                model.removeRow(editor.index.row())
+            # Replace the whole list (rather than removing the row) so the
+            # change is saved to the caption file like any other edit.
+            if string_list is not None and 0 <= row < len(string_list):
+                model.setStringList(string_list[:row] + string_list[row + 1:])
             return
-        # Warn if the edited value already exists at a different row.
-        if string_list is not None:
-            for row, existing in enumerate(string_list):
-                if row != editor.index.row() and existing == text:
-                    msg = QMessageBox(self.parent())
-                    msg.setWindowTitle('Duplicate Tag')
-                    msg.setIcon(QMessageBox.Icon.Warning)
-                    msg.setText(f'"{text}" already exists in the tag list. '
-                                f'The edit will be reverted.')
-                    msg.exec()
-                    self.closeEditor.emit(editor)
-                    return
+        if string_list is None:
+            self.commitData.emit(editor)
+            self.closeEditor.emit(editor)
+            return
+        # Text containing the tag separator becomes several tags, the same as
+        # in the Add Tag box (the caption file would split it on reload).
+        separator = get_tag_separator()
+        new_tags = list(dict.fromkeys(
+            part.strip() for part in text.split(separator) if part.strip()))
+        # Warn if an edited value already exists at a different row. Letter
+        # case is ignored, like the Add Tag box and the filters.
+        other_tags = {existing.casefold()
+                      for other_row, existing in enumerate(string_list)
+                      if other_row != row}
+        duplicates = [tag for tag in new_tags if tag.casefold() in other_tags]
+        if duplicates:
+            msg = QMessageBox(self.parent())
+            msg.setWindowTitle('Duplicate Tag')
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setText(f'"{duplicates[0]}" already exists in the tag list. '
+                        f'The edit will be reverted.')
+            msg.exec()
+            self.closeEditor.emit(editor)
+            return
+        if len(new_tags) > 1:
+            self.closeEditor.emit(editor)
+            model.setStringList(string_list[:row] + new_tags
+                                + string_list[row + 1:])
+            return
+        editor.setPlainText(new_tags[0])
         self.commitData.emit(editor)
         self.closeEditor.emit(editor)
 
     def paint(self, painter, option, index):
         # Add some left padding.
         option.rect.adjust(4, 0, 0, 0)
-        # Draw a subtle amber "review" marker for tags the most recent
-        # Auto-Captioner run added, matching the grouped (grid) view. Only the
+        # Draw a subtle amber "review" marker for unviewed tags, matching the
+        # grouped (grid) view. Only the
         # Image Tags list carries a ``_recently_captioned`` set, so other views
         # sharing this delegate (e.g. All Tags) never get a dot. When present,
         # the dot reserves a little width on the right so it never overlaps the
@@ -88,13 +111,20 @@ class TextEditItemDelegate(QStyledItemDelegate):
     def eventFilter(self, editor, event: QEvent):
         if (event.type() == QEvent.KeyPress
                 and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
+            view = self.parent()
+            edited_tag = editor.index.data(Qt.ItemDataRole.EditRole)
             self._commit_and_close_editor(editor)
-            self.parent().setCurrentIndex(
-                self.parent().model().index(editor.index.row(), 0))
-            self.parent().selectionModel().select(
-                self.parent().model().index(editor.index.row(), 0),
+            # Views whose rows move after an edit (e.g. All Tags, which
+            # re-counts and re-sorts) re-select the tag by name instead.
+            if hasattr(view, 'select_tag_after_edit'):
+                view.select_tag_after_edit(edited_tag)
+                view.setFocus()
+                return True
+            view.setCurrentIndex(view.model().index(editor.index.row(), 0))
+            view.selectionModel().select(
+                view.model().index(editor.index.row(), 0),
                 QItemSelectionModel.SelectionFlag.ClearAndSelect)
-            self.parent().setFocus()
+            view.setFocus()
             return True
         # This is required to prevent crashing when the user clicks on another
         # tag in the All Tags list.

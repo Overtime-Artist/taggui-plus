@@ -112,14 +112,23 @@ class RemoveAppDataDialog(QDialog):
             self.models_dir_check_box.setChecked(False)
             layout.addWidget(self.models_dir_check_box)
             layout.addWidget(self._hint(str(models_dir)))
+            models_unsafe = app_data.get_unsafe_removal_reason(models_dir)
+            if models_unsafe is not None:
+                self.models_dir_check_box.setEnabled(False)
+                layout.addWidget(self._unsafe_label(models_unsafe))
 
         # --- Shared Hugging Face cache ---
         self.hf_check_box = QCheckBox(
             f'Shared Hugging Face model cache \u2013 '
             f'{app_data.format_size(hf_size)}')
         self.hf_check_box.setChecked(False)
-        self.hf_check_box.setEnabled(hf_size > 0 or hf_dir.exists())
+        hf_unsafe = app_data.get_unsafe_removal_reason(hf_dir)
+        self.hf_check_box.setEnabled(
+            hf_unsafe is None and (hf_size > 0 or hf_dir.exists()))
         layout.addWidget(self.hf_check_box)
+        if hf_unsafe is not None:
+            layout.addWidget(self._hint(str(hf_dir)))
+            layout.addWidget(self._unsafe_label(hf_unsafe))
         hf_warning = QLabel(
             f'Warning: this folder ({hf_dir}) is shared with other programs '
             f'that use Hugging Face models. Only remove it if no other tool on '
@@ -157,6 +166,15 @@ class RemoveAppDataDialog(QDialog):
         hint_font.setPointSize(8)
         label.setFont(hint_font)
         label.setStyleSheet('color: #999999;')
+        label.setContentsMargins(22, 0, 0, 0)
+        return label
+
+    def _unsafe_label(self, reason: str) -> QLabel:
+        label = QLabel(
+            f'This folder cannot be removed here because {reason}. Delete '
+            f'the model files inside it manually if needed.')
+        label.setWordWrap(True)
+        label.setStyleSheet('color: #cc7a00;')
         label.setContentsMargins(22, 0, 0, 0)
         return label
 

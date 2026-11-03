@@ -3,7 +3,7 @@ from pathlib import Path
 from time import perf_counter
 
 from PIL import UnidentifiedImageError
-from PySide6.QtCore import QModelIndex, QThread, Qt, Signal
+from PySide6.QtCore import QThread, Signal
 
 from auto_captioning.auto_captioning_model import AutoCaptioningModel
 from auto_captioning.models_list import get_model_class
@@ -82,10 +82,12 @@ def format_duration(seconds: float) -> str:
 class CaptioningThread(QThread):
     text_outputted = Signal(str)
     clear_console_text_edit_requested = Signal()
-    # The image index, caption text, updated tags, and updated natural language
-    # prompt. The third parameter must be declared as `list` instead of
-    # `list[str]` for it to work.
-    caption_generated = Signal(QModelIndex, str, list, str)
+    # The image's file path and the caption text. Images are identified by
+    # path rather than by row because the image list can change while
+    # captioning runs (refresh, sorting, deleting, loading another folder);
+    # the main thread looks up the image's current row when the caption
+    # arrives and skips it if the image is gone.
+    caption_generated = Signal(object, str)
     progress_bar_update_requested = Signal(int)
     # Emitted once at the start of a run when the user selected "GPU if
     # available" but captioning will actually run on the CPU, so the main
@@ -93,12 +95,12 @@ class CaptioningThread(QThread):
     device_warning_requested = Signal(str)
 
     def __init__(self, parent, image_list_model: ImageListModel,
-                 selected_image_indices: list[QModelIndex],
+                 selected_images: list[Image],
                  caption_settings: dict, tag_separator: str,
                  models_directory_path: Path | None):
         super().__init__(parent)
         self.image_list_model = image_list_model
-        self.selected_image_indices = selected_image_indices
+        self.selected_images = selected_images
         self.caption_settings = caption_settings
         self.tag_separator = tag_separator
         self.models_directory_path = models_directory_path
@@ -127,7 +129,7 @@ class CaptioningThread(QThread):
             print('Canceled captioning.')
             return
         self.clear_console_text_edit_requested.emit()
-        selected_image_count = len(self.selected_image_indices)
+        selected_image_count = len(self.selected_images)
         are_multiple_images_selected = selected_image_count > 1
         captioning_start_datetime = datetime.now()
         captioning_message = model.get_captioning_message(
@@ -135,17 +137,11 @@ class CaptioningThread(QThread):
         print(captioning_message)
         if device_warning:
             print(f'Warning: {device_warning}')
-        caption_destination = self.caption_settings['caption_destination']
-        caption_position = self.caption_settings['caption_position']
-        natural_language_position = self.caption_settings[
-            'natural_language_position']
-        for i, image_index in enumerate(self.selected_image_indices):
+        for i, image in enumerate(self.selected_images):
             start_time = perf_counter()
             if self.is_canceled:
                 print('Canceled captioning.')
                 return
-            image: Image = self.image_list_model.data(image_index,
-                                                      Qt.ItemDataRole.UserRole)
             image_prompt = model.get_image_prompt(image)
             try:
                 model_inputs = model.get_model_inputs(image_prompt, image)
@@ -161,11 +157,7 @@ class CaptioningThread(QThread):
             if self.is_canceled:
                 print('Canceled captioning.')
                 return
-            tags, natural_language_prompt = get_generated_caption_data(
-                image, caption, caption_destination, caption_position,
-                natural_language_position)
-            self.caption_generated.emit(
-                image_index, caption, tags, natural_language_prompt)
+            self.caption_generated.emit(image.path, caption)
             if are_multiple_images_selected:
                 self.progress_bar_update_requested.emit(i + 1)
             if i == 0 and not are_multiple_images_selected:
@@ -196,3 +188,11 @@ class CaptioningThread(QThread):
 
     def write(self, text: str):
         self.text_outputted.emit(text)
+
+    # `sys.stdout`/`sys.stderr` point at this object during a run, so it must
+    # also support the other stream methods that libraries call.
+    def flush(self):
+        pass
+
+    def isatty(self) -> bool:
+        return False

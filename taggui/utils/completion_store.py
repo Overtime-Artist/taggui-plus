@@ -3,7 +3,9 @@ Persistent store for the per-image "complete" workflow flag.
 
 The set of images the user has marked as complete is saved to
 ``completion_cache.json`` in the same cache directory used by the scan cache
-(for example ``%LOCALAPPDATA%\\taggui`` on Windows).
+(for example ``%LOCALAPPDATA%\\taggui`` on Windows). Saves are atomic, and the
+previous version is kept as ``completion_cache.json.bak``, which is used if the
+main file is ever found damaged.
 
 Design
 ------
@@ -108,7 +110,7 @@ class CompletionStore:
         ``{path: true}`` format (which loads with empty hash metadata that is
         filled in lazily on the next scan).
         """
-        data = _load_json(self._path)
+        data = _load_json(self._path, use_backup=True)
         entries: dict[str, dict] = {}
         for key, value in data.items():
             if isinstance(value, dict):
@@ -134,7 +136,7 @@ class CompletionStore:
         with self._lock:
             data = {path: dict(entry) for path, entry in self._entries.items()}
             self._dirty = False
-        _save_json(self._path, data)
+        _save_json(self._path, data, keep_backup=True)
 
     def save_if_dirty(self) -> None:
         """Persist only if in-memory state changed since the last save/load."""

@@ -19,7 +19,7 @@ from utils.danbooru_session import (cancel_pending_fetches, danbooru_urlopen,
                                     initialize_on_main_thread)
 from dialogs.wiki_dialog_base import (AUTOCOMPLETE_ANY_SUFFIX_PATTERN, AUTOCOMPLETE_COUNT_SUFFIX_PATTERN,
                                      BaseWikiDialog, TAG_GROUP_NORMALIZED_PREFIX,
-                                     TAG_GROUP_SEARCH_PREFIX)
+                                     TAG_GROUP_SEARCH_PREFIX, park_running_threads)
 
 DANBOORU_BASE_URL = 'https://danbooru.donmai.us'
 # The Danbooru help page describing what tag deprecation means. Linked from the
@@ -763,8 +763,12 @@ class DanbooruTagAutocompleteThread(QThread):
         except Exception:
             self.suggestions_ready.emit(self.query_text, [])
             return
+        if not isinstance(tags, list):
+            tags = []
         suggestions = []
         for tag in tags:
+            if not isinstance(tag, dict):
+                continue
             tag_name = str(tag.get('value') or tag.get('name') or '').strip()
             if not tag_name:
                 continue
@@ -810,9 +814,13 @@ class DanbooruTagAutocompleteThread(QThread):
                     response.read().decode('utf-8', errors='replace'))
         except Exception:
             return []
+        if not isinstance(entries, list):
+            return []
         wiki_suggestions = []
         for entry in entries:
-            name = str(entry.get('value') or entry.get('label') or '').strip()
+            if not isinstance(entry, dict):
+                continue
+            name =  str(entry.get('value') or entry.get('label') or '').strip()
             if not name:
                 continue
             wiki_suggestions.append({
@@ -955,20 +963,19 @@ class DanbooruWikiDialog(BaseWikiDialog):
         if self._torn_down:
             return
         self._torn_down = True
-        # Release any worker blocked on an in-flight browser page fetch so the
-        # thread joins below return promptly instead of waiting out the fetch
-        # timeout.
-        cancel_pending_fetches()
         # Stop the animated (indeterminate) loading bar first, on the GUI
-        # thread. That bar runs an internal timer; switching it off here means
-        # no timer is left running while we block below waiting for the worker
-        # threads — which avoids Qt's "QBasicTimer::stop: Failed. Possibly
-        # trying to stop from a different thread" warning during teardown.
+        # thread, so its internal timer isn't left running after close.
         self.show_status_message('')
         self._resize_timer.stop()
+        # Hand every worker thread over to ``park_running_threads``. This flags
+        # them for interruption (so they won't start new browser fetches) and
+        # keeps them alive until they finish, without blocking the GUI.
         self.stop_all_fetch_threads()
         self.stop_all_autocomplete_threads(wait=True)
         self.stop_all_posts_threads()
+        # Then release any worker blocked on an in-flight browser page fetch so
+        # the parked threads wind down promptly.
+        cancel_pending_fetches()
 
     def done(self, result):
         self._teardown()
@@ -979,14 +986,9 @@ class DanbooruWikiDialog(BaseWikiDialog):
         super().closeEvent(event)
 
     def stop_all_posts_threads(self):
-        for posts_thread in list(self._active_posts_threads):
-            try:
-                if posts_thread.isRunning():
-                    posts_thread.requestInterruption()
-                    posts_thread.quit()
-                    posts_thread.wait(12000)
-            except RuntimeError:
-                continue
+        """Called while the dialog closes. Never blocks: see
+        ``park_running_threads``."""
+        park_running_threads(list(self._active_posts_threads))
         self._active_posts_threads.clear()
         self._posts_fetch_thread = None
 
@@ -1264,7 +1266,9 @@ class DanbooruWikiDialog(BaseWikiDialog):
         Everything else behaves like a normal wiki search."""
         raw_text = self.search_line_edit.text().strip()
         if raw_text.casefold().startswith(POSTS_SEARCH_PREFIX):
-            remainder = raw_text[len(POSTS_SEARCH_PREFIX):].strip()
+            if not self._claim_search_trigger():
+                return
+            remainder =  raw_text[len(POSTS_SEARCH_PREFIX):].strip()
             popup = self.search_completer.popup()
             if popup is not None:
                 popup.hide()
@@ -2403,7 +2407,7 @@ class DanbooruWikiDialog(BaseWikiDialog):
             cleaned = AUTOCOMPLETE_COUNT_SUFFIX_PATTERN.sub('', text).strip()
             if cleaned and cleaned != text:
                 self.search_line_edit.setText(cleaned)
-                return
+                text = cleaned
         self.queue_autocomplete_search(text)
 
     @Slot(str)

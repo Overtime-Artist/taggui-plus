@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 
+import shiboken6
 from PySide6.QtCore import (QEvent, QEventLoop, QItemSelectionModel,
                             QKeyCombination, QModelIndex,
                             QObject, QPoint, QRunnable, QThreadPool, QTimer,
@@ -20,6 +21,7 @@ from transformers import AutoTokenizer
 from dialogs.batch_reorder_tags_dialog import (BatchReorderTagsDialog,
                                                apply_batch_reorder)
 from dialogs.danbooru_wiki_dialog import DanbooruWikiDialog
+from dialogs import directory_analytics_dialog
 from dialogs.directory_analytics_dialog import DirectoryAnalyticsDialog
 from dialogs.export_settings_dialog import ExportSettingsDialog
 from dialogs.find_and_replace_dialog import FindAndReplaceDialog
@@ -27,7 +29,7 @@ from dialogs.find_duplicates_dialog import FindDuplicatesDialog
 from dialogs.gelbooru_wiki_dialog import GelbooruWikiDialog
 from dialogs.import_settings_preview_dialog import ImportSettingsPreviewDialog
 from dialogs.keyboard_shortcuts_dialog import (KeyboardShortcutsDialog,
-                                               normalize_shortcut_sequences)
+                                               resolve_shortcut_sequences)
 from dialogs.settings_dialog import SettingsDialog
 from dialogs.tag_library_dialog import TagLibraryDialog
 from models.image_list_model import ImageListModel, RefreshScanner
@@ -57,6 +59,45 @@ from widgets.image_viewer import ImageViewer
 ICON_PATH = Path('images/icon.ico')
 GITHUB_REPOSITORY_URL = 'https://github.com/Overtime-Artist/taggui-plus'
 TOKENIZER_DIRECTORY_PATH = Path('clip-vit-base-patch32')
+
+
+def ensure_menu_shortcut_gap(menu: QMenu):
+    """Keep a clear gap between action names and their shortcuts.
+
+    Fusion places the shortcut column right after the longest action name, so
+    an action whose name is the longest (a one-item menu, a long
+    'Undo "..."' text, or a user-assigned key on the longest item) gets almost
+    no gap. The shortcut is right-aligned, so widening the menu adds the gap.
+    Call again whenever texts or shortcuts may have changed (e.g. from
+    `aboutToShow`).
+    """
+    menu.setMinimumWidth(0)
+    menu.ensurePolished()
+    # QMenu caches its item layout, and that cache includes the minimum width
+    # set on the previous call, so sizeHint() would keep the old widened size
+    # and the menu would grow on every open. A font-change event makes Qt
+    # recompute the layout without the old minimum.
+    QApplication.sendEvent(menu, QEvent(QEvent.Type.FontChange))
+    font_metrics = menu.fontMetrics()
+    actions = [action for action in menu.actions()
+               if action.isVisible() and not action.isSeparator()]
+    actions_with_shortcut = [action for action in actions
+                             if not action.shortcut().isEmpty()]
+    if not actions_with_shortcut:
+        return
+
+    def text_width(action: QAction) -> int:
+        # '&' marks a mnemonic and is not drawn ('&&' draws one '&').
+        text = action.text().replace('&&', '\0').replace('&', '')
+        return font_metrics.horizontalAdvance(text.replace('\0', '&'))
+
+    widest_text = max(text_width(action) for action in actions)
+    smallest_gap = min(widest_text - text_width(action)
+                       for action in actions_with_shortcut)
+    wanted_gap = 3 * font_metrics.horizontalAdvance('M')
+    if smallest_gap < wanted_gap:
+        menu.setMinimumWidth(menu.sizeHint().width()
+                             + wanted_gap - smallest_gap)
 
 
 class TokenizerLoader(QObject, QRunnable):
@@ -93,6 +134,8 @@ class MainWindow(QMainWindow):
         # The path of the currently loaded directory. This is set later when a
         # directory is loaded.
         self.directory_path = None
+        # The open (modeless) Directory Analytics dialog, if any.
+        self._directory_analytics_dialog = None
         # Tracks an in-flight background refresh (RefreshScanner) so re-focusing
         # the window repeatedly does not start overlapping scans.
         self._refresh_scanner = None
@@ -139,6 +182,18 @@ class MainWindow(QMainWindow):
         # in changeEvent() whenever the window switches between the two modes.
         self._expanded_dock_state = None
         self._normal_dock_state = None
+        # (geometry, dock state, window state) from before focus mode was
+        # entered, or None when focus mode is off. Restored on exit and saved
+        # instead of the focus layout if the app is closed in focus mode.
+        self._focus_mode_saved = None
+        self._focus_mode_tracking_was_ready = False
+        # Images pane actions also attached to the main window while focus
+        # mode hides that pane (Qt ignores shortcuts of hidden widgets).
+        self._focus_mode_extra_actions = []
+        self._focus_mode_pre_size = None
+        self._focus_mode_restore_min_size = False
+        # (dock, line edit) to focus once a focus mode exit finishes.
+        self._focus_mode_exit_focus_target = None
         # Guard so the layout tracking below ignores the window-state changes
         # that happen while the app is still starting up and restoring itself.
         self._dock_state_tracking_ready = False
@@ -245,8 +300,9 @@ class MainWindow(QMainWindow):
         self.toggle_all_tags_editor_action = QAction('All Tags', parent=self)
         self.toggle_auto_captioner_action = QAction('Auto-Captioner',
                                                     parent=self)
-        self.open_danbooru_wiki_action = QAction('Danbooru Wiki...' + ' ' * 12, parent=self)
-        self.open_gelbooru_wiki_action = QAction('Gelbooru Wiki...' + ' ' * 12, parent=self)
+        self.toggle_focus_mode_action = QAction('Focus Mode', parent=self)
+        self.open_danbooru_wiki_action = QAction('Danbooru Wiki...', parent=self)
+        self.open_gelbooru_wiki_action = QAction('Gelbooru Wiki...', parent=self)
         self.create_menus()
         self.app.installEventFilter(self)
 
@@ -267,14 +323,17 @@ class MainWindow(QMainWindow):
                              Qt.Key.Key_PageDown, Qt.Key.Key_Home,
                              Qt.Key.Key_End))
         self.installEventFilter(key_press_forwarder)
-        # Remove the Ctrl+Z shortcut from text input boxes to prevent it from
-        # conflicting with the undo action.
+        # Let the Undo/Redo keys reach the app's undo actions instead of being
+        # taken by these text boxes' own undo. The keys are kept in sync with
+        # the (possibly customized) Undo/Redo shortcuts in
+        # ``apply_configured_shortcuts``.
         ctrl_z = QKeyCombination(Qt.KeyboardModifier.ControlModifier,
                                  key=Qt.Key.Key_Z)
         ctrl_y = QKeyCombination(Qt.KeyboardModifier.ControlModifier,
                                  key=Qt.Key.Key_Y)
         shortcut_remover = ShortcutRemover(parent=self,
                                            shortcuts=(ctrl_z, ctrl_y))
+        self._text_box_shortcut_remover = shortcut_remover
         self.image_list.filter_line_edit.installEventFilter(shortcut_remover)
         self.image_tags_editor.tag_input_box.installEventFilter(
             shortcut_remover)
@@ -288,9 +347,7 @@ class MainWindow(QMainWindow):
         self.focus_filter_images_box_shortcut = QShortcut(
             QKeySequence('Alt+F'), self)
         self.focus_filter_images_box_shortcut.activated.connect(
-            self.image_list.raise_)
-        self.focus_filter_images_box_shortcut.activated.connect(
-            self.image_list.filter_line_edit.setFocus)
+            self.focus_image_list_filter)
         self.focus_add_tag_box_shortcut = QShortcut(
             QKeySequence('Alt+A'), self)
         self.focus_add_tag_box_shortcut.activated.connect(
@@ -304,9 +361,7 @@ class MainWindow(QMainWindow):
         self.focus_search_tags_box_shortcut = QShortcut(
             QKeySequence('Alt+S'), self)
         self.focus_search_tags_box_shortcut.activated.connect(
-            self.all_tags_editor.raise_)
-        self.focus_search_tags_box_shortcut.activated.connect(
-            self.all_tags_editor.filter_line_edit.setFocus)
+            self.focus_all_tags_search)
         self.focus_caption_button_shortcut = QShortcut(
             QKeySequence('Alt+C'), self)
         self.focus_caption_button_shortcut.activated.connect(
@@ -375,6 +430,16 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent):
         """Save the window geometry and state before closing."""
+        # Closing while the captioning thread runs would destroy it mid-run and
+        # crash the app. Cancel it and close once it has stopped instead.
+        if self.auto_captioner.is_captioning:
+            event.ignore()
+            if not getattr(self, '_close_after_captioning', False):
+                self._close_after_captioning = True
+                self.auto_captioner.cancel_captioning()
+                self.auto_captioner.update_console_text_edit(
+                    'TagGUI Plus will close as soon as captioning stops.')
+            return
         # When removing app data for an uninstall, skip every save so nothing
         # that was just deleted (settings, completion store, etc.) is recreated.
         if self.is_removing_app_data:
@@ -386,23 +451,8 @@ class MainWindow(QMainWindow):
         get_completion_store().save_if_dirty()
         # Don't overwrite geometry/state if we're closing after importing settings
         if not self.should_skip_save_state_on_close:
-            self.settings.setValue('geometry', self.saveGeometry())
-            current_state = self.saveState()
-            self.settings.setValue('window_state', current_state)
-            # Keep the current mode's cached per-mode layout in sync with what
-            # is on screen (the user may have resized panels without switching
-            # modes since the last swap), then persist both layouts so the
-            # maximized vs. normal panel sizes survive a restart.
-            if self.isMaximized() or self.isFullScreen():
-                self._expanded_dock_state = current_state
-            else:
-                self._normal_dock_state = current_state
-            if self._expanded_dock_state:
-                self.settings.setValue('expanded_dock_state',
-                                       self._expanded_dock_state)
-            if self._normal_dock_state:
-                self.settings.setValue('normal_dock_state',
-                                       self._normal_dock_state)
+            if not getattr(self, '_keep_imported_ui_layout', False):
+                self._save_window_layout()
             # Persist the active image filter so the same filtered view (and
             # position within it) is restored on the next launch.
             self.settings.setValue(
@@ -410,6 +460,36 @@ class MainWindow(QMainWindow):
                 self.image_list.filter_line_edit.text())
             self.settings.sync()
         super().closeEvent(event)
+
+    def _save_window_layout(self):
+        if self._focus_mode_saved is not None:
+            # Save the layout from before focus mode, so the next launch
+            # doesn't start full screen with the panes hidden.
+            geometry, current_state, window_state = self._focus_mode_saved
+            self.settings.setValue('geometry', geometry)
+            self.settings.setValue('window_state', current_state)
+            if self._window_state_is_expanded(window_state):
+                self._expanded_dock_state = current_state
+            else:
+                self._normal_dock_state = current_state
+        else:
+            self.settings.setValue('geometry', self.saveGeometry())
+            current_state = self.saveState()
+            self.settings.setValue('window_state', current_state)
+            # Keep the current mode's cached per-mode layout in sync with
+            # what is on screen (the user may have resized panels without
+            # switching modes since the last swap), then persist both layouts
+            # so the maximized vs. normal panel sizes survive a restart.
+            if self.isMaximized() or self.isFullScreen():
+                self._expanded_dock_state = current_state
+            else:
+                self._normal_dock_state = current_state
+        if self._expanded_dock_state:
+            self.settings.setValue('expanded_dock_state',
+                                   self._expanded_dock_state)
+        if self._normal_dock_state:
+            self.settings.setValue('normal_dock_state',
+                                   self._normal_dock_state)
 
     @Slot()
     def _show_window(self):
@@ -515,6 +595,158 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(
             0, lambda: setattr(self, '_suppress_dock_snapshot', False))
 
+    def is_focus_mode(self) -> bool:
+        return self._focus_mode_saved is not None
+
+    def toggle_focus_mode(self, enabled: bool | None = None):
+        """Switch focus mode on or off (toggle when `enabled` is None).
+
+        Focus mode makes the window full screen and hides every pane except
+        the image preview and the Image Tags pane. Leaving it restores the
+        previous window size, state and panel layout exactly.
+        """
+        if enabled is None:
+            enabled = not self.is_focus_mode()
+        if enabled == self.is_focus_mode():
+            self.toggle_focus_mode_action.setChecked(enabled)
+            return
+        if enabled:
+            self._enter_focus_mode()
+        else:
+            self._exit_focus_mode()
+        self.toggle_focus_mode_action.setChecked(enabled)
+
+    def _enter_focus_mode(self):
+        self._focus_mode_saved = (self.saveGeometry(), self.saveState(),
+                                  self.windowState())
+        self._focus_mode_pre_size = self.size()
+        self._focus_mode_exit_focus_target = None
+        # Pause the per-mode (maximized/normal) layout tracking so going full
+        # screen neither re-applies the saved maximized layout (which would
+        # re-show the hidden panes) nor records the focus layout.
+        self._focus_mode_tracking_was_ready = self._dock_state_tracking_ready
+        self._dock_state_tracking_ready = False
+        self._dock_settle_timer.stop()
+        self._pending_dock_restore = None
+        hidden_docks = (self.image_list, self.all_tags_editor,
+                        self.auto_captioner)
+        focus_widget = QApplication.focusWidget()
+        focus_was_hidden = focus_widget is not None and any(
+            dock.isAncestorOf(focus_widget) for dock in hidden_docks)
+        for dock in hidden_docks:
+            dock.hide()
+        self.image_tags_editor.show()
+        # Qt ignores shortcuts whose only widget is hidden, so attach the
+        # Images pane actions (Copy Tags, Mark as Complete, etc.) to the main
+        # window while that pane is hidden. Select All is left out because it
+        # only applies while the thumbnails have focus.
+        list_view = self.image_list.list_view
+        self._focus_mode_extra_actions = [
+            action for (_, action) in list_view.get_shortcut_actions().values()
+            if action is not list_view.select_all_images_action]
+        self.addActions(self._focus_mode_extra_actions)
+        if focus_was_hidden:
+            self._focus_image_tags_pane()
+        self.image_viewer.set_focus_overlay_text(
+            self.image_list.image_index_label.text())
+        self.image_viewer.set_focus_overlay_enabled(True)
+        self.showFullScreen()
+
+    def _focus_image_tags_pane(self):
+        editor = self.image_tags_editor
+        if editor.tag_input_box.isVisible() and editor.tag_input_box.isEnabled():
+            editor.tag_input_box.setFocus()
+        else:
+            editor.setFocus()
+
+    def _focus_dock_box(self, dock, line_edit):
+        # These boxes live in panes that focus mode hides, so leave focus
+        # mode first rather than typing into an invisible box. The panes are
+        # only re-shown once the exit finishes, so focus the box then too.
+        if self.is_focus_mode():
+            self.toggle_focus_mode(False)
+            self._focus_mode_exit_focus_target = (dock, line_edit)
+        dock.raise_()
+        line_edit.setFocus()
+
+    def focus_image_list_filter(self):
+        self._focus_dock_box(self.image_list, self.image_list.filter_line_edit)
+
+    def focus_all_tags_search(self):
+        self._focus_dock_box(self.all_tags_editor,
+                             self.all_tags_editor.filter_line_edit)
+
+    def _on_captioning_started(self):
+        # Alt+C focuses the (hidden) Start button, which becomes Cancel once
+        # captioning starts; move focus off it so a stray Enter or Space
+        # can't cancel captioning invisibly.
+        if self.is_focus_mode():
+            focus_widget = QApplication.focusWidget()
+            if (focus_widget is None
+                    or self.auto_captioner.isAncestorOf(focus_widget)):
+                self._focus_image_tags_pane()
+
+    def _exit_focus_mode(self):
+        geometry, dock_state, window_state = self._focus_mode_saved
+        self._focus_mode_saved = None
+        self.image_viewer.set_focus_overlay_enabled(False)
+        for action in self._focus_mode_extra_actions:
+            self.removeAction(action)
+        self._focus_mode_extra_actions = []
+        if window_state & Qt.WindowState.WindowFullScreen:
+            pass
+        elif window_state & Qt.WindowState.WindowMaximized:
+            # On Windows, leaving full screen for maximized briefly passes
+            # through the normal (restored) window size, which shows as a
+            # visible shrink-and-grow. Holding the minimum size at the
+            # maximized size until the switch finishes hides that step.
+            self._focus_mode_restore_min_size = True
+            available = self.screen().availableGeometry().size()
+            self.setMinimumSize(
+                self._focus_mode_pre_size.boundedTo(available).expandedTo(
+                    self.minimumSize()))
+            self.showMaximized()
+        else:
+            self.showNormal()
+            self.restoreGeometry(geometry)
+        self.restoreState(dock_state)
+        # Re-apply the layout once the window has finished resizing back
+        # (the resize can squash the panels), then resume layout tracking.
+        QTimer.singleShot(
+            250, lambda: self._finish_exit_focus_mode(dock_state))
+
+    def _finish_exit_focus_mode(self, dock_state):
+        if self._focus_mode_restore_min_size:
+            self._focus_mode_restore_min_size = False
+            # The main window's minimum normally comes from its layout, so
+            # clear the temporary one and let the layout recalculate it.
+            self.setMinimumSize(0, 0)
+            if self.layout() is not None:
+                self.layout().invalidate()
+                self.layout().activate()
+        if self.is_focus_mode():
+            return
+        self.restoreState(dock_state)
+        self._suppress_dock_snapshot = False
+        self._dock_state_tracking_ready = self._focus_mode_tracking_was_ready
+        target = self._focus_mode_exit_focus_target
+        self._focus_mode_exit_focus_target = None
+        if target is not None:
+            dock, line_edit = target
+            dock.raise_()
+            line_edit.setFocus()
+
+    def keyPressEvent(self, event):
+        # Only reached when the focused widget didn't use the key, so Esc
+        # still cancels tag editing, completions, etc. first.
+        if (event.key() == Qt.Key.Key_Escape
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and self.is_focus_mode()):
+            self.toggle_focus_mode(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _snapshot_current_dock_state(self):
         """Cache the current panel layout for whichever mode is active now.
 
@@ -617,6 +849,9 @@ class MainWindow(QMainWindow):
     def set_windows_title_bar_theme(self, widget: QWidget, use_dark_mode: bool,
                                     force_frame_refresh: bool = True):
         if sys.platform != 'win32':
+            return
+        # Delayed calls can arrive after the window was already deleted.
+        if not shiboken6.isValid(widget):
             return
         window_handle = widget.windowHandle()
         if window_handle is None or not window_handle.isTopLevel():
@@ -739,7 +974,20 @@ class MainWindow(QMainWindow):
         # next tag-count update as a new baseline, not a user-driven deletion.
         self.skip_next_all_tags_removal_prompt = True
         self.is_syncing_tag_library_from_directory = True
-        self.directory_path = path.resolve()
+        # Remembered so a failed load can put things back as they were.
+        self._directory_state_before_load = (
+            self.directory_path, self.windowTitle(), save_path_to_settings)
+        # Load and refresh must use the same form of the path (refresh uses
+        # `self.directory_path`); otherwise, for folders on mapped network
+        # drives or reached through links, every refresh would see all images
+        # as removed and re-added.
+        new_directory_path = path.resolve()
+        # An open Directory Analytics report describes the old folder; reloading
+        # the same folder keeps it open.
+        if new_directory_path != self.directory_path:
+            self._close_directory_analytics_dialog()
+        self.directory_path = new_directory_path
+        self.directory_analytics_action.setEnabled(True)
         if save_path_to_settings:
             self.settings.setValue('directory_path', str(self.directory_path))
         self.setWindowTitle(path.name)
@@ -748,13 +996,42 @@ class MainWindow(QMainWindow):
         # Filter to reapply once loading completes (empty clears the filter, as
         # every normal directory load does).
         self._pending_directory_filter = restore_filter
-        self.image_list_model.load_directory(path)
+        # Tag positions remembered by the grid view belong to the old folder.
+        self.image_tags_editor.group_tags_panel.reset_order_memory()
+        self.image_list_model.load_directory(self.directory_path)
+
+    @Slot(object, str)
+    def _on_directory_load_failed(self, directory_path: Path, message: str):
+        previous_path, previous_title, was_saved = (
+            self._directory_state_before_load)
+        self.directory_path = previous_path
+        self.directory_analytics_action.setEnabled(previous_path is not None)
+        self.setWindowTitle(previous_title)
+        if was_saved:
+            # Never save an empty path: on the next launch `Path('')` would
+            # mean "the folder the app was started from" and load that.
+            if previous_path is not None:
+                self.settings.setValue('directory_path', str(previous_path))
+            else:
+                self.settings.remove('directory_path')
+        self.skip_next_all_tags_removal_prompt = False
+        self.is_syncing_tag_library_from_directory = False
+        self._pending_directory_filter = ''
+        self._show_window()
+        QMessageBox.warning(
+            self, 'Could Not Load Folder',
+            f'The folder could not be loaded:\n{directory_path}\n\n{message}')
 
     @Slot(object)
     def _on_tokenizer_loaded(self, tokenizer):
         self.proxy_image_list_model.set_tokenizer(tokenizer)
         self.image_tags_editor.set_tokenizer(tokenizer)
         self.image_list_model.set_tokenizer(tokenizer)
+        filter_line_edit = self.image_list.filter_line_edit
+        filter_line_edit.tokens_filter_available = True
+        if 'tokens' in filter_line_edit.text().casefold():
+            # A `tokens:` filter was rejected while the tokenizer loaded.
+            self.set_image_list_filter()
         # Re-sort if images are currently sorted by token count, which was not
         # computable before the tokenizer finished loading.
         if (self.image_list.sort_by_combo_box.currentData()
@@ -790,7 +1067,7 @@ class MainWindow(QMainWindow):
         row_count = self.proxy_image_list_model.rowCount()
         if row_count:
             select_index = max(0, min(select_index, row_count - 1))
-        self.image_list.list_view.setCurrentIndex(
+        self.image_list.list_view.set_current_image_index(
             self.proxy_image_list_model.index(select_index, 0))
         self.centralWidget().setCurrentWidget(self.image_viewer)
         self.reload_directory_action.setDisabled(False)
@@ -802,9 +1079,35 @@ class MainWindow(QMainWindow):
         # therefore no first_image_rendered signal, so show the window now.
         if not self.image_list_model.images:
             self._show_window()
+        skipped_directories = self.image_list_model.skipped_directories
+        if skipped_directories:
+            # Deferred so the window (and first image) can appear first.
+            QTimer.singleShot(
+                0, lambda: self._show_skipped_directories_notice(
+                    skipped_directories))
+
+    def _show_skipped_directories_notice(self, skipped_directories):
+        self._show_window()
+        listed = '\n'.join(str(path) for path in skipped_directories[:10])
+        if len(skipped_directories) > 10:
+            listed += f'\n... and {len(skipped_directories) - 10} more'
+        QMessageBox.information(
+            self, f'{pluralize("Subfolder", len(skipped_directories))} '
+                  f'Skipped',
+            f'{len(skipped_directories)} '
+            f'{pluralize("subfolder", len(skipped_directories))} could not '
+            f'be read (for example, because of folder permissions), so '
+            f'images inside {"it" if len(skipped_directories) == 1 else "them"}'
+            f' are not shown:\n\n{listed}')
 
     @Slot()
     def select_and_load_directory(self):
+        if self.auto_captioner.is_captioning:
+            QMessageBox.information(
+                self, 'Auto-captioning in progress',
+                'Cancel or finish auto-captioning before loading another '
+                'folder.')
+            return
         initial_directory = (str(self.directory_path)
                              if self.directory_path else '')
         load_directory_path = QFileDialog.getExistingDirectory(
@@ -856,6 +1159,10 @@ class MainWindow(QMainWindow):
         if structure_changed:
             self.image_list.apply_current_sort()
             self.tag_counter_model.count_tags(self.image_list_model.images)
+            # Rebuild the grid from the current selection now, so the cell
+            # refresh below doesn't work from rows that have since moved.
+            if self.image_viewer.is_grid_mode():
+                self._sync_variant_group_view()
         if not changed_rows:
             return
         if self.image_viewer.is_grid_mode():
@@ -875,7 +1182,8 @@ class MainWindow(QMainWindow):
             current_proxy_index)
         if current_source_index.row() not in changed_rows:
             return
-        self.image_viewer.load_image(current_proxy_index)
+        # Keep the user's zoom and position while showing the updated file.
+        self.image_viewer.reload_image(current_proxy_index)
 
 
     @Slot()
@@ -1010,7 +1318,13 @@ class MainWindow(QMainWindow):
         if not selected_categories:
             return
         
-        if import_settings(import_data, selected_categories):
+        if import_settings(import_data, selected_categories,
+                           tag_library_model=self.tag_library_model):
+            if 'ui_layout' in selected_categories:
+                # Keep the imported window layout even if the user declines
+                # the restart: closing would otherwise save the current one
+                # over it.
+                self._keep_imported_ui_layout = True
             # Completion marks apply without a restart: re-home imported marks
             # onto matching images (by hash) and refresh the completion icons
             # by re-scanning the current directory.
@@ -1030,7 +1344,8 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(
                 self, 'Import Failed',
-                'Failed to import settings. Please check file permissions.')
+                'The settings in this file could not be imported. Nothing '
+                'was changed.')
 
     def _restart_application(self):
         """Restart the application.
@@ -1086,6 +1401,8 @@ class MainWindow(QMainWindow):
             ('paste_tags', 'Paste Tags', 'Ctrl+V'),
             ('copy_file_name', 'Copy File Name', 'Ctrl+Shift+P'),
             ('copy_path', 'Copy Path', 'Ctrl+P'),
+            ('copy_image_to_clipboard', 'Copy Image to Clipboard',
+             'Ctrl+Shift+I'),
             ('move_images', 'Move Images to...', 'Ctrl+M'),
             ('copy_images', 'Copy Images to...', 'Ctrl+Shift+M'),
             ('delete_images', 'Delete Images', 'Ctrl+Del'),
@@ -1103,6 +1420,9 @@ class MainWindow(QMainWindow):
             ('select_all_images', 'Select All Images', 'Ctrl+A'),
             ('mark_complete', 'Mark as Complete', 'Ctrl+K'),
             ('mark_incomplete', 'Mark as Incomplete', 'Ctrl+Shift+K'),
+            ('mark_tags_unviewed', 'Mark Tags as Unviewed', 'Ctrl+U'),
+            ('clear_unviewed_markers', 'Clear Unviewed Tag Markers',
+             'Ctrl+Shift+U'),
             ('go_to_previous_image', 'Go to Previous Image', 'Ctrl+Up'),
             ('go_to_next_image', 'Go to Next Image', 'Ctrl+Down'),
             ('jump_to_first_untagged_image', 'Jump to First Untagged Image',
@@ -1123,7 +1443,8 @@ class MainWindow(QMainWindow):
             ('focus_all_tags_search', 'Focus All Tags Search Box', 'Alt+S'),
             ('focus_auto_caption_button', 'Focus Auto-Caption Button', 'Alt+C'),
             ('toggle_editor_mode',
-             'Toggle Natural Language Mode / Current Image Only', 'Ctrl+Space')
+             'Toggle Natural Language Mode / Current Image Only', 'Ctrl+Space'),
+            ('toggle_focus_mode', 'Toggle Focus Mode', 'F11')
         ]
 
     def get_shortcut_action_map(self) -> dict[str, QAction]:
@@ -1166,6 +1487,7 @@ class MainWindow(QMainWindow):
             'focus_all_tags_search': self.focus_search_tags_box_shortcut,
             'focus_auto_caption_button': self.focus_caption_button_shortcut,
             'toggle_editor_mode': self.toggle_editor_mode_shortcut,
+            'toggle_focus_mode': self.toggle_focus_mode_action,
             **image_list_shortcuts
         }
 
@@ -1178,17 +1500,13 @@ class MainWindow(QMainWindow):
         primary shortcuts are constructed in ``__init__``.
         """
         return {
-            'focus_image_list_filter': [
-                self.image_list.raise_,
-                self.image_list.filter_line_edit.setFocus],
+            'focus_image_list_filter': [self.focus_image_list_filter],
             'focus_add_tag_box': [
                 self.image_tags_editor.raise_,
                 self.image_tags_editor.tag_input_box.setFocus],
             'focus_image_tags_list': [
                 self.image_tags_editor.focus_tags_list],
-            'focus_all_tags_search': [
-                self.all_tags_editor.raise_,
-                self.all_tags_editor.filter_line_edit.setFocus],
+            'focus_all_tags_search': [self.focus_all_tags_search],
             'focus_auto_caption_button': [
                 self.auto_captioner.focus_start_cancel_button],
             'go_to_previous_image': [self.image_list.go_to_previous_image],
@@ -1218,16 +1536,13 @@ class MainWindow(QMainWindow):
         handlers_by_id = self.get_shortcut_handlers_map()
         if not hasattr(self, '_extra_qshortcuts'):
             self._extra_qshortcuts = {}
-        for shortcut_id, _, default_shortcut in shortcut_specs:
+        sequences_by_id = resolve_shortcut_sequences(shortcut_specs,
+                                                     configured_shortcuts)
+        for shortcut_id, _, _ in shortcut_specs:
             action = action_by_id.get(shortcut_id)
             if action is None:
                 continue
-            if shortcut_id in configured_shortcuts:
-                sequence_strings = normalize_shortcut_sequences(
-                    configured_shortcuts[shortcut_id])
-            else:
-                sequence_strings = normalize_shortcut_sequences(
-                    default_shortcut)
+            sequence_strings = sequences_by_id[shortcut_id]
             key_sequences = [QKeySequence(sequence)
                              for sequence in sequence_strings]
             # The map holds both QActions (menu/list actions, which support
@@ -1240,6 +1555,19 @@ class MainWindow(QMainWindow):
                     handlers_by_id.get(shortcut_id, []))
             else:
                 action.setShortcuts(key_sequences)
+        remover = getattr(self, '_text_box_shortcut_remover', None)
+        if remover is not None:
+            # Only key combinations with Ctrl/Alt/Meta; a bare key (e.g.
+            # Backspace) must keep editing the text.
+            command_modifiers = (Qt.KeyboardModifier.ControlModifier
+                                 | Qt.KeyboardModifier.AltModifier
+                                 | Qt.KeyboardModifier.MetaModifier)
+            remover.shortcuts = tuple(
+                sequence[0]
+                for action in (self.undo_action, self.redo_action)
+                for sequence in action.shortcuts()
+                if sequence.count() == 1
+                and sequence[0].keyboardModifiers() & command_modifiers)
         # Refresh menu to recalculate layout with shortcuts now set
         self.menu_bar.update()
         self._apply_tag_library_dialog_shortcuts()
@@ -1290,7 +1618,8 @@ class MainWindow(QMainWindow):
         keyboard_shortcuts_dialog = KeyboardShortcutsDialog(
             parent=parent or self,
             shortcut_specs=self.get_shortcut_specs(),
-            configured_shortcuts=configured_shortcuts)
+            configured_shortcuts=resolve_shortcut_sequences(
+                self.get_shortcut_specs(), configured_shortcuts))
         if keyboard_shortcuts_dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.settings.setValue('keyboard_shortcuts',
@@ -1369,6 +1698,9 @@ class MainWindow(QMainWindow):
             'autocomplete_tags',
             defaultValue=DEFAULT_SETTINGS['autocomplete_tags'], type=bool)
         self.image_tags_editor.set_autocomplete_enabled(autocomplete_tags)
+        if getattr(self, '_tag_library_dialog', None) is not None:
+            self._tag_library_dialog.set_autocomplete_enabled(
+                autocomplete_tags)
 
     def reload_directory_for_settings_change(self):
         """Reload the current directory so a changed image-file-formats filter
@@ -1392,10 +1724,44 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def show_directory_analytics_dialog(self):
-        directory_analytics_dialog = DirectoryAnalyticsDialog(
+        # Modeless, so the user can keep working while it is open; reuse an
+        # open one rather than stacking several.
+        dialog = self._directory_analytics_dialog
+        if dialog is not None:
+            dialog.showNormal()
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        dialog = DirectoryAnalyticsDialog(
             parent=self, image_list_model=self.image_list_model,
-            directory_path=self.directory_path)
-        directory_analytics_dialog.exec()
+            directory_path=self.directory_path,
+            select_image_callback=self._select_image_from_analytics)
+        self._directory_analytics_dialog = dialog
+
+        def forget_dialog():
+            if self._directory_analytics_dialog is dialog:
+                self._directory_analytics_dialog = None
+            dialog.deleteLater()
+
+        dialog.finished.connect(forget_dialog)
+        dialog.show()
+
+    def _close_directory_analytics_dialog(self):
+        if self._directory_analytics_dialog is not None:
+            self._directory_analytics_dialog.reject()
+
+    def _select_image_from_analytics(self, image_path) -> str:
+        """Select ``image_path`` in the Images pane for Directory Analytics."""
+        target = Path(image_path)
+        if not any(image.path == target
+                   for image in self.image_list_model.images):
+            return directory_analytics_dialog.NOT_LOADED
+        proxy_row = self._find_proxy_row_of_image(target)
+        if proxy_row is None:
+            return directory_analytics_dialog.HIDDEN_BY_FILTER
+        self.image_list.list_view.set_current_image_index(
+            self.proxy_image_list_model.index(proxy_row, 0))
+        return directory_analytics_dialog.SELECTED
 
     @Slot()
     def show_batch_reorder_tags_dialog(self):
@@ -1553,6 +1919,11 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.toggle_image_tags_editor_action)
         view_menu.addAction(self.toggle_all_tags_editor_action)
         view_menu.addAction(self.toggle_auto_captioner_action)
+        view_menu.addSeparator()
+        self.toggle_focus_mode_action.setCheckable(True)
+        self.toggle_focus_mode_action.triggered.connect(
+            lambda: self.toggle_focus_mode())
+        view_menu.addAction(self.toggle_focus_mode_action)
 
         tools_menu = self.menu_bar.addMenu('Tools')
         self.open_danbooru_wiki_action.triggered.connect(
@@ -1572,9 +1943,12 @@ class MainWindow(QMainWindow):
                                                   parent=self)
         self.directory_analytics_action.triggered.connect(
             self.show_directory_analytics_dialog)
+        # Only available once a folder is loaded (see load_directory).
+        self.directory_analytics_action.setEnabled(
+            self.directory_path is not None)
         tools_menu.addAction(self.directory_analytics_action)
         tools_menu.addSeparator()
-        self.tag_library_action = QAction('Tag Library...' + ' ' * 4, parent=self)
+        self.tag_library_action = QAction('Tag Library...', parent=self)
         self.tag_library_action.triggered.connect(self.show_tag_library_dialog)
         tools_menu.addAction(self.tag_library_action)
 
@@ -1584,19 +1958,27 @@ class MainWindow(QMainWindow):
             lambda: QDesktopServices.openUrl(QUrl(GITHUB_REPOSITORY_URL)))
         help_menu.addAction(open_github_repository_action)
 
+        for menu in (file_menu, edit_menu, view_menu, tools_menu, help_menu):
+            menu.aboutToShow.connect(
+                lambda menu=menu: ensure_menu_shortcut_gap(menu))
+
     @Slot()
     def update_undo_and_redo_actions(self):
+        # Undo/redo are unavailable while auto-captioning runs: undoing part
+        # way through would roll back some captions while the rest kept being
+        # written with no way to undo them.
+        is_captioning = self.auto_captioner.is_captioning
         if self.image_list_model.undo_stack:
             undo_action_name = self.image_list_model.undo_stack[-1].action_name
             self.undo_action.setText(f'Undo "{undo_action_name}"')
-            self.undo_action.setDisabled(False)
+            self.undo_action.setDisabled(is_captioning)
         else:
             self.undo_action.setText('Undo')
             self.undo_action.setDisabled(True)
         if self.image_list_model.redo_stack:
             redo_action_name = self.image_list_model.redo_stack[-1].action_name
             self.redo_action.setText(f'Redo "{redo_action_name}"')
-            self.redo_action.setDisabled(False)
+            self.redo_action.setDisabled(is_captioning)
         else:
             self.redo_action.setText('Redo')
             self.redo_action.setDisabled(True)
@@ -1604,6 +1986,14 @@ class MainWindow(QMainWindow):
     @Slot()
     def set_image_list_filter(self):
         filter_ = self.image_list.filter_line_edit.parse_filter_text()
+        current_index = self.image_list.list_view.currentIndex()
+        current_image = (current_index.data(Qt.ItemDataRole.UserRole)
+                         if current_index.isValid() else None)
+        if (self.proxy_image_list_model.filter is None
+                and filter_ is not None and current_image is not None):
+            # Remember the image (not its row, which changes when re-sorted)
+            # to return to when the filter is cleared.
+            self._image_path_before_filter = current_image.path
         self.proxy_image_list_model.filter = filter_
         # Apply the new filter.
         self.proxy_image_list_model.invalidateFilter()
@@ -1615,13 +2005,26 @@ class MainWindow(QMainWindow):
             self.all_tags_editor.all_tags_list.setCurrentIndex(QModelIndex())
             # Select the previously selected image in the unfiltered image
             # list.
-            select_index = self.settings.value('image_index', type=int) or 0
-            self.image_list.list_view.setCurrentIndex(
+            select_index = self._find_proxy_row_of_image(
+                getattr(self, '_image_path_before_filter', None))
+            if select_index is None:
+                select_index = self.settings.value('image_index', type=int) or 0
+            self.image_list.list_view.set_current_image_index(
                 self.proxy_image_list_model.index(select_index, 0))
         else:
             # Select the first image.
-            self.image_list.list_view.setCurrentIndex(
+            self.image_list.list_view.set_current_image_index(
                 self.proxy_image_list_model.index(0, 0))
+
+    def _find_proxy_row_of_image(self, image_path) -> int | None:
+        if image_path is None:
+            return None
+        for proxy_row in range(self.proxy_image_list_model.rowCount()):
+            image = self.proxy_image_list_model.index(proxy_row, 0).data(
+                Qt.ItemDataRole.UserRole)
+            if image is not None and image.path == image_path:
+                return proxy_row
+        return None
 
     @Slot()
     def save_image_index(self, proxy_image_index: QModelIndex):
@@ -1638,6 +2041,8 @@ class MainWindow(QMainWindow):
             self.save_image_index)
         self.image_list_selection_model.currentChanged.connect(
             self.image_list.update_image_index_label)
+        self.image_list.image_index_text_changed.connect(
+            self.image_viewer.set_focus_overlay_text)
         self.image_list_selection_model.currentChanged.connect(
             self.image_viewer.load_image)
         self.image_list_selection_model.currentChanged.connect(
@@ -1649,6 +2054,14 @@ class MainWindow(QMainWindow):
             self._sync_variant_group_view)
         self.image_list_selection_model.currentChanged.connect(
             self._sync_variant_group_view)
+        # The grid holds row positions, and rows can be removed, added or
+        # reordered without the selection signals firing (e.g. a refresh that
+        # removes a selected file), so rebuild it whenever the rows change.
+        for signal in (self.proxy_image_list_model.rowsRemoved,
+                       self.proxy_image_list_model.rowsInserted,
+                       self.proxy_image_list_model.layoutChanged,
+                       self.proxy_image_list_model.modelReset):
+            signal.connect(self._schedule_variant_group_resync)
         self.image_list_model.dataChanged.connect(
             lambda: self.tag_counter_model.count_tags(
                 self.image_list_model.images))
@@ -1662,6 +2075,8 @@ class MainWindow(QMainWindow):
             self.update_undo_and_redo_actions)
         self.image_list_model.directory_loaded.connect(
             self._on_directory_loaded)
+        self.image_list_model.directory_load_failed.connect(
+            self._on_directory_load_failed)
         # Rows are inserted or removed from the proxy image list model when the
         # filter is changed.
         self.proxy_image_list_model.rowsInserted.connect(
@@ -1679,6 +2094,8 @@ class MainWindow(QMainWindow):
         self.image_viewer.grid_cell_clicked.connect(self._select_grid_cell)
         self.image_viewer.grid_cell_context_menu_requested.connect(
             self._show_grid_cell_tag_menu)
+        self.image_viewer.image_context_menu_requested.connect(
+            self._show_image_preview_menu)
         self.tag_counter_model.modelReset.connect(self.track_all_tags_changes)
         # Connecting the signal directly without `isVisible()` causes the menu
         # item to be unchecked when the widget is an inactive tab.
@@ -1711,6 +2128,22 @@ class MainWindow(QMainWindow):
         if len(tag) <= limit:
             return tag
         return tag[:limit - 1] + '\u2026'
+
+    @Slot(QPoint)
+    def _show_image_preview_menu(self, global_point: QPoint):
+        """Context menu for the single-image preview.
+
+        Reuses the Images pane's action, so its text and (customizable)
+        shortcut stay identical in both menus.
+        """
+        self.image_list.list_view.update_context_menu_actions()
+        copy_action = self.image_list.list_view.copy_image_to_clipboard_action
+        if not copy_action.isVisible():
+            return
+        menu = QMenu(self)
+        menu.addAction(copy_action)
+        ensure_menu_shortcut_gap(menu)
+        menu.exec(global_point)
 
     @Slot(QModelIndex, QPoint)
     def _show_grid_cell_tag_menu(self, proxy_index: QModelIndex,
@@ -1794,6 +2227,20 @@ class MainWindow(QMainWindow):
         return tags_to_add + new_implied
 
     @Slot()
+    def _schedule_variant_group_resync(self, *args):
+        if (not self.image_viewer.is_grid_mode()
+                or getattr(self, '_is_variant_group_resync_pending', False)):
+            return
+        self._is_variant_group_resync_pending = True
+
+        def resync():
+            self._is_variant_group_resync_pending = False
+            if self.image_viewer.is_grid_mode():
+                self._sync_variant_group_view()
+
+        QTimer.singleShot(0, resync)
+
+    @Slot()
     def _sync_variant_group_view(self, *args):
         """Reconcile the grouped tag view and grid preview with the selection.
 
@@ -1845,15 +2292,16 @@ class MainWindow(QMainWindow):
             # already ran once while group mode was still active and early
             # returned without refreshing the single-image tag list or the
             # green "Complete" indicator. Now that group mode is off, reload the
-            # current image so both reflect its real state.
+            # current image so both reflect its real state (or empty the pane
+            # if no image is current, e.g. the filter hides everything).
             current_proxy_index = self.image_list_selection_model.currentIndex()
-            if current_proxy_index.isValid():
-                self.image_tags_editor.load_image_tags(current_proxy_index)
+            self.image_tags_editor.load_image_tags(current_proxy_index)
         if was_grid:
             self.image_viewer.exit_grid()
+            # Also called with an invalid index (nothing current), which
+            # clears the grid instead of leaving it on screen.
             current_proxy_index = self.image_list_selection_model.currentIndex()
-            if current_proxy_index.isValid():
-                self.image_viewer.load_image(current_proxy_index)
+            self.image_viewer.load_image(current_proxy_index)
 
     @Slot()
     def _focus_image_list_on_preview_click(self):
@@ -1878,6 +2326,9 @@ class MainWindow(QMainWindow):
         image_index = self.image_tags_editor.image_index
         image: Image = self.image_list_model.data(image_index,
                                                   Qt.ItemDataRole.UserRole)
+        if image is None:
+            # No image is shown (or it was removed): nothing to save to.
+            return
         old_tags = image.tags
         new_tags = list(dict.fromkeys(self.image_tag_list_model.stringList()))
         if old_tags == new_tags:
@@ -1943,10 +2394,19 @@ class MainWindow(QMainWindow):
         the all tags list.
         """
         if not selected_tags:
+            # The last selected tag was deselected: stop filtering by it.
+            self.image_list.filter_line_edit.clear()
             return
         escaped_selected_tags = []
         for selected_tag in selected_tags:
-            escaped_selected_tag = (selected_tag.replace('\\', '\\\\')
+            # `*` and `?` are wildcards in the filter; escape them with a
+            # backslash (shown as `\\?` inside quotes). `[` has no backslash
+            # escape, so it becomes `[[]`.
+            literal_tag = ''.join('\\' + character if character in '*?'
+                                  else '[[]' if character == '['
+                                  else character
+                                  for character in selected_tag)
+            escaped_selected_tag = (literal_tag.replace('\\', '\\\\')
                                     .replace('"', r'\"')
                                     .replace("'", r"\'"))
             escaped_selected_tags.append(f'tag:"{escaped_selected_tag}"')
@@ -2285,9 +2745,9 @@ class MainWindow(QMainWindow):
         self.image_list_model.delete_tags(tags)
         self.image_list.filter_line_edit.clear()
 
-    @Slot(list, str)
-    def handle_all_tags_rename(self, old_tags: list[str], new_tag: str):
-        self.image_list_model.rename_tags(old_tags, new_tag)
+    @Slot(list, list)
+    def handle_all_tags_rename(self, old_tags: list[str], new_tags: list[str]):
+        self.image_list_model.rename_tags(old_tags, new_tags)
         self.image_list.filter_line_edit.clear()
 
     def connect_all_tags_editor_signals(self):
@@ -2311,13 +2771,17 @@ class MainWindow(QMainWindow):
 
     def connect_auto_captioner_signals(self):
         self.auto_captioner.captioning_started.connect(
-            self.clear_pending_auto_caption_category_tags)
+            self._on_captioning_started)
         self.auto_captioner.captioning_started.connect(
-            self.image_tags_editor.begin_auto_caption_run)
+            self.update_undo_and_redo_actions)
+        self.auto_captioner.captioning_finished.connect(
+            self.update_undo_and_redo_actions)
+        self.auto_captioner.captioning_finished.connect(
+            self._close_if_waiting_for_captioning)
+        self.auto_captioner.captioning_started.connect(
+            self.clear_pending_auto_caption_category_tags)
         self.auto_captioner.captioning_finished.connect(
             self.schedule_pending_auto_caption_category_prompt)
-        self.auto_captioner.captioning_finished.connect(
-            self.image_tags_editor.end_auto_caption_run)
         self.auto_captioner.caption_generated.connect(
             self.handle_auto_caption_generated)
         self.auto_captioner.caption_generated.connect(
@@ -2330,12 +2794,25 @@ class MainWindow(QMainWindow):
             lambda: self.toggle_auto_captioner_action.setChecked(
                 self.auto_captioner.isVisible()))
 
+    @Slot()
+    def _close_if_waiting_for_captioning(self):
+        if getattr(self, '_close_after_captioning', False):
+            self._close_after_captioning = False
+            QTimer.singleShot(0, self.close)
+
     @Slot(QModelIndex, str, list, str)
     def handle_auto_caption_generated(self, image_index: QModelIndex,
                                       _caption: str, tags: list[str],
                                       natural_language_prompt: str):
+        image = self.image_list_model.data(image_index,
+                                           Qt.ItemDataRole.UserRole)
+        tags_before = set(image.tags) if image is not None else set()
         self.image_list_model.update_image_caption(image_index, tags,
                                                    natural_language_prompt)
+        # Flag the tags this caption added with an orange "unviewed" dot.
+        if image is not None:
+            self.image_list_model.mark_tags_unviewed(
+                [image], set(image.tags) - tags_before)
 
     @Slot()
     def clear_pending_auto_caption_category_tags(self):
@@ -2475,9 +2952,13 @@ class MainWindow(QMainWindow):
             image_index = 0
         # Load the last loaded directory.
         if self.settings.contains('directory_path'):
-            directory_path = Path(self.settings.value('directory_path',
-                                                      type=str))
-            if directory_path.is_dir():
+            saved_directory_path = self.settings.value('directory_path',
+                                                       type=str)
+            # An empty value (saved by older versions after a failed load)
+            # would otherwise resolve to the app's own working folder.
+            directory_path = (Path(saved_directory_path)
+                              if saved_directory_path.strip() else None)
+            if directory_path is not None and directory_path.is_dir():
                 self.load_directory(directory_path, select_index=image_index,
                                     restore_filter=saved_filter)
                 return

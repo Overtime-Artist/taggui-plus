@@ -34,8 +34,15 @@ _SQUARE_TOLERANCE = 0.02
 _RATIO_TOLERANCE = 0.03
 # Longer-edge boundaries for the resolution buckets.
 _BUCKET_EDGES = (512, 1024, 2048)
+# Shown instead of numbers when there is nothing to summarise.
+NO_DATA = '\u2014'
 # How many "most common" tags to keep in the report.
 _TOP_TAGS = 25
+# Operating-system housekeeping files that are not counted as "other files".
+_SYSTEM_FILE_NAMES = {'thumbs.db', 'ehthumbs.db', 'ehthumbs_vista.db',
+                      'desktop.ini', '.ds_store'}
+# How often (in files) the folder walk reports progress.
+_WALK_PROGRESS_EVERY = 500
 # Named aspect ratios, expressed as long-side / short-side (>= 1.0). Orientation
 # (portrait vs landscape) is tracked separately.
 _NAMED_RATIOS = (
@@ -57,26 +64,31 @@ _NAMED_RATIOS = (
 
 @dataclass
 class FormatCount:
-    suffix: str
+    label: str  # File suffix, aspect-ratio name or tag.
     count: int
     percent: float
 
 
 @dataclass
 class NumberSummary:
-    """min / median / max / average for a set of numbers (all 0 when empty)."""
+    """min / median / max / average for a set of numbers (all 0 when empty;
+    ``count`` is how many numbers there were, so 0 means "no data")."""
     minimum: float = 0.0
     median: float = 0.0
     maximum: float = 0.0
     average: float = 0.0
+    count: int = 0
 
 
 @dataclass
 class SubfolderStats:
+    """Totals for a folder *including all of its subfolders*;
+    ``direct_image_count`` counts only images saved in the folder itself."""
     name: str  # Path relative to the scan root ('.' for the root itself).
     image_count: int
+    direct_image_count: int
     total_size_bytes: int
-    average_megapixels: float
+    average_megapixels: float | None  # None when no image had dimensions.
     caption_coverage_percent: float
     completion_percent: float
 
@@ -102,9 +114,9 @@ class AnalyticsReport:
     orientation_counts: dict[str, int] = field(default_factory=dict)
     aspect_ratio_counts: list[FormatCount] = field(default_factory=list)
     very_small_count: int = 0
-    very_small_examples: list[str] = field(default_factory=list)
+    very_small_paths: list[str] = field(default_factory=list)
     extreme_aspect_count: int = 0
-    extreme_aspect_examples: list[str] = field(default_factory=list)
+    extreme_aspect_paths: list[str] = field(default_factory=list)
 
     # Captions & tags
     images_with_caption: int = 0
@@ -115,19 +127,19 @@ class AnalyticsReport:
     total_tag_instances: int = 0
     most_common_tags: list[FormatCount] = field(default_factory=list)
     rare_tag_count: int = 0
-    rare_tag_examples: list[str] = field(default_factory=list)
+    rare_tags: list[str] = field(default_factory=list)
     images_with_prompt: int = 0
     prompt_length_summary: NumberSummary = field(default_factory=NumberSummary)
     complete_count: int = 0
     completion_percent: float = 0.0
 
-    # Housekeeping
+    # Housekeeping. (Images with no caption file are listed under Captions &
+    # tags: `missing_caption_paths`.)
     orphan_caption_count: int = 0
-    orphan_caption_examples: list[str] = field(default_factory=list)
-    missing_caption_count: int = 0
-    missing_caption_examples: list[str] = field(default_factory=list)
+    orphan_caption_paths: list[str] = field(default_factory=list)
+    missing_caption_paths: list[str] = field(default_factory=list)
     non_image_file_count: int = 0
-    non_image_file_examples: list[str] = field(default_factory=list)
+    non_image_file_paths: list[str] = field(default_factory=list)
 
     # Per-subfolder
     subfolders: list[SubfolderStats] = field(default_factory=list)
@@ -143,7 +155,15 @@ def _summarize(values: list[float]) -> NumberSummary:
         median=float(statistics.median(values)),
         maximum=float(max(values)),
         average=float(statistics.fmean(values)),
+        count=len(values),
     )
+
+
+def _caption_key(path: Path) -> str:
+    """Same matching rule the app uses to pair an image with its caption
+    file (`models.image_list_model.get_caption_key`): the `.txt` path,
+    ignoring upper/lower case on Windows."""
+    return os.path.normcase(str(path.with_suffix('.txt')))
 
 
 def _percent(part: int, whole: int) -> float:
@@ -193,17 +213,18 @@ def _format_counts(counter: dict[str, int], whole: int,
 # --- Main computation ---------------------------------------------------------
 
 def compute_analytics(images, root_directory, image_suffixes,
-                      progress_callback=None, should_cancel=None
-                      ) -> AnalyticsReport | None:
+                      progress_callback=None, should_cancel=None,
+                      walk_callback=None) -> AnalyticsReport | None:
     """Build an :class:`AnalyticsReport` for ``images`` under ``root_directory``.
 
     ``images`` is any iterable of objects exposing the ``Image`` fields listed in
     the module docstring. ``image_suffixes`` is the list of recognised image
     extensions (lower-case, dot-prefixed, e.g. ``['.jpg', '.png']``).
 
-    ``progress_callback(done, total)`` is called as images are processed and
-    ``should_cancel()`` (if given) is polled so a long scan can be aborted; on
-    cancellation ``None`` is returned.
+    ``progress_callback(done, total)`` is called as images are processed,
+    ``walk_callback(files_found)`` (if given) while the folder is first being
+    listed, and ``should_cancel()`` (if given) is polled so a long scan can be
+    aborted; on cancellation ``None`` is returned.
     """
     image_list = list(images)
     total = len(image_list)
@@ -216,7 +237,8 @@ def compute_analytics(images, root_directory, image_suffixes,
     # --- One filesystem walk: file sizes + caption / non-image discovery. -----
     # ``sizes`` maps str(path) -> on-disk byte size for every file in the tree.
     sizes: dict[str, int] = {}
-    caption_stems: set[str] = set()   # str(path without suffix) for .txt files
+    # Caption match key -> actual .txt path, for every caption file found.
+    caption_files: dict[str, str] = {}
     non_image_files: list[str] = []
     if root.exists():
         for dirpath, _dirnames, filenames in os.walk(root):
@@ -228,10 +250,14 @@ def compute_analytics(images, root_directory, image_suffixes,
                     sizes[str(file_path)] = file_path.stat().st_size
                 except OSError:
                     sizes[str(file_path)] = 0
+                if (walk_callback is not None
+                        and len(sizes) % _WALK_PROGRESS_EVERY == 0):
+                    walk_callback(len(sizes))
                 suffix = file_path.suffix.lower()
                 if suffix == '.txt':
-                    caption_stems.add(str(file_path.with_suffix('')))
-                elif suffix not in suffix_set:
+                    caption_files[_caption_key(file_path)] = str(file_path)
+                elif (suffix not in suffix_set
+                      and filename.lower() not in _SYSTEM_FILE_NAMES):
                     non_image_files.append(str(file_path))
 
     # --- Accumulators ---------------------------------------------------------
@@ -245,10 +271,11 @@ def compute_analytics(images, root_directory, image_suffixes,
     widths: list[float] = []
     heights: list[float] = []
     megapixels: list[float] = []
-    tag_counter: dict[str, int] = {}
+    tag_counter: dict[str, int] = {}          # tag -> times used
+    tag_image_counter: dict[str, int] = {}    # tag -> images that have it
     tags_per_image: list[float] = []
     prompt_lengths: list[float] = []
-    image_stems: set[str] = set()
+    image_caption_keys: set[str] = set()
 
     # Per-subfolder accumulators keyed by relative folder name.
     sub_images: dict[str, int] = {}
@@ -261,7 +288,7 @@ def compute_analytics(images, root_directory, image_suffixes,
         if should_cancel is not None and should_cancel():
             return None
         path = Path(image.path)
-        image_stems.add(str(path.with_suffix('')))
+        image_caption_keys.add(_caption_key(path))
 
         # File format.
         suffix = path.suffix.lower() or '(none)'
@@ -305,13 +332,9 @@ def compute_analytics(images, root_directory, image_suffixes,
                 orientation_counter[orientation] += 1
             ratio_counter[ratio_name] = ratio_counter.get(ratio_name, 0) + 1
             if longer_edge < _VERY_SMALL_MAX_EDGE:
-                report.very_small_count += 1
-                if len(report.very_small_examples) < 20:
-                    report.very_small_examples.append(str(path))
+                report.very_small_paths.append(str(path))
             if ratio >= _EXTREME_ASPECT_RATIO:
-                report.extreme_aspect_count += 1
-                if len(report.extreme_aspect_examples) < 20:
-                    report.extreme_aspect_examples.append(str(path))
+                report.extreme_aspect_paths.append(str(path))
         else:
             report.images_without_dimensions += 1
 
@@ -322,9 +345,7 @@ def compute_analytics(images, root_directory, image_suffixes,
             report.images_with_caption += 1
             sub_caption[folder_name] += 1
         else:
-            report.images_without_caption += 1
-            if len(report.missing_caption_examples) < 20:
-                report.missing_caption_examples.append(str(path))
+            report.missing_caption_paths.append(str(path))
 
         tags = list(getattr(image, 'tags', None) or [])
         tags_per_image.append(len(tags))
@@ -332,6 +353,8 @@ def compute_analytics(images, root_directory, image_suffixes,
             report.images_with_zero_tags += 1
         for tag in tags:
             tag_counter[tag] = tag_counter.get(tag, 0) + 1
+        for tag in set(tags):
+            tag_image_counter[tag] = tag_image_counter.get(tag, 0) + 1
 
         prompt = getattr(image, 'natural_language_prompt', '') or ''
         if prompt.strip():
@@ -366,36 +389,66 @@ def compute_analytics(images, root_directory, image_suffixes,
     report.total_unique_tags = len(tag_counter)
     report.total_tag_instances = sum(tag_counter.values())
     report.most_common_tags = _format_counts(
-        tag_counter, report.total_tag_instances, limit=_TOP_TAGS)
+        tag_image_counter, total, limit=_TOP_TAGS)
     rare_tags = sorted(tag for tag, count in tag_counter.items() if count == 1)
     report.rare_tag_count = len(rare_tags)
-    report.rare_tag_examples = rare_tags[:20]
+    report.rare_tags = rare_tags
     report.prompt_length_summary = _summarize(prompt_lengths)
     report.completion_percent = _percent(report.complete_count, total)
+    report.missing_caption_paths.sort()
+    report.images_without_caption = len(report.missing_caption_paths)
+    report.very_small_paths.sort()
+    report.very_small_count = len(report.very_small_paths)
+    report.extreme_aspect_paths.sort()
+    report.extreme_aspect_count = len(report.extreme_aspect_paths)
 
     # --- Finalise housekeeping ------------------------------------------------
-    orphan_stems = sorted(caption_stems - image_stems)
-    report.orphan_caption_count = len(orphan_stems)
-    report.orphan_caption_examples = [stem + '.txt'
-                                      for stem in orphan_stems[:20]]
-    report.missing_caption_count = report.images_without_caption
+    orphans = sorted(caption_path for key, caption_path in caption_files.items()
+                     if key not in image_caption_keys)
+    report.orphan_caption_count = len(orphans)
+    report.orphan_caption_paths = orphans
     non_image_files.sort()
     report.non_image_file_count = len(non_image_files)
-    report.non_image_file_examples = non_image_files[:20]
+    report.non_image_file_paths = non_image_files
 
     # --- Finalise per-subfolder table -----------------------------------------
+    # Each folder's figures include everything beneath it, so every folder on
+    # the way from the root to a folder with images gets a row (the root too).
+    totals: dict[str, dict] = {}
+    for name, direct_count in sub_images.items():
+        if name == '.':
+            chain = ['.']
+        elif Path(name).is_absolute():
+            # Outside the root (not expected); listed on its own.
+            chain = [name]
+        else:
+            name_parts = Path(name).parts
+            chain = ['.'] + [str(Path(*name_parts[:length]))
+                             for length in range(1, len(name_parts) + 1)]
+        for folder in chain:
+            entry = totals.setdefault(folder, {
+                'images': 0, 'direct': 0, 'size': 0, 'mp': [],
+                'caption': 0, 'complete': 0})
+            entry['images'] += direct_count
+            entry['size'] += sub_size.get(name, 0)
+            entry['mp'].extend(sub_mp.get(name, []))
+            entry['caption'] += sub_caption.get(name, 0)
+            entry['complete'] += sub_complete.get(name, 0)
+        totals[name]['direct'] = direct_count
     subfolders: list[SubfolderStats] = []
-    for name in sorted(sub_images):
-        count = sub_images[name]
-        mp_values = sub_mp.get(name, [])
-        avg_mp = statistics.fmean(mp_values) if mp_values else 0.0
+    for name in sorted(totals,
+                       key=lambda n: () if n == '.' else Path(n).parts):
+        entry = totals[name]
+        count = entry['images']
         subfolders.append(SubfolderStats(
             name=name,
             image_count=count,
-            total_size_bytes=sub_size.get(name, 0),
-            average_megapixels=avg_mp,
-            caption_coverage_percent=_percent(sub_caption.get(name, 0), count),
-            completion_percent=_percent(sub_complete.get(name, 0), count),
+            direct_image_count=entry['direct'],
+            total_size_bytes=entry['size'],
+            average_megapixels=(statistics.fmean(entry['mp'])
+                                if entry['mp'] else None),
+            caption_coverage_percent=_percent(entry['caption'], count),
+            completion_percent=_percent(entry['complete'], count),
         ))
     report.subfolders = subfolders
 
@@ -418,25 +471,81 @@ def format_size(num_bytes) -> str:
     return f'{size:.1f} TB'
 
 
-def _summary_row(label: str, summary: NumberSummary, unit: str = '',
-                 decimals: int = 0) -> list[str]:
+def summary_row(label: str, summary: NumberSummary, unit: str = '',
+                decimals: int = 0, no_data: str = NO_DATA) -> list[str]:
+    """A table row of min / median / max / average; ``no_data`` in every
+    cell when nothing was summarised."""
     def fmt(value: float) -> str:
+        if not summary.count:
+            return no_data
         text = f'{value:.{decimals}f}'
         return f'{text}{unit}' if unit else text
     return [label, fmt(summary.minimum), fmt(summary.median),
             fmt(summary.maximum), fmt(summary.average)]
 
 
+def format_megapixels(value: float | None, no_data: str = NO_DATA) -> str:
+    return no_data if value is None else f'{value:.2f}'
+
+
+def relative_path(report: AnalyticsReport, path) -> str:
+    """``path`` relative to the analysed folder (unchanged if outside it)."""
+    try:
+        return str(Path(path).relative_to(report.root_directory))
+    except ValueError:
+        return str(path)
+
+
+def subfolder_summary(report: AnalyticsReport) -> str:
+    """e.g. '3 (plus images directly in the main folder)'."""
+    text = str(report.subfolder_count)
+    if report.folders_with_images > report.subfolder_count:
+        text += ' (plus images directly in the main folder)'
+    return text
+
+
 # --- Exporters ----------------------------------------------------------------
 
+_MARKDOWN_SPECIAL = set('\\`*_[]<>|#')
+
+
+def _md_text(text) -> str:
+    """Escape user text (tags, folder names) for a Markdown table cell, so a
+    `|` cannot split the cell and characters like `*` or `_` show as-is."""
+    return ''.join('\\' + char if char in _MARKDOWN_SPECIAL else char
+                   for char in str(text))
+
+
+def _md_code(text) -> str:
+    """Wrap a path in a Markdown code span, using a longer backtick fence if
+    the path itself contains backticks."""
+    text = str(text)
+    longest = run = 0
+    for char in text:
+        run = run + 1 if char == '`' else 0
+        longest = max(longest, run)
+    fence = '`' * (longest + 1)
+    padding = ' ' if text.startswith('`') or text.endswith('`') else ''
+    return f'{fence}{padding}{text}{padding}{fence}'
+
+
 def report_to_markdown(report: AnalyticsReport) -> str:
-    """Render the report as a Markdown document."""
+    """Render the report as a Markdown document. Paths are relative to the
+    analysed folder, which is named at the top."""
     lines: list[str] = []
     add = lines.append
 
-    add(f'# Directory Analytics')
+    def add_paths(paths):
+        for path in paths:
+            add(f'  - {_md_code(relative_path(report, path))}')
+
+    def add_summary(label, summary, decimals=0):
+        add('| ' + ' | '.join(_md_text(cell) for cell in summary_row(
+            label, summary, decimals=decimals)) + ' |')
+
+    add('# Directory Analytics')
     add('')
-    add(f'**Folder:** `{report.root_directory}`')
+    add(f'**Folder:** {_md_code(report.root_directory)}')
     add('')
 
     # Overview
@@ -444,13 +553,12 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add('')
     add(f'- Total images: **{report.total_images}**')
     add(f'- Total size on disk: **{format_size(report.total_size_bytes)}**')
-    add(f'- Subfolders containing images: **{report.subfolder_count}** '
-        f'(folders with images: {report.folders_with_images})')
+    add(f'- Subfolders with images: **{subfolder_summary(report)}**')
     add('')
     add('| Format | Count | % |')
     add('| --- | ---: | ---: |')
     for item in report.format_breakdown:
-        add(f'| {item.suffix} | {item.count} | {item.percent:.1f}% |')
+        add(f'| {_md_text(item.label)} | {item.count} | {item.percent:.1f}% |')
     add('')
 
     # Resolution
@@ -462,17 +570,13 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add('| Longer edge (px) | Count |')
     add('| --- | ---: |')
     for label, count in report.resolution_buckets.items():
-        add(f'| {label} | {count} |')
+        add(f'| {_md_text(label)} | {count} |')
     add('')
     add('| Measure | Min | Median | Max | Average |')
     add('| --- | ---: | ---: | ---: | ---: |')
-    add('| ' + ' | '.join(_summary_row('Width (px)',
-                                       report.width_summary)) + ' |')
-    add('| ' + ' | '.join(_summary_row('Height (px)',
-                                       report.height_summary)) + ' |')
-    add('| ' + ' | '.join(_summary_row('Megapixels',
-                                       report.megapixel_summary,
-                                       decimals=2)) + ' |')
+    add_summary('Width (px)', report.width_summary)
+    add_summary('Height (px)', report.height_summary)
+    add_summary('Megapixels', report.megapixel_summary, decimals=2)
     add('')
     add(f'- Orientation: landscape {report.orientation_counts.get("landscape", 0)}'
         f', portrait {report.orientation_counts.get("portrait", 0)}'
@@ -481,12 +585,14 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add('| Aspect ratio | Count | % |')
     add('| --- | ---: | ---: |')
     for item in report.aspect_ratio_counts:
-        add(f'| {item.suffix} | {item.count} | {item.percent:.1f}% |')
+        add(f'| {_md_text(item.label)} | {item.count} | {item.percent:.1f}% |')
     add('')
     add(f'- Very small images (longer edge < {_VERY_SMALL_MAX_EDGE}px): '
         f'**{report.very_small_count}**')
+    add_paths(report.very_small_paths)
     add(f'- Extreme aspect ratios (>= {_EXTREME_ASPECT_RATIO:.0f}:1): '
         f'**{report.extreme_aspect_count}**')
+    add_paths(report.extreme_aspect_paths)
     add('')
 
     # Captions & tags
@@ -494,31 +600,32 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add('')
     add(f'- Images with a caption file: **{report.images_with_caption}**')
     add(f'- Images missing a caption file: **{report.images_without_caption}**')
+    add_paths(report.missing_caption_paths)
     add(f'- Images with zero tags: **{report.images_with_zero_tags}**')
     add(f'- Total unique tags: **{report.total_unique_tags}**')
     add(f'- Total tag instances: **{report.total_tag_instances}**')
     add('')
     add('| Tags per image | Min | Median | Max | Average |')
     add('| --- | ---: | ---: | ---: | ---: |')
-    add('| ' + ' | '.join(_summary_row('Tags',
-                                       report.tags_per_image_summary)) + ' |')
+    add_summary('Tags', report.tags_per_image_summary)
     add('')
     add(f'- Images with a natural-language prompt: '
         f'**{report.images_with_prompt}**')
+    add('')
     add('| Prompt length (chars) | Min | Median | Max | Average |')
     add('| --- | ---: | ---: | ---: | ---: |')
-    add('| ' + ' | '.join(_summary_row('Length',
-                                       report.prompt_length_summary)) + ' |')
+    add_summary('Length', report.prompt_length_summary)
     add('')
     add(f'- Completed images (is_complete): **{report.complete_count}** '
         f'({report.completion_percent:.1f}%)')
-    add('')
     add(f'- Rare tags (used once): **{report.rare_tag_count}**')
+    if report.rare_tags:
+        add(f'  - {", ".join(_md_text(tag) for tag in report.rare_tags)}')
     add('')
-    add('| Most common tag | Count | % of instances |')
+    add('| Most common tag | Images | % of images |')
     add('| --- | ---: | ---: |')
     for item in report.most_common_tags:
-        add(f'| {item.suffix} | {item.count} | {item.percent:.1f}% |')
+        add(f'| {_md_text(item.label)} | {item.count} | {item.percent:.1f}% |')
     add('')
 
     # Housekeeping
@@ -526,25 +633,24 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add('')
     add(f'- Orphaned caption files (no matching image): '
         f'**{report.orphan_caption_count}**')
-    for example in report.orphan_caption_examples:
-        add(f'  - `{example}`')
-    add(f'- Images with no caption file: **{report.missing_caption_count}**')
-    for example in report.missing_caption_examples:
-        add(f'  - `{example}`')
+    add_paths(report.orphan_caption_paths)
     add(f'- Other (non-image) files: **{report.non_image_file_count}**')
-    for example in report.non_image_file_examples:
-        add(f'  - `{example}`')
+    add_paths(report.non_image_file_paths)
     add('')
 
     # Per-subfolder
     add('## Per-subfolder')
     add('')
-    add('| Folder | Images | Size | Avg MP | Caption % | Complete % |')
-    add('| --- | ---: | ---: | ---: | ---: | ---: |')
+    add('Figures include subfolders; *Direct* counts only the images saved in '
+        'the folder itself.')
+    add('')
+    add('| Folder | Images | Direct | Size | Avg MP | Caption % | Complete % |')
+    add('| --- | ---: | ---: | ---: | ---: | ---: | ---: |')
     for sub in report.subfolders:
-        add(f'| {sub.name} | {sub.image_count} | '
+        add(f'| {_md_text(sub.name)} | {sub.image_count} | '
+            f'{sub.direct_image_count} | '
             f'{format_size(sub.total_size_bytes)} | '
-            f'{sub.average_megapixels:.2f} | '
+            f'{format_megapixels(sub.average_megapixels)} | '
             f'{sub.caption_coverage_percent:.1f}% | '
             f'{sub.completion_percent:.1f}% |')
     add('')
@@ -553,7 +659,8 @@ def report_to_markdown(report: AnalyticsReport) -> str:
 
 
 def report_to_csv(report: AnalyticsReport) -> str:
-    """Render the report as CSV text (several labelled sections)."""
+    """Render the report as CSV text (several labelled sections). Paths are
+    relative to the analysed folder; cells with no data are left empty."""
     import csv
     import io
 
@@ -562,6 +669,14 @@ def report_to_csv(report: AnalyticsReport) -> str:
 
     def blank():
         writer.writerow([])
+
+    def write_paths(paths):
+        for path in paths:
+            writer.writerow(['', relative_path(report, path)])
+
+    def write_summary(label, summary, decimals=0):
+        writer.writerow(summary_row(label, summary, decimals=decimals,
+                                    no_data=''))
 
     writer.writerow(['Directory Analytics'])
     writer.writerow(['Folder', report.root_directory])
@@ -572,13 +687,15 @@ def report_to_csv(report: AnalyticsReport) -> str:
     writer.writerow(['Total size (bytes)', report.total_size_bytes])
     writer.writerow(['Total size', format_size(report.total_size_bytes)])
     writer.writerow(['Subfolders with images', report.subfolder_count])
-    writer.writerow(['Folders with images', report.folders_with_images])
+    writer.writerow(['Images directly in the main folder',
+                     'Yes' if report.folders_with_images
+                     > report.subfolder_count else 'No'])
     blank()
 
     writer.writerow(['File formats'])
     writer.writerow(['Format', 'Count', 'Percent'])
     for item in report.format_breakdown:
-        writer.writerow([item.suffix, item.count, f'{item.percent:.1f}'])
+        writer.writerow([item.label, item.count, f'{item.percent:.1f}'])
     blank()
 
     writer.writerow(['Resolution buckets (longer edge px)'])
@@ -589,10 +706,9 @@ def report_to_csv(report: AnalyticsReport) -> str:
 
     writer.writerow(['Resolution summary'])
     writer.writerow(['Measure', 'Min', 'Median', 'Max', 'Average'])
-    writer.writerow(_summary_row('Width (px)', report.width_summary))
-    writer.writerow(_summary_row('Height (px)', report.height_summary))
-    writer.writerow(_summary_row('Megapixels', report.megapixel_summary,
-                                 decimals=2))
+    write_summary('Width (px)', report.width_summary)
+    write_summary('Height (px)', report.height_summary)
+    write_summary('Megapixels', report.megapixel_summary, decimals=2)
     blank()
 
     writer.writerow(['Orientation'])
@@ -604,19 +720,22 @@ def report_to_csv(report: AnalyticsReport) -> str:
     writer.writerow(['Aspect ratios'])
     writer.writerow(['Ratio', 'Count', 'Percent'])
     for item in report.aspect_ratio_counts:
-        writer.writerow([item.suffix, item.count, f'{item.percent:.1f}'])
+        writer.writerow([item.label, item.count, f'{item.percent:.1f}'])
     blank()
 
     writer.writerow(['Flags'])
-    writer.writerow(['Very small images', report.very_small_count])
-    writer.writerow(['Extreme aspect ratios', report.extreme_aspect_count])
     writer.writerow(['Images without readable dimensions',
                      report.images_without_dimensions])
+    writer.writerow(['Very small images', report.very_small_count])
+    write_paths(report.very_small_paths)
+    writer.writerow(['Extreme aspect ratios', report.extreme_aspect_count])
+    write_paths(report.extreme_aspect_paths)
     blank()
 
     writer.writerow(['Captions & tags'])
     writer.writerow(['Images with caption', report.images_with_caption])
     writer.writerow(['Images without caption', report.images_without_caption])
+    write_paths(report.missing_caption_paths)
     writer.writerow(['Images with zero tags', report.images_with_zero_tags])
     writer.writerow(['Total unique tags', report.total_unique_tags])
     writer.writerow(['Total tag instances', report.total_tag_instances])
@@ -624,43 +743,42 @@ def report_to_csv(report: AnalyticsReport) -> str:
     writer.writerow(['Completed images', report.complete_count])
     writer.writerow(['Completion percent', f'{report.completion_percent:.1f}'])
     writer.writerow(['Rare tags (used once)', report.rare_tag_count])
+    for tag in report.rare_tags:
+        writer.writerow(['', tag])
     blank()
 
     writer.writerow(['Tags per image'])
     writer.writerow(['Measure', 'Min', 'Median', 'Max', 'Average'])
-    writer.writerow(_summary_row('Tags', report.tags_per_image_summary))
+    write_summary('Tags', report.tags_per_image_summary)
     blank()
 
     writer.writerow(['Prompt length (chars)'])
     writer.writerow(['Measure', 'Min', 'Median', 'Max', 'Average'])
-    writer.writerow(_summary_row('Length', report.prompt_length_summary))
+    write_summary('Length', report.prompt_length_summary)
     blank()
 
     writer.writerow(['Most common tags'])
-    writer.writerow(['Tag', 'Count', 'Percent of instances'])
+    writer.writerow(['Tag', 'Images', 'Percent of images'])
     for item in report.most_common_tags:
-        writer.writerow([item.suffix, item.count, f'{item.percent:.1f}'])
+        writer.writerow([item.label, item.count, f'{item.percent:.1f}'])
     blank()
 
     writer.writerow(['Housekeeping'])
     writer.writerow(['Orphaned caption files', report.orphan_caption_count])
-    for example in report.orphan_caption_examples:
-        writer.writerow(['', example])
-    writer.writerow(['Images with no caption', report.missing_caption_count])
-    for example in report.missing_caption_examples:
-        writer.writerow(['', example])
+    write_paths(report.orphan_caption_paths)
     writer.writerow(['Non-image files', report.non_image_file_count])
-    for example in report.non_image_file_examples:
-        writer.writerow(['', example])
+    write_paths(report.non_image_file_paths)
     blank()
 
-    writer.writerow(['Per-subfolder'])
-    writer.writerow(['Folder', 'Images', 'Size (bytes)', 'Average megapixels',
-                     'Caption coverage %', 'Completion %'])
+    writer.writerow(['Per-subfolder (figures include subfolders)'])
+    writer.writerow(['Folder', 'Images', 'Direct images', 'Size (bytes)',
+                     'Average megapixels', 'Caption coverage %',
+                     'Completion %'])
     for sub in report.subfolders:
         writer.writerow([
-            sub.name, sub.image_count, sub.total_size_bytes,
-            f'{sub.average_megapixels:.2f}',
+            sub.name, sub.image_count, sub.direct_image_count,
+            sub.total_size_bytes,
+            format_megapixels(sub.average_megapixels, no_data=''),
             f'{sub.caption_coverage_percent:.1f}',
             f'{sub.completion_percent:.1f}'])
 

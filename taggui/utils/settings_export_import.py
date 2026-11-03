@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 from utils.completion_store import get_completion_store
@@ -6,6 +7,9 @@ from utils.enums import (CaptionDestination, CaptionPosition,
                          NaturalLanguagePosition, ThemeMode)
 from utils.settings import (DEFAULT_SETTINGS, REORDER_OPTIONS,
                             SETTINGS_KEY_MIGRATIONS,
+                            _normalize_tag_library_aliases,
+                            _normalize_tag_library_implications,
+                            _normalize_tag_library_profiles,
                             get_settings,
                             save_tag_library_aliases,
                             save_tag_library_implications,
@@ -134,15 +138,16 @@ def _validate_caption_destination_by_model(value):
 # listed here are ignored on import so that unknown/arbitrary keys from a
 # tampered or future file cannot pollute QSettings. ``hidden_model_ids`` is
 # intentionally omitted because it is imported via ``save_hidden_model_ids``.
+# The numeric ranges match the spin boxes in the Settings dialog.
 _GENERAL_PREFERENCES_VALIDATORS = {
-    'font_size': _make_int_validator(minimum=6, maximum=72),
+    'font_size': _make_int_validator(minimum=1, maximum=99),
     'theme': _make_choice_validator(member.value for member in ThemeMode),
-    'image_list_font_size': _make_int_validator(minimum=6, maximum=72),
+    'image_list_font_size': _make_int_validator(minimum=1, maximum=99),
     'image_list_file_formats': _validate_str,
-    'image_list_image_width': _make_int_validator(minimum=32, maximum=4096),
+    'image_list_image_width': _make_int_validator(minimum=16, maximum=9999),
     'image_list_show_resolution_badge': _validate_bool,
     'image_list_resolution_badge_font_size':
-        _make_int_validator(minimum=4, maximum=72),
+        _make_int_validator(minimum=1, maximum=99),
     'image_list_resolution_badge_transparency':
         _make_int_validator(minimum=0, maximum=100),
     'image_list_show_completion_icon': _validate_bool,
@@ -158,7 +163,7 @@ _GENERAL_PREFERENCES_VALIDATORS = {
     'disable_new_tag_auto_select': _validate_bool,
     'models_directory_path': _validate_str,
     'image_editor_executable_path': _validate_str,
-    'image_tags_token_limit': _make_int_validator(minimum=0, maximum=100000),
+    'image_tags_token_limit': _make_int_validator(minimum=1, maximum=999999),
     'tag_library_keep_or_remove_default_choice':
         _make_choice_validator(('Keep', 'Remove')),
     'tag_library_ask_keep_or_remove': _validate_bool,
@@ -511,27 +516,68 @@ def export_settings(include_tag_library: bool = False,
 def save_settings_to_file(file_path: str, include_tag_library: bool = False,
                           include_auto_captioner: bool = True,
                           include_completed_images: bool = False) -> bool:
-    """Export settings to a JSON file."""
+    """Export settings to a JSON file (UTF-8).
+
+    The file is written to a temporary file next to the target first and then
+    swapped in, so a failed write never leaves a half-written file behind
+    (or destroys an earlier export saved under the same name).
+    """
+    temp_path = None
     try:
         export_data = export_settings(include_tag_library,
                                       include_auto_captioner,
                                       include_completed_images)
-        
+
         # Convert QByteArray and other non-JSON-serializable types
         export_data = _make_json_serializable(export_data)
-        
-        with open(file_path, 'w') as f:
-            json.dump(export_data, f, indent=2)
+
+        target = Path(file_path)
+        temp_path = target.with_name(f'{target.name}.{os.getpid()}.tmp')
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, indent=2, ensure_ascii=False)
+        os.replace(temp_path, target)
+        temp_path = None
         return True
     except Exception as e:
         print(f"Error saving settings: {e}")
         return False
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def backup_all_settings() -> Path | None:
+    """Save every setting (including the Tag Library) to a time-stamped JSON
+    file that can be restored with File > Import Settings. Saved in the cache
+    folder (or the home folder if that fails). Returns None if it failed."""
+    from datetime import datetime
+    from utils.scan_cache import _get_cache_dir
+    file_name = f'settings-backup-{datetime.now():%Y-%m-%d_%H-%M-%S}.json'
+    for get_folder in (_get_cache_dir, Path.home):
+        try:
+            folder = get_folder()
+            folder.mkdir(parents=True, exist_ok=True)
+            backup_path = folder / file_name
+            if save_settings_to_file(str(backup_path),
+                                     include_tag_library=True,
+                                     include_auto_captioner=True):
+                return backup_path
+        except Exception:
+            continue
+    return None
 
 
 def load_settings_from_file(file_path: str) -> dict | None:
-    """Load settings from a JSON file."""
+    """Load settings from a JSON file.
+
+    Read as UTF-8, also accepting a leading byte-order mark (Windows Notepad
+    adds one when saving as UTF-8), so a hand-edited file still loads.
+    """
     try:
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             data = json.load(f)
         if not isinstance(data, dict) or 'version' not in data or 'data' not in data:
             return None
@@ -546,92 +592,187 @@ def load_settings_from_file(file_path: str) -> dict | None:
         return None
 
 
-def import_settings(import_data: dict, categories_to_import: list[str]) -> bool:
-    """Import settings from loaded data."""
+def _sanitize_tag_library(category_data) -> dict | None:
+    """Return a clean, complete Tag Library from imported data, or ``None`` if
+    the data holds no tags (replacing with it would empty the library).
+
+    The result always has all six parts; a part missing from the file becomes
+    empty, because importing replaces the whole library.
+    """
+    if not isinstance(category_data, dict):
+        return None
+    raw_tags = category_data.get('tag_library_tags')
+    if isinstance(raw_tags, str):
+        raw_tags = [raw_tags]
+    if not isinstance(raw_tags, (list, tuple)):
+        return None
+    tags = []
+    for tag in raw_tags:
+        if isinstance(tag, str):
+            tag = tag.strip()
+            if tag and tag not in tags:
+                tags.append(tag)
+    if not tags:
+        return None
+
+    categories = []
+    seen_category_ids = set()
+    raw_categories = category_data.get('tag_library_categories')
+    if isinstance(raw_categories, (list, tuple)):
+        for category in raw_categories:
+            if not isinstance(category, dict):
+                continue
+            category_id = category.get('id')
+            name = category.get('name')
+            color = category.get('color', '')
+            if not isinstance(category_id, str) or not isinstance(name, str):
+                continue
+            category_id = category_id.strip()
+            name = name.strip()
+            if (not category_id or not name
+                    or category_id in seen_category_ids):
+                continue
+            categories.append({
+                'id': category_id, 'name': name,
+                'color': color.strip() if isinstance(color, str) else ''})
+            seen_category_ids.add(category_id)
+
+    category_by_tag = {}
+    raw_category_by_tag = category_data.get('tag_library_category_by_tag')
+    if isinstance(raw_category_by_tag, dict):
+        for tag, category_id in raw_category_by_tag.items():
+            if not isinstance(tag, str) or not isinstance(category_id, str):
+                continue
+            tag = tag.strip()
+            category_id = category_id.strip()
+            if tag and category_id:
+                category_by_tag[tag] = category_id
+
+    return {
+        'tags': tags,
+        'categories': categories,
+        'category_by_tag': category_by_tag,
+        'aliases': _normalize_tag_library_aliases(
+            category_data.get('tag_library_aliases')),
+        'implications': _normalize_tag_library_implications(
+            category_data.get('tag_library_implications')),
+        'profiles': _normalize_tag_library_profiles(
+            category_data.get('tag_library_profiles')),
+    }
+
+
+def _decode_ui_layout(category_data) -> dict:
+    from PySide6.QtCore import QByteArray
+    layout = {}
+    if not isinstance(category_data, dict):
+        return layout
+    for key in ('geometry', 'window_state'):
+        value = category_data.get(key)
+        if isinstance(value, str) and value:
+            byte_array = QByteArray.fromBase64(value.encode('utf-8'))
+            if not byte_array.isEmpty():
+                layout[key] = byte_array
+    return layout
+
+
+def import_settings(import_data: dict, categories_to_import: list[str],
+                    tag_library_model=None) -> bool:
+    """Import settings from loaded data.
+
+    Every selected category is validated first; nothing is written unless all
+    of them could be read, so a damaged file can never be half-imported.
+
+    The Tag Library is *replaced* (not merged). Pass the app's live
+    ``TagLibraryModel`` as ``tag_library_model`` so the running app uses the
+    imported library straight away; otherwise a later edit in the same
+    session would save the old in-memory library over it. A file whose
+    library has no tags is skipped, so an import can never empty the library.
+    """
     try:
         settings = get_settings()
         data = _normalize_import_data(import_data).get('data', {})
-        
+
+        # Pass 1: validate everything and build the list of changes.
+        values_to_set: list[tuple[str, object]] = []
+        keys_to_remove: list[str] = []
+        hidden_model_ids = None
+        tag_library = None
+        completed_entries = None
         for category_key in categories_to_import:
             if category_key not in data:
                 continue
-            
             category_data = data[category_key]
-            
-            # Special handling for tag library
             if category_key == 'tag_library':
-                if not isinstance(category_data, dict):
-                    continue
-                if 'tag_library_tags' in category_data:
-                    save_tag_library_tags(category_data['tag_library_tags'])
-                if 'tag_library_categories' in category_data:
-                    save_tag_library_categories(category_data['tag_library_categories'])
-                if 'tag_library_category_by_tag' in category_data:
-                    save_tag_library_category_by_tag(category_data['tag_library_category_by_tag'])
-                if 'tag_library_aliases' in category_data:
-                    save_tag_library_aliases(category_data['tag_library_aliases'])
-                if 'tag_library_implications' in category_data:
-                    save_tag_library_implications(
-                        category_data['tag_library_implications'])
-                if 'tag_library_profiles' in category_data:
-                    save_tag_library_profiles(
-                        category_data['tag_library_profiles'])
+                tag_library = _sanitize_tag_library(category_data)
             elif category_key == 'general_preferences':
                 if not isinstance(category_data, dict):
                     continue
                 # ``hidden_model_ids`` is validated/normalized by its own
                 # saver; everything else is validated against a schema so
                 # invalid types/ranges/enums and unknown keys are dropped.
-                hidden_model_ids = category_data.get('hidden_model_ids')
-                if isinstance(hidden_model_ids, list):
-                    save_hidden_model_ids(hidden_model_ids)
-                for key, value in _sanitize_general_preferences(
-                        category_data).items():
-                    settings.setValue(key, value)
+                raw_hidden = category_data.get('hidden_model_ids')
+                if isinstance(raw_hidden, list):
+                    hidden_model_ids = [model_id for model_id in raw_hidden
+                                        if isinstance(model_id, str)]
+                values_to_set.extend(
+                    _sanitize_general_preferences(category_data).items())
             elif category_key == 'auto_captioner':
                 if not isinstance(category_data, dict):
                     continue
-                # Validated against a schema so invalid types/ranges/enums and
-                # unknown keys are dropped.
-                for key, value in _sanitize_auto_captioner(
-                        category_data).items():
-                    settings.setValue(key, value)
+                values_to_set.extend(
+                    _sanitize_auto_captioner(category_data).items())
             elif category_key == 'keyboard_shortcuts':
                 if not isinstance(category_data, dict):
                     continue
-                shortcuts = _sanitize_keyboard_shortcuts(
-                    category_data.get('keyboard_shortcuts'))
-                settings.setValue('keyboard_shortcuts', shortcuts)
+                values_to_set.append((
+                    'keyboard_shortcuts',
+                    _sanitize_keyboard_shortcuts(
+                        category_data.get('keyboard_shortcuts'))))
             elif category_key == 'ui_layout':
-                if not isinstance(category_data, dict):
-                    continue
-                # Handle base64-encoded window state
-                # Store as QByteArray so QSettings handles it correctly
-                from PySide6.QtCore import QByteArray
-                for key in ('geometry', 'window_state'):
-                    value = category_data.get(key)
-                    if isinstance(value, str):
-                        try:
-                            # Decode base64 string back to QByteArray and store
-                            byte_array = QByteArray.fromBase64(value.encode('utf-8'))
-                            settings.setValue(key, byte_array)
-                        except Exception as e:
-                            print(f"Error importing {key}: {e}")
+                layout = _decode_ui_layout(category_data)
+                values_to_set.extend(layout.items())
+                # The saved per-mode (maximized / normal) panel layouts would
+                # otherwise override the imported one on the next start.
+                if 'window_state' in layout:
+                    keys_to_remove.extend(
+                        ('expanded_dock_state', 'normal_dock_state'))
             elif category_key == 'completed_images':
-                # Merge the imported "complete" marks into the completion
-                # store (union: never un-marks anything already complete).
-                # Persisted immediately so a subsequent directory reload
-                # re-homes any foreign paths onto matching images by hash.
-                entries = _sanitize_completed_images(category_data)
-                if entries:
-                    get_completion_store().import_entries(entries)
+                completed_entries = _sanitize_completed_images(category_data)
+            # Unknown categories are ignored rather than writing arbitrary keys.
+
+        # Pass 2: write.
+        for key in keys_to_remove:
+            settings.remove(key)
+        for key, value in values_to_set:
+            settings.setValue(key, value)
+        if hidden_model_ids is not None:
+            save_hidden_model_ids(hidden_model_ids)
+        if tag_library is not None:
+            if tag_library_model is not None:
+                tag_library_model.load_all_data(
+                    tag_library['tags'], tag_library['categories'],
+                    tag_library['category_by_tag'],
+                    aliases=tag_library['aliases'],
+                    implications=tag_library['implications'],
+                    profiles=tag_library['profiles'])
             else:
-                # Unknown category: ignore rather than writing arbitrary keys.
-                continue
-        
+                save_tag_library_tags(tag_library['tags'])
+                save_tag_library_categories(tag_library['categories'])
+                save_tag_library_category_by_tag(
+                    tag_library['category_by_tag'])
+                save_tag_library_aliases(tag_library['aliases'])
+                save_tag_library_implications(tag_library['implications'])
+                save_tag_library_profiles(tag_library['profiles'])
+        if completed_entries:
+            # Merge the imported "complete" marks into the completion store
+            # (union: never un-marks anything already complete). Persisted
+            # immediately so a subsequent directory reload re-homes any
+            # foreign paths onto matching images by hash.
+            get_completion_store().import_entries(completed_entries)
+
         # Ensure all settings are flushed to disk
         settings.sync()
-        
+
         return True
     except Exception as e:
         print(f"Error importing settings: {e}")
@@ -642,7 +783,18 @@ def get_category_summary(import_data: dict, category_key: str) -> str:
     """Get a human-readable summary of what will be imported from a category."""
     import_data = _normalize_import_data(import_data)
     data = import_data.get('data', {}).get(category_key, {})
-    
+    if category_key == 'tag_library':
+        library = _sanitize_tag_library(data)
+        if library is None:
+            return 'No tags in this file \u2013 your Tag Library will be kept'
+        return (f"Replaces your Tag Library: {len(library['tags'])} tags, "
+                f"{len(library['categories'])} categories, "
+                f"{len(library['aliases'])} aliases, "
+                f"{len(library['implications'])} implications, "
+                f"{len(library['profiles'])} profiles")
+    if not isinstance(data, dict):
+        return 'Unreadable \u2013 will be skipped'
+
     if category_key == 'general_preferences':
         theme = data.get('theme', 'N/A')
         font_size = data.get('font_size', 'N/A')
@@ -670,19 +822,6 @@ def get_category_summary(import_data: dict, category_key: str) -> str:
         if has_state:
             parts.append('pane layout')
         return ', '.join(parts) if parts else 'None'
-    elif category_key == 'tag_library':
-        tags = data.get('tag_library_tags', [])
-        categories = data.get('tag_library_categories', [])
-        aliases = data.get('tag_library_aliases', {})
-        implications = data.get('tag_library_implications', {})
-        profiles = data.get('tag_library_profiles', {})
-        tag_count = len(tags) if isinstance(tags, list) else 0
-        cat_count = len(categories) if isinstance(categories, list) else 0
-        alias_count = len(aliases) if isinstance(aliases, dict) else 0
-        implication_count = len(implications) if isinstance(implications, dict) else 0
-        profile_count = len(profiles) if isinstance(profiles, dict) else 0
-        return (f'{tag_count} tags, {cat_count} categories, {alias_count} aliases, '
-                f'{implication_count} implications, {profile_count} profiles')
     elif category_key == 'completed_images':
         entries = data.get('entries', {})
         count = len(entries) if isinstance(entries, dict) else 0

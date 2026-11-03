@@ -1,12 +1,84 @@
 import html
 import re
+import time
 
 from PySide6.QtCore import QEvent, QMimeData, Qt, QTimer, QUrl, Slot
 from PySide6.QtGui import (QColor, QPalette, QStandardItem, QStandardItemModel,
                            QTextCursor)
-from PySide6.QtWidgets import (QCompleter, QDialog, QHBoxLayout, QLabel,
-                               QLineEdit, QProgressBar, QPushButton,
+from PySide6.QtWidgets import (QApplication, QCompleter, QDialog, QHBoxLayout,
+                               QLabel, QLineEdit, QProgressBar, QPushButton,
                                QStackedWidget, QTextBrowser, QVBoxLayout)
+
+# Worker threads still busy with a network request when a wiki dialog closes.
+# Waiting for them would freeze the whole app until the request times out, so
+# the dialog hands them over here instead. Their signals are blocked (nothing
+# reaches the closed dialog) and this list keeps them alive until they finish,
+# because destroying a running QThread crashes the app.
+_parked_threads = []
+_park_sweep_timer = None
+_park_quit_hook_installed = False
+_PARKED_THREAD_EXIT_WAIT_SECONDS = 20
+
+
+def _sweep_parked_threads():
+    _parked_threads[:] = [thread for thread in _parked_threads
+                          if _thread_is_running(thread)]
+    if not _parked_threads and _park_sweep_timer is not None:
+        _park_sweep_timer.stop()
+
+
+def _thread_is_running(thread) -> bool:
+    try:
+        return thread.isRunning()
+    except RuntimeError:
+        return False
+
+
+def _wait_for_parked_threads_at_exit():
+    deadline = time.monotonic() + _PARKED_THREAD_EXIT_WAIT_SECONDS
+    for thread in list(_parked_threads):
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            break
+        try:
+            thread.wait(remaining_ms)
+        except RuntimeError:
+            continue
+    _sweep_parked_threads()
+
+
+def park_running_threads(threads):
+    """Stop ``threads`` without blocking the GUI.
+
+    Finished threads are simply dropped. Running ones are asked to stop, have
+    their signals blocked, and are kept alive in ``_parked_threads`` until they
+    exit on their own."""
+    global _park_sweep_timer, _park_quit_hook_installed
+    for thread in threads:
+        if not _thread_is_running(thread):
+            continue
+        try:
+            thread.requestInterruption()
+            thread.quit()
+            thread.blockSignals(True)
+        except RuntimeError:
+            continue
+        if thread not in _parked_threads:
+            _parked_threads.append(thread)
+    if not _parked_threads:
+        return
+    application = QApplication.instance()
+    if application is None:
+        return
+    if _park_sweep_timer is None:
+        _park_sweep_timer = QTimer(application)
+        _park_sweep_timer.setInterval(250)
+        _park_sweep_timer.timeout.connect(_sweep_parked_threads)
+    if not _park_sweep_timer.isActive():
+        _park_sweep_timer.start()
+    if not _park_quit_hook_installed:
+        application.aboutToQuit.connect(_wait_for_parked_threads_at_exit)
+        _park_quit_hook_installed = True
 
 # Unicode object-replacement character that Qt uses to represent an embedded
 # image (such as a synonym chip) inside a text document.
@@ -661,8 +733,24 @@ class BaseWikiDialog(QDialog):
         if popup is not None:
             popup.hide()
 
+    def _claim_search_trigger(self) -> bool:
+        """Pressing Enter on a highlighted autocomplete suggestion fires both
+        the completer's ``activated`` and the line edit's ``returnPressed``.
+        Let only the first of them run a search in this event-loop pass, so a
+        single Enter loads the page once and adds one history entry."""
+        if getattr(self, '_search_trigger_claimed', False):
+            return False
+        self._search_trigger_claimed = True
+        QTimer.singleShot(0, self._release_search_trigger)
+        return True
+
+    def _release_search_trigger(self):
+        self._search_trigger_claimed = False
+
     @Slot()
     def search_tag(self):
+        if not self._claim_search_trigger():
+            return
         popup = self.search_completer.popup()
         if popup is not None:
             popup.hide()
@@ -675,14 +763,9 @@ class BaseWikiDialog(QDialog):
         self.load_tag(search_text, add_to_history=True)
 
     def stop_all_fetch_threads(self):
-        for fetch_thread in list(self.active_fetch_threads):
-            try:
-                if fetch_thread.isRunning():
-                    fetch_thread.requestInterruption()
-                    fetch_thread.quit()
-                    fetch_thread.wait(12000)
-            except RuntimeError:
-                continue
+        """Called while the dialog closes. Never blocks: see
+        ``park_running_threads``."""
+        park_running_threads(list(self.active_fetch_threads))
         self.active_fetch_threads.clear()
         self.fetch_thread = None
 
@@ -694,30 +777,29 @@ class BaseWikiDialog(QDialog):
         ``handle_autocomplete_thread_finished`` so typing/searching stays
         responsive.
 
-        When the dialog is closing (``wait=True``) we must actually block until
-        every thread has finished running. Otherwise a thread can still be busy
-        with its network request when the dialog object is garbage-collected,
-        which destroys a running QThread and crashes the app with
-        "QThread: Destroyed while thread '' is still running".
+        When the dialog is closing (``wait=True``) the threads must outlive the
+        dialog until they finish, or a running QThread would be destroyed with
+        it and crash the app ("QThread: Destroyed while thread '' is still
+        running"). Rather than blocking the GUI until each request times out,
+        they are handed to ``park_running_threads``.
         """
         self.search_autocomplete_timer.stop()
         self.current_autocomplete_query = ''
+        if wait:
+            park_running_threads(list(self.active_autocomplete_threads))
+            self.active_autocomplete_threads.clear()
+            self.autocomplete_thread = None
+            return
         for autocomplete_thread in list(self.active_autocomplete_threads):
             try:
                 if autocomplete_thread.isRunning():
                     autocomplete_thread.requestInterruption()
-                    if wait:
-                        autocomplete_thread.quit()
-                        autocomplete_thread.wait(12000)
             except RuntimeError:
                 continue
-        # When waiting, every thread has now stopped running, so it is safe to
-        # drop our references to them. When not waiting, do NOT clear
-        # active_autocomplete_threads here — the threads clean themselves up via
-        # handle_autocomplete_thread_finished, and premature clearing drops the
-        # last Python reference while the C++ thread is still running → crash.
-        if wait:
-            self.active_autocomplete_threads.clear()
+        # Do NOT clear active_autocomplete_threads here — the threads clean
+        # themselves up via handle_autocomplete_thread_finished, and premature
+        # clearing drops the last Python reference while the C++ thread is
+        # still running → crash.
         self.autocomplete_thread = None
 
     @Slot()
@@ -799,6 +881,8 @@ class BaseWikiDialog(QDialog):
             return
         selected_tag = self.extract_tag_name_from_search_text(selected_text)
         if not selected_tag:
+            return
+        if not self._claim_search_trigger():
             return
         self.load_tag(selected_tag, add_to_history=True)
 

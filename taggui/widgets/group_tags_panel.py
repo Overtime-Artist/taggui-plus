@@ -207,9 +207,10 @@ class _TagBadgeDelegate(_UniformHeightDelegate):
                          badge)
 
         tag = index.data(Qt.ItemDataRole.DisplayRole)
-        # Draw a subtle "review" marker for tags the most recent Auto-Captioner
-        # run added or increased the count of, so the user can see at a glance
-        # which existing tags were touched. The dot sits just left of the k/N
+        # Draw a subtle "review" marker for unviewed tags (added by the
+        # Auto-Captioner, or marked by the user, and not selected since), so
+        # the user can see at a glance which tags to check. The dot sits just
+        # left of the k/N
         # badge; when present it reserves a little extra width so it never
         # overlaps the (right-elided) tag text or the badge.
         panel = self.parent()
@@ -448,6 +449,8 @@ class GroupTagsPanel(QWidget):
     # Look up a tag in the Danbooru / Gelbooru wiki (right-click a tag).
     danbooru_wiki_requested = Signal(str)
     gelbooru_wiki_requested = Signal(str)
+    # Tags whose unviewed marker was just dropped because they were selected.
+    unviewed_tags_viewed = Signal(list)
     # Rename a tag (old, new) on the selected images that contain it.
     rename_tag_requested = Signal(str, str)
     # The tag-list filter changed via the clickable summary. Carries the new
@@ -458,6 +461,10 @@ class GroupTagsPanel(QWidget):
     def __init__(self, tag_library_model: TagLibraryModel):
         super().__init__()
         self.tag_library_model = tag_library_model
+        # Optional callable returning the current image's tags (or None). Set
+        # by the Image Tags editor so the context menu only offers the
+        # "current image" actions when they would change something.
+        self.current_image_tags_provider = None
         self._model = _UnifiedTagModel(tag_library_model)
         # The active tag-list filter: 'all' shows every tag, 'common' shows only
         # tags on every selected image (k == N), 'differences' shows only tags
@@ -468,31 +475,33 @@ class GroupTagsPanel(QWidget):
         # top (mirrors the normal Image Tags list). One-shot: set right before
         # an edit is requested, consumed by the next refresh.
         self._pending_anchor: int | None = None
-        # Stable display order for the tag list. Every tag seen during the
-        # current selection is assigned a permanent slot number the first time
-        # it appears; the list is always shown sorted by that slot. Because a
-        # slot is NEVER reused or pruned while the selection is unchanged, a tag
-        # that is removed from every image (and so vanishes) reclaims its exact
-        # original position if it comes back via undo/redo — independent of the
-        # order it was removed from / re-added to the individual images. A
-        # brand-new tag (manual add or auto-caption), or a fully-removed tag
-        # that is manually re-added, gets a fresh slot at the end.
-        # `_order_key` identifies the current selection (by image paths); when
-        # it changes the slots are rebuilt from natural first-appearance order.
+        # Stable display order for the tag list. Every tag seen is assigned a
+        # permanent slot number the first time it appears; the list is always
+        # shown sorted by that slot. Slots are never pruned, so a tag that
+        # vanishes (removed from every image, or its only image deselected)
+        # reclaims its exact position if it comes back via undo/redo or by
+        # reselecting the image. A brand-new tag (manual add or auto-caption),
+        # or a fully-removed tag that is manually re-added, gets a fresh slot
+        # at the end. A renamed tag takes over the old name's slot.
+        # `_order_key` is the image paths of the last grid selection. The slots
+        # are kept while each new grid selection shares an image with the last
+        # one, and rebuilt from natural first-appearance order otherwise (and
+        # when a directory is loaded).
         self._order_key: frozenset[str] | None = None
-        self._slot_of: dict[str, int] = {}
+        self._slot_of: dict[str, float] = {}
         self._next_slot = 0
+        # Incremented whenever the slots are rebuilt, so a tag order saved with
+        # an undo entry is only restored into the order it came from.
+        self._order_generation = 0
         # Tags that were present at the previous refresh. Used to tell a tag
         # that (re)appeared on a normal edit (-> fresh slot at the end) from one
         # that was merely restored by undo/redo (-> keep its permanent slot).
         self._present_prev: set[str] = set()
-        # Tags touched by the most recent auto-caption run (newly added or whose
-        # image count increased). Shown with a subtle marker so they are easy to
-        # review; cleared when the selection changes or a marked tag is clicked.
+        # Tags with an unviewed marker on any selected image (set by
+        # ImageTagsEditor from the image list model). Shown with a subtle dot
+        # so they are easy to review; a marker is dropped once its tag is
+        # selected.
         self._recently_captioned: set[str] = set()
-        # Per-tag image counts snapshotted when an auto-caption run starts, so
-        # the touched set can be computed when it finishes. None outside a run.
-        self._auto_caption_counts: dict[str, int] | None = None
         # Tags to select after the next refresh (undo/redo re-adds): mirrors the
         # single-image list, which selects a re-added tag. One-shot.
         self._pending_select_tags: list[str] = []
@@ -523,6 +532,7 @@ class GroupTagsPanel(QWidget):
             self._show_context_menu)
         self.tag_list.selectionModel().selectionChanged.connect(
             self._on_selection_changed)
+        self.tag_list.clicked.connect(self._on_tag_clicked)
         self.tag_list.edge_navigation.connect(self._on_edge)
         self.tag_list.escape_navigation.connect(
             self.escape_selection_requested)
@@ -537,22 +547,30 @@ class GroupTagsPanel(QWidget):
     # ------------------------------------------------------------------
     # Population and stable ordering
     # ------------------------------------------------------------------
-    def set_images(self, images: list[Image], restore_positions: bool = False):
+    def set_images(self, images: list[Image], restore_positions: bool = False,
+                   renames: dict[str, list[str]] | None = None,
+                   saved_order=None):
+        """Show the tags of ``images``.
+
+        ``restore_positions`` is set for an undo/redo, with ``saved_order``
+        the tag order saved (by ``order_state``) just before the change being
+        undone/redone. ``renames`` maps each tag renamed by this change to its
+        replacement(s), so the new name keeps the old one's position.
+        """
         rows, total = compute_tag_rows(images)
         counts = dict(rows)
         present = [tag for tag, _ in rows]  # natural first-appearance order
         present_set = set(present)
-        # When the selected image set changes, start a fresh stable order (and
-        # drop any leftover auto-caption markers, which belonged to the old
-        # selection).
         order_key = frozenset(str(image.path) for image in images)
         same_selection = order_key == self._order_key
         if not same_selection:
-            self._order_key = order_key
-            self._slot_of = {}
-            self._next_slot = 0
+            # Keep the remembered positions while the new selection shares an
+            # image with the last one; otherwise start a fresh order.
+            if order_key and not order_key & (self._order_key or frozenset()):
+                self.reset_order_memory()
+            if order_key:
+                self._order_key = order_key
             self._present_prev = set()
-            self._recently_captioned = set()
         # When an external edit (auto-captioning, undo/redo) changes the tags of
         # the same selection without the panel setting an explicit row anchor,
         # remember the selected tags by name so they stay selected across the
@@ -563,20 +581,26 @@ class GroupTagsPanel(QWidget):
         prev_tags = self.tag_list.selected_tags() if preserve else []
         # Assign / keep permanent slots (see _slot_of docs in __init__).
         if not same_selection:
-            # Fresh selection: slot every tag in natural first-appearance order.
+            # Selection changed: remembered tags keep their slots; tags never
+            # seen before go to the end in natural first-appearance order.
             for tag in present:
                 self._assign_slot(tag)
         elif restore_positions:
-            # Undo/redo: never reassign an existing slot, so a returning tag
-            # reclaims its exact position. Only a tag never seen this selection
-            # (shouldn't normally happen on a restore) gets a new end slot.
+            # Undo/redo: put every tag back where it was before the change, so
+            # a returning tag reclaims its exact position. Only a tag never
+            # seen before (shouldn't normally happen) gets a new end slot.
+            self._apply_order_state(saved_order)
             for tag in present:
                 if tag not in self._slot_of:
                     self._assign_slot(tag)
         else:
-            # Normal edit: a tag that just (re)appeared gets a fresh slot at the
-            # end; tags already present keep their slots.
+            # Normal edit: a renamed tag takes the old name's slot; any other
+            # tag that just (re)appeared gets a fresh slot at the end; tags
+            # already present keep their slots.
+            renamed = self._apply_renames(renames or {}, present_set)
             for tag in present:
+                if tag in renamed:
+                    continue
                 if tag not in self._present_prev or tag not in self._slot_of:
                     self._assign_slot(tag, force_end=True)
         ordered_tags = sorted(present, key=lambda tag: self._slot_of[tag])
@@ -615,6 +639,57 @@ class GroupTagsPanel(QWidget):
         if force_end or tag not in self._slot_of:
             self._slot_of[tag] = self._next_slot
             self._next_slot += 1
+
+    def reset_order_memory(self):
+        """Forget every remembered tag position (e.g. a new directory was
+        loaded), so the next grid selection starts in natural order."""
+        self._order_key = None
+        self._slot_of = {}
+        self._next_slot = 0
+        self._order_generation += 1
+        self._present_prev = set()
+
+    def order_state(self):
+        """The current tag order, to be saved with an undo entry and passed
+        back to ``set_images`` when that entry is undone or redone."""
+        return self._order_generation, dict(self._slot_of)
+
+    def _apply_order_state(self, state):
+        """Put tags back in the positions saved by ``order_state``, unless the
+        order has been rebuilt since. Tags seen only after the save keep their
+        current positions."""
+        if state is None:
+            return
+        generation, slots = state
+        if generation == self._order_generation:
+            self._slot_of.update(slots)
+
+    def _apply_renames(self, renames: dict[str, list[str]],
+                       present: set[str]) -> set[str]:
+        """Give each newly appeared replacement of a renamed tag the old tag's
+        slot (several replacements are placed together, in order, before the
+        next tag). A replacement that was already shown (the rename merged into
+        it) keeps its own slot. The old tag keeps its slot too, so an undo
+        brings it back in place. Returns the tags given a slot."""
+        placed: set[str] = set()
+        old_tags = sorted((tag for tag in renames
+                           if tag in self._present_prev
+                           and tag in self._slot_of),
+                          key=lambda tag: self._slot_of[tag])
+        for old_tag in old_tags:
+            new_tags = [tag for tag in dict.fromkeys(renames[old_tag])
+                        if tag in present and tag not in self._present_prev
+                        and tag not in placed]
+            if not new_tags:
+                continue
+            base = self._slot_of[old_tag]
+            following = min((slot for slot in self._slot_of.values()
+                             if slot > base), default=base + 1)
+            step = (following - base) / len(new_tags)
+            for position, tag in enumerate(new_tags):
+                self._slot_of[tag] = base + position * step
+                placed.add(tag)
+        return placed
 
     def _refresh_view(self, prev_tags: list[str]):
         """Apply the current filter, repopulate the model, and restore state."""
@@ -750,28 +825,25 @@ class GroupTagsPanel(QWidget):
             if newly_cleared:
                 self._recently_captioned -= newly_cleared
                 self.tag_list.viewport().update()
+                self.unviewed_tags_viewed.emit(sorted(newly_cleared))
         self.partial_focus_changed.emit(self._selected_difference_tags())
 
-    def begin_auto_caption_run(self):
-        """Snapshot the current per-tag image counts so the next
-        end_auto_caption_run() can flag which tags the run added or grew.
+    @Slot(QModelIndex)
+    def _on_tag_clicked(self, index: QModelIndex):
+        # Clicking a tag that was already selected doesn't change the
+        # selection, so clear its marker on the click itself.
+        tag = index.data(Qt.ItemDataRole.DisplayRole)
+        if (tag in self._recently_captioned
+                and self.tag_list.selectionModel().isSelected(index)):
+            self._recently_captioned.discard(tag)
+            self.tag_list.viewport().update()
+            self.unviewed_tags_viewed.emit([tag])
 
-        Called when the Auto-Captioner starts while the grouped view is active.
-        """
-        self._auto_caption_counts = {tag: count
-                                     for tag, count in self._rows_full}
-
-    def end_auto_caption_run(self):
-        """Mark every tag the just-finished auto-caption run added or increased
-        the image count of, so the user can review them at a glance."""
-        if self._auto_caption_counts is None:
-            return
-        before = self._auto_caption_counts
-        self._auto_caption_counts = None
-        touched = {tag for tag, count in self._rows_full
-                   if count > before.get(tag, 0)}
-        if touched != self._recently_captioned:
-            self._recently_captioned = touched
+    def set_recently_captioned(self, tags):
+        """Show unviewed markers on the given tags and repaint."""
+        new_marks = set(tags)
+        if new_marks != self._recently_captioned:
+            self._recently_captioned = new_marks
             self.tag_list.viewport().update()
 
     @Slot(str)
@@ -881,7 +953,8 @@ class GroupTagsPanel(QWidget):
     def _copy_tags(self):
         self.tag_list.copy_selected_tags_to_clipboard()
 
-    def _add_category_actions(self, menu: QMenu, tag: str) -> tuple[dict, object]:
+    def _add_category_actions(self, menu: QMenu,
+                              tags: list[str]) -> tuple[dict, object]:
         """Append an "Assign Category" submenu and a "Clear Category" action.
 
         Mirrors ImageTagsList.show_context_menu. Returns the mapping of assign
@@ -895,18 +968,21 @@ class GroupTagsPanel(QWidget):
             category_actions[action] = category['id']
         assign_menu.setEnabled(bool(categories))
         clear_action = menu.addAction('Clear Category')
-        clear_action.setEnabled(
-            self.tag_library_model.get_category_for_tag(tag) is not None)
+        clear_action.setEnabled(any(
+            self.tag_library_model.get_category_for_tag(tag) is not None
+            for tag in tags))
         return category_actions, clear_action
 
-    def _assign_category(self, tag: str, category_id):
-        if not self.tag_library_model.has_tag(tag):
-            self.tag_library_model.add_tags([tag])
-        self.tag_library_model.assign_category([tag], category_id)
+    def _assign_category(self, tags: list[str], category_id):
+        missing = [tag for tag in tags
+                   if not self.tag_library_model.has_tag(tag)]
+        if missing:
+            self.tag_library_model.add_tags(missing)
+        self.tag_library_model.assign_category(tags, category_id)
         self._refresh_tag_colors()
 
-    def _clear_category(self, tag: str):
-        self.tag_library_model.clear_category([tag])
+    def _clear_category(self, tags: list[str]):
+        self.tag_library_model.clear_category(tags)
         self._refresh_tag_colors()
 
     def _refresh_tag_colors(self):
@@ -926,31 +1002,11 @@ class GroupTagsPanel(QWidget):
             0, lambda: self._emit_rename(anchor, old_tag, new_tag))
 
     def _emit_rename(self, anchor: int | None, old_tag: str, new_tag: str):
-        # Keep the renamed tag in its slot. A new name would otherwise be
-        # treated as a brand-new tag and sent to the end, so move the old name's
-        # permanent slot to the new name in place. The pending anchor then
-        # restores the cursor to that row.
-        self._rename_slot(old_tag, new_tag)
+        # The renamed tag keeps its position (the model reports the rename, see
+        # `_apply_renames`), so the pending anchor restores the cursor to it.
         self._pending_anchor = anchor
         self.rename_tag_requested.emit(old_tag, new_tag)
         self._pending_anchor = None
-
-    def _rename_slot(self, old_tag: str, new_tag: str):
-        """Move ``old_tag``'s permanent slot to ``new_tag`` so a rename keeps the
-        tag's position. If ``new_tag`` already has a slot (the rename merges into
-        an existing tag), keep that slot and just drop ``old_tag``. Also updates
-        the "present at last refresh" set so the follow-up refresh doesn't treat
-        ``new_tag`` as a freshly (re)appeared tag and bump it to the end."""
-        if old_tag in self._slot_of:
-            slot = self._slot_of.pop(old_tag)
-            if new_tag not in self._slot_of:
-                self._slot_of[new_tag] = slot
-        if old_tag in self._present_prev:
-            self._present_prev.discard(old_tag)
-            self._present_prev.add(new_tag)
-        if old_tag in self._recently_captioned:
-            self._recently_captioned.discard(old_tag)
-            self._recently_captioned.add(new_tag)
 
     def _show_context_menu(self, position):
         tags = self.tag_list.selected_tags()
@@ -961,22 +1017,41 @@ class GroupTagsPanel(QWidget):
         # "Add" only makes sense for tags missing from some images; offer it
         # when any selected tag is a difference (adding a common tag is a no-op).
         any_difference = any(tag in differences for tag in tags)
+        # The current-image actions are only offered when they would do
+        # something to the current image.
+        current_tags = None
+        if self.current_image_tags_provider is not None:
+            current_tags = self.current_image_tags_provider()
+        if current_tags is None:
+            can_add_current = any_difference
+            can_remove_current = True
+        else:
+            can_add_current = any(tag not in current_tags for tag in tags)
+            can_remove_current = any(tag in current_tags for tag in tags)
+        # Category actions apply to all selected tags (like Copy) when the
+        # clicked tag is one of them. The wiki look-ups open a single page, so
+        # they use the clicked tag.
+        category_tags = (tags if clicked_tag in tags
+                         else [clicked_tag] if clicked_tag else [])
         menu = QMenu(self)
         copy_action = menu.addAction(
             'Copy Tags' if len(tags) > 1 else 'Copy Tag')
         menu.addSeparator()
         add_all_action = None
         add_current_action = None
+        remove_current_action = None
         # Group by scope (all selected vs. current image) so choosing a scope is
         # a deliberate top-block vs. bottom-block decision, with a separator to
         # make the boundary unmistakable. Add sits before Remove within each.
         if any_difference:
             add_all_action = menu.addAction('Add to all selected')
         remove_all_action = menu.addAction('Remove from all selected')
-        menu.addSeparator()
-        if any_difference:
+        if can_add_current or can_remove_current:
+            menu.addSeparator()
+        if can_add_current:
             add_current_action = menu.addAction('Add to current image')
-        remove_current_action = menu.addAction('Remove from current image')
+        if can_remove_current:
+            remove_current_action = menu.addAction('Remove from current image')
         view_danbooru_action = None
         view_gelbooru_action = None
         category_actions = {}
@@ -987,7 +1062,7 @@ class GroupTagsPanel(QWidget):
             view_gelbooru_action = menu.addAction('View Gelbooru Wiki')
             menu.addSeparator()
             category_actions, clear_action = self._add_category_actions(
-                menu, clicked_tag)
+                menu, category_tags)
         chosen = menu.exec(self.tag_list.viewport().mapToGlobal(position))
         if chosen is None:
             return
@@ -1002,10 +1077,10 @@ class GroupTagsPanel(QWidget):
             self.gelbooru_wiki_requested.emit(clicked_tag)
             return
         if chosen == clear_action:
-            self._clear_category(clicked_tag)
+            self._clear_category(category_tags)
             return
         if chosen in category_actions:
-            self._assign_category(clicked_tag, category_actions[chosen])
+            self._assign_category(category_tags, category_actions[chosen])
             return
         # Preserve the cursor position across the refresh the edit triggers.
         self._pending_anchor = self._anchor_row(self.tag_list)

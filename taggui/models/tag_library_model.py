@@ -4,7 +4,10 @@ from uuid import uuid4
 from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt, Signal, Slot
 from PySide6.QtGui import QColor
 
-from utils.settings import (get_tag_library_aliases, get_tag_library_categories,
+from utils.settings import (_normalize_tag_library_aliases,
+                            _normalize_tag_library_implications,
+                            _normalize_tag_library_profiles,
+                            get_tag_library_aliases, get_tag_library_categories,
                             get_tag_library_category_by_tag,
                             get_tag_library_implications,
                             get_tag_library_profiles, get_tag_library_tags,
@@ -221,13 +224,42 @@ class TagLibraryModel(QAbstractListModel):
                 return category
         return None
 
-    def add_alias(self, alias: str, canonical: str) -> bool:
-        """Add alias → canonical. Returns False if alias already exists."""
+    def get_alias_problem(self, alias: str, canonical: str,
+                          ignore_alias: str | None = None) -> str | None:
+        """Return why `alias → canonical` can't be added, or None if it can.
+        `ignore_alias` is an existing alias being edited, which is treated as
+        already removed. Aliases must not chain or loop: an alias can't point
+        to another alias, and a canonical tag can't itself be an alias."""
         alias = alias.strip()
         canonical = canonical.strip()
-        if not alias or not canonical or alias == canonical:
-            return False
-        if alias in self.aliases:
+        if not alias or not canonical:
+            return 'The alias and canonical tag must not be empty.'
+        if alias == canonical:
+            return (f'An alias cannot be the same as its canonical tag '
+                    f'("{canonical}").')
+        aliases = {key: value for key, value in self.aliases.items()
+                   if key != ignore_alias}
+        if alias in aliases:
+            return (f'"{alias}" is already an alias of "{aliases[alias]}". '
+                    'Edit or remove that alias first.')
+        if canonical in aliases:
+            return (f'"{canonical}" is itself an alias of '
+                    f'"{aliases[canonical]}". Use "{aliases[canonical]}" as '
+                    'the canonical tag instead.')
+        pointing = sorted(key for key, value in aliases.items()
+                          if value == alias)
+        if pointing:
+            quoted = ', '.join(f'"{key}"' for key in pointing)
+            return (f'"{alias}" is the canonical tag of {quoted}, so it '
+                    'cannot also be an alias.')
+        return None
+
+    def add_alias(self, alias: str, canonical: str) -> bool:
+        """Add alias → canonical. Returns False if it isn't allowed (see
+        `get_alias_problem`)."""
+        alias = alias.strip()
+        canonical = canonical.strip()
+        if self.get_alias_problem(alias, canonical) is not None:
             return False
         self.aliases[alias] = canonical
         self._save_all_tag_library_data()
@@ -328,6 +360,10 @@ class TagLibraryModel(QAbstractListModel):
     def get_implied_tags(self, tags: list[str]) -> list[str]:
         """Return all tags implied by the given list, excluding tags already in the list.
 
+        Implications chain: if a implies b and b implies c, then a implies
+        both b and c. Loops (a implies b, b implies a) are safe because each
+        tag is only expanded once.
+
         Trigger rules can be exact tags or glob patterns containing ``*`` or ``?``.
         Exact triggers match case-sensitively; wildcard triggers match
         case-insensitively via fnmatch.
@@ -339,14 +375,21 @@ class TagLibraryModel(QAbstractListModel):
         wildcard_rules = [(trigger, implied_tags)
                           for trigger, implied_tags in self.implications.items()
                           if '*' in trigger or '?' in trigger]
+        pending = list(tags)
+        expanded = set()
 
         def add_implied(implied_tags: list[str]):
             for implied_tag in implied_tags:
                 if implied_tag not in tags_set and implied_tag not in seen:
                     implied.append(implied_tag)
                     seen.add(implied_tag)
+                    pending.append(implied_tag)
 
-        for tag in tags:
+        while pending:
+            tag = pending.pop(0)
+            if tag in expanded:
+                continue
+            expanded.add(tag)
             add_implied(self.implications.get(tag, []))
             tag_lower = tag.lower()
             for trigger, implied_tags in wildcard_rules:
@@ -565,9 +608,16 @@ class TagLibraryModel(QAbstractListModel):
             tag: cat_id for tag, cat_id in category_by_tag.items()
             if tag in tag_set and cat_id in cat_ids
         }
-        self.aliases = aliases if aliases is not None else {}
-        self.implications = implications if implications is not None else {}
-        self.profiles = profiles if profiles is not None else {}
+        # Imported data may be hand-edited, so drop malformed entries and any
+        # aliases that would chain or loop (the first valid entry wins).
+        self.aliases = {}
+        for alias, canonical in _normalize_tag_library_aliases(
+                aliases or {}).items():
+            if self.get_alias_problem(alias, canonical) is None:
+                self.aliases[alias] = canonical
+        self.implications = _normalize_tag_library_implications(
+            implications or {})
+        self.profiles = _normalize_tag_library_profiles(profiles or {})
 
         self._save_all_tag_library_data()
         self._notify_model_changed()

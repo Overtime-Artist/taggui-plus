@@ -1,7 +1,10 @@
+import functools
+import os
 import random
 import re
 import sys
 from collections import Counter, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -10,14 +13,15 @@ import exifread
 import imagesize
 from PySide6.QtCore import (QAbstractListModel, QModelIndex, QObject,
                             QRunnable, QSize, Qt, QThreadPool, Signal, Slot)
-from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap
+from PySide6.QtGui import QIcon, QImage, QImageIOHandler, QImageReader, QPixmap
 from PySide6.QtWidgets import QMessageBox
 
 from utils.completion_store import get_completion_store
 from utils.enums import ImageListSortBy, SortOrder
 from utils.image import Image, build_caption_text, parse_caption_text
 from utils.settings import DEFAULT_SETTINGS, get_settings
-from utils.thumbnail_cache import evict_to_limit, get_cache_path
+from utils.thumbnail_cache import (evict_to_limit, get_cache_path,
+                                   mark_thumbnail_used, save_thumbnail)
 from utils.utils import get_confirmation_dialog_reply, pluralize
 
 UNDO_STACK_SIZE = 32
@@ -63,16 +67,10 @@ class BackgroundThumbnailWarmer(QRunnable):
             # what makes warming cheap on a directory that's mostly cached.
             if cache_path is None or cache_path.exists():
                 continue
-            image_reader = QImageReader(str(image_path))
-            # Rotate the image based on the orientation tag.
-            image_reader.setAutoTransform(True)
-            image = image_reader.read()
-            if image.isNull():
-                continue
-            thumbnail_image = image.scaledToWidth(
-                self.image_width, Qt.TransformationMode.SmoothTransformation)
+            thumbnail_image = create_thumbnail_image(image_path,
+                                                     self.image_width)
             if not thumbnail_image.isNull():
-                thumbnail_image.save(str(cache_path))
+                save_thumbnail(thumbnail_image, cache_path)
 
 
 class _CacheEvictionRunner(QRunnable):
@@ -86,18 +84,109 @@ class _CacheEvictionRunner(QRunnable):
         evict_to_limit(self.max_bytes)
 
 
-def get_file_paths(directory_path: Path) -> set[Path]:
+def get_file_paths(directory_path: Path,
+                   skipped_directories: list | None = None) -> set[Path]:
     """
     Recursively get all file paths in a directory, including those in
     subdirectories.
+
+    Subfolders that cannot be read (e.g. no permission) are skipped and added
+    to ``skipped_directories``; only an unreadable top folder raises
+    ``OSError``. Each real folder is scanned once, so a junction or symbolic
+    link that leads back to an already scanned folder (which could otherwise
+    loop) is not followed again. Linked folders are scanned after real ones so
+    images are listed under their real location when possible.
     """
     file_paths = set()
-    for path in directory_path.iterdir():
-        if path.is_file():
-            file_paths.add(path)
-        elif path.is_dir():
-            file_paths.update(get_file_paths(path))
+    visited_directories = set()
+    directories_to_scan = [directory_path]
+    linked_directories = []
+    while directories_to_scan or linked_directories:
+        directory = (directories_to_scan.pop() if directories_to_scan
+                     else linked_directories.pop())
+        try:
+            real_directory = os.path.normcase(os.path.realpath(directory))
+        except (OSError, ValueError):
+            real_directory = os.path.normcase(str(directory))
+        if real_directory in visited_directories:
+            continue
+        visited_directories.add(real_directory)
+        try:
+            with os.scandir(directory) as entries:
+                entries = list(entries)
+        except OSError:
+            if directory == directory_path:
+                raise
+            if skipped_directories is not None:
+                skipped_directories.append(directory)
+            continue
+        for entry in entries:
+            try:
+                if entry.is_file():
+                    file_paths.add(Path(entry.path))
+                elif entry.is_dir():
+                    # `is_junction` needs Python 3.12+; on older versions a
+                    # junction loop is still caught by the visited check.
+                    is_link = entry.is_symlink() or getattr(
+                        entry, 'is_junction', lambda: False)()
+                    if is_link:
+                        linked_directories.append(Path(entry.path))
+                    else:
+                        directories_to_scan.append(Path(entry.path))
+            except OSError:
+                continue
     return file_paths
+
+
+def get_caption_key(caption_path: Path) -> str:
+    """Key used to match an image to its caption file. Ignores upper/lower
+    case on Windows (where `a.TXT` and `a.txt` are the same file) and always
+    ignores the case of the `.txt` extension."""
+    return os.path.normcase(str(caption_path.with_suffix('.txt')))
+
+
+def get_caption_paths(file_paths) -> dict[str, Path]:
+    """Map caption key (see `get_caption_key`) -> actual caption file path for
+    every `.txt` file, whatever the case of its extension (`.txt`, `.TXT`)."""
+    return {get_caption_key(path): path for path in file_paths
+            if path.suffix.lower() == '.txt'}
+
+
+def get_caption_path(image_path: Path,
+                     caption_paths: dict[str, Path]) -> Path:
+    """The caption file for an image: the existing file found by the scan if
+    there is one, otherwise `<image name>.txt`."""
+    text_file_path = image_path.with_suffix('.txt')
+    return caption_paths.get(get_caption_key(text_file_path), text_file_path)
+
+
+def create_thumbnail_image(image_path: Path, image_width: int) -> QImage:
+    """Decode an image file into a thumbnail `image_width` pixels wide. Returns
+    a null `QImage` if the file cannot be read.
+
+    Large images are decoded at reduced size (twice the thumbnail width, then
+    smoothly scaled down as before), which needs far less memory and time than
+    decoding them at full size.
+    """
+    image_reader = QImageReader(str(image_path))
+    # Rotate the image based on the orientation tag.
+    image_reader.setAutoTransform(True)
+    size = image_reader.size()
+    if size.isValid() and size.width() > 0 and size.height() > 0:
+        is_rotated = bool(
+            image_reader.transformation()
+            & QImageIOHandler.Transformation.TransformationRotate90)
+        displayed_width = size.height() if is_rotated else size.width()
+        scale = 2 * image_width / displayed_width
+        if scale < 1:
+            image_reader.setScaledSize(QSize(
+                max(1, round(size.width() * scale)),
+                max(1, round(size.height() * scale))))
+    image = image_reader.read()
+    if image.isNull():
+        return QImage()
+    return image.scaledToWidth(image_width,
+                               Qt.TransformationMode.SmoothTransformation)
 
 
 def read_caption_file(text_file_path: Path,
@@ -129,6 +218,13 @@ def read_caption_file(text_file_path: Path,
 def get_image_dimensions(image_path: Path) -> tuple[int, int] | None:
     try:
         dimensions = imagesize.get(image_path)
+        if min(dimensions) <= 0:
+            # The fast header reader can't handle some formats (e.g. some
+            # BMPs); fall back to Qt's reader. None if neither can read it.
+            size = QImageReader(str(image_path)).size()
+            if not size.isValid() or size.width() <= 0 or size.height() <= 0:
+                return None
+            dimensions = (size.width(), size.height())
         # Check the Exif orientation tag and rotate the dimensions if
         # necessary.
         with open(image_path, 'rb') as image_file:
@@ -153,9 +249,68 @@ def get_image_dimensions(image_path: Path) -> tuple[int, int] | None:
 @dataclass
 class HistoryItem:
     action_name: str
-    tags: list[list[str]]
-    natural_language_prompts: list[str]
+    # Keyed by image path (not list position) so undo/redo stays correct after
+    # the image list is re-sorted or files are added/removed by a refresh.
+    # Values are (tags, natural_language_prompt).
+    captions: dict[Path, tuple[list[str], str]]
     should_ask_for_confirmation: bool
+    # The grid view's tag order from just before this change was applied, so
+    # undoing/redoing it puts every tag back exactly where it was. Set by the
+    # Image Tags pane; None when the change was not made in the grid view.
+    group_order_state: object = None
+
+
+MAX_LISTED_WRITE_ERRORS = 10
+
+
+def get_existing_name_case(path: Path) -> Path:
+    """On case-insensitive file systems (Windows), return `path` with its last
+    part spelled the way the existing file is actually named (`a.txt` ->
+    `a.TXT`). Returns `path` unchanged if it doesn't exist or is a link."""
+    try:
+        if path.exists() and not path.is_symlink():
+            actual_name = path.resolve().name
+            if (actual_name != path.name
+                    and actual_name.lower() == path.name.lower()):
+                return path.with_name(actual_name)
+    except (OSError, RuntimeError):
+        pass
+    return path
+
+
+def write_text_atomically(path: Path, text: str):
+    """Write a caption file so a crash mid-write cannot leave it truncated.
+
+    The text is written to a temporary file next to the target, which is then
+    swapped into place in one step. If the swap is not possible (for example,
+    another program has the file open), fall back to a direct write. Raises
+    ``OSError`` if the file could not be written at all.
+
+    If the file already exists under a differently-cased name (e.g. `a.TXT`
+    when asked to write `a.txt` on Windows), that name is kept.
+    """
+    path = get_existing_name_case(path)
+    temp_path = path.with_name(f'.{path.name}.taggui-tmp')
+    try:
+        temp_path.write_text(text, encoding='utf-8', errors='replace')
+        os.replace(temp_path, path)
+        return
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    path.write_text(text, encoding='utf-8', errors='replace')
+
+
+def collect_write_errors(method):
+    """Decorator for bulk caption operations: show one summary error message
+    at the end instead of one message per caption file that fails to save."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.batch_write_errors():
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class Scope(str, Enum):
@@ -167,6 +322,9 @@ class Scope(str, Enum):
 class DirectoryScanner(QObject, QRunnable):
     """Scans a directory for images and captions off the main thread."""
     scan_complete = Signal(list)
+    # Emitted instead of `scan_complete` if the scan could not finish, with a
+    # description of the problem.
+    scan_failed = Signal(str)
 
     def __init__(self, directory_path: Path, image_suffixes: list,
                  tag_separator: str):
@@ -175,22 +333,38 @@ class DirectoryScanner(QObject, QRunnable):
         self.directory_path = directory_path
         self.image_suffixes = image_suffixes
         self.tag_separator = tag_separator
+        # Subfolders that could not be read and were left out of the scan.
+        self.skipped_directories: list[Path] = []
         self.setAutoDelete(False)
 
     @Slot()
     def run(self):
+        try:
+            self._scan()
+        except Exception as exception:
+            # The app is quitting while the scan runs; nobody is waiting for
+            # the result, so don't print an alarming error to the console.
+            if (sys.is_finalizing()
+                    or 'interpreter shutdown' in str(exception)):
+                return
+            # Never leave the folder half-loaded with no explanation.
+            print(f'Failed to load {self.directory_path}: {exception}',
+                  file=sys.stderr)
+            self.scan_failed.emit(str(exception))
+
+    def _scan(self):
         from utils.scan_cache import ScanCache
         scan_cache = ScanCache()
         scan_cache.load()
         completion_store = get_completion_store()
         completion_store.load()
 
-        file_paths = get_file_paths(self.directory_path)
+        file_paths = get_file_paths(self.directory_path,
+                                    self.skipped_directories)
         image_paths = sorted(
             p for p in file_paths if p.suffix.lower() in self.image_suffixes
         )
-        text_file_path_strings = {str(p) for p in file_paths
-                                  if p.suffix == '.txt'}
+        caption_paths = get_caption_paths(file_paths)
 
         dim_updates: dict = {}
         cap_updates: dict = {}
@@ -220,12 +394,16 @@ class DirectoryScanner(QObject, QRunnable):
 
             # Caption — use cache if available, otherwise read from disk.
             txt_path = image_path.with_suffix('.txt')
+            caption_key = get_caption_key(txt_path)
+            if caption_key in caption_paths:
+                # The actual file, which may be named e.g. `a.TXT`.
+                txt_path = caption_paths[caption_key]
             txt_path_str = str(txt_path)
             tags: list = []
             nl: str = ''
             cap_mtime_ns = None
 
-            if txt_path_str in text_file_path_strings:
+            if caption_key in caption_paths:
                 try:
                     cap_mtime_ns = txt_path.stat().st_mtime_ns
                 except OSError:
@@ -276,7 +454,8 @@ class DirectoryScanner(QObject, QRunnable):
         scan_cache.save_async(dim_updates, cap_updates,
                               directory_path=self.directory_path,
                               live_dim_keys=live_dim_keys,
-                              live_cap_keys=text_file_path_strings)
+                              live_cap_keys={str(path) for path
+                                             in caption_paths.values()})
         images.sort(key=lambda img: img.path)
         self.scan_complete.emit(images)
 
@@ -324,22 +503,37 @@ class RefreshScanner(QObject, QRunnable):
     def run(self):
         try:
             result = self._scan()
-        except OSError:
+        except Exception as exception:
             # The directory may have been removed or become unreadable while
             # scanning. Report an empty (no-op) diff so the UI simply skips
-            # this refresh; the next re-focus will try again.
+            # this refresh; the next re-focus will try again. (Any other error
+            # is handled the same way, so refreshing never stops working.)
+            if not isinstance(exception, OSError):
+                print(f'Failed to refresh {self.directory_path}: '
+                      f'{exception}', file=sys.stderr)
             result = RefreshResult(self.directory_path, [], set(), {})
         self.refresh_complete.emit(result)
 
     def _scan(self) -> 'RefreshResult':
         completion_store = get_completion_store()
-        file_paths = get_file_paths(self.directory_path)
+        skipped_directories: list[Path] = []
+        file_paths = get_file_paths(self.directory_path, skipped_directories)
         image_paths = {path for path in file_paths
                        if path.suffix.lower() in self.image_suffixes}
-        text_file_path_strings = {str(path) for path in file_paths
-                                  if path.suffix == '.txt'}
+        caption_paths = get_caption_paths(file_paths)
+
+        def is_in_skipped_directory(path: Path) -> bool:
+            return any(path.is_relative_to(directory)
+                       for directory in skipped_directories)
+
+        # Images in a subfolder that couldn't be read this time (e.g. briefly
+        # locked by another program) are left exactly as they are: not removed
+        # and not checked for changes.
+        unscanned_paths = ({path for path in self.snapshot
+                            if is_in_skipped_directory(path)}
+                           if skipped_directories else set())
         existing_paths = set(self.snapshot.keys())
-        removed_paths = existing_paths - image_paths
+        removed_paths = existing_paths - image_paths - unscanned_paths
         added_paths = sorted(image_paths - existing_paths)
 
         # Per-image info handed to the completion store so it can refresh hashes
@@ -362,9 +556,9 @@ class RefreshScanner(QObject, QRunnable):
             tags: list = []
             natural_language_prompt = ''
             caption_file_modified_time_ns = None
-            text_file_path = image_path.with_suffix('.txt')
+            text_file_path = get_caption_path(image_path, caption_paths)
             text_file_path_str = str(text_file_path)
-            if text_file_path_str in text_file_path_strings:
+            if get_caption_key(text_file_path) in caption_paths:
                 (tags, natural_language_prompt,
                  caption_file_modified_time_ns) = read_caption_file(
                      text_file_path, self.tag_separator)
@@ -388,7 +582,7 @@ class RefreshScanner(QObject, QRunnable):
         updates: dict = {}
         for image_path, (snapshot_file_mtime,
                          snapshot_caption_mtime) in self.snapshot.items():
-            if image_path in removed_paths:
+            if image_path in removed_paths or image_path in unscanned_paths:
                 continue
             entry: dict = {}
 
@@ -406,7 +600,7 @@ class RefreshScanner(QObject, QRunnable):
                                  get_image_dimensions(image_path))
 
             # Caption file: stat first; only read + parse when it changed.
-            text_file_path = image_path.with_suffix('.txt')
+            text_file_path = get_caption_path(image_path, caption_paths)
             text_file_path_str = str(text_file_path)
             try:
                 new_caption_mtime = text_file_path.stat().st_mtime_ns
@@ -476,21 +670,15 @@ class ThumbnailLoader(QObject, QRunnable):
         if cache_path is not None and cache_path.exists():
             cached_image = QImage(str(cache_path))
             if not cached_image.isNull():
+                mark_thumbnail_used(cache_path)
                 self.thumbnail_loaded.emit(
                     self.image_path, cached_image,
                     self.image_width, self.file_modified_time_ns)
                 return
-        image_reader = QImageReader(str(self.image_path))
-        # Rotate the image based on the orientation tag.
-        image_reader.setAutoTransform(True)
-        image = image_reader.read()
-        if image.isNull():
-            thumbnail_image = QImage()
-        else:
-            thumbnail_image = image.scaledToWidth(
-                self.image_width, Qt.TransformationMode.SmoothTransformation)
+        thumbnail_image = create_thumbnail_image(self.image_path,
+                                                 self.image_width)
         if not thumbnail_image.isNull() and cache_path is not None:
-            thumbnail_image.save(str(cache_path))
+            save_thumbnail(thumbnail_image, cache_path)
         self.thumbnail_loaded.emit(self.image_path, thumbnail_image,
                                    self.image_width,
                                    self.file_modified_time_ns)
@@ -499,6 +687,10 @@ class ThumbnailLoader(QObject, QRunnable):
 class ImageListModel(QAbstractListModel):
     update_undo_and_redo_actions_requested = Signal()
     directory_loaded = Signal()
+    # A folder scan failed; carries the folder path and the reason.
+    directory_load_failed = Signal(object, str)
+    # The "unviewed" (orange dot) tag markers changed.
+    unviewed_tags_changed = Signal()
 
     def __init__(self, image_list_image_width: int, tag_separator: str):
         super().__init__()
@@ -508,16 +700,43 @@ class ImageListModel(QAbstractListModel):
         self.images: list[Image] = []
         self.undo_stack = deque(maxlen=UNDO_STACK_SIZE)
         self.redo_stack = []
+        # What the most recent `add_to_undo_stack` call displaced (the oldest
+        # undo entry dropped by the size limit, and the cleared redo stack), so
+        # a bulk operation that ends up changing nothing can be fully undone
+        # from the history. None when there is nothing to restore.
+        self._last_undo_push = None
+        # Caption files that failed to save while a bulk operation is running.
+        self._write_error_batch_depth = 0
+        self._failed_write_paths: list[Path] = []
         # True only while restoring tags from the undo/redo history. Consumers
         # (e.g. the Common/Differences panel) use this to distinguish a genuine
         # new edit from a history restore, so an undone/redone tag returns to
         # its original position while a freshly added tag lands at the end.
         self.is_restoring_history = False
-        self.proxy_image_list_model = None
+        # While restoring: (item being restored, its reverse item). See
+        # `restore_history_tags`.
+        self.restoring_history_items = None
+        # The entry most recently added by `add_to_undo_stack`, until the
+        # grid view has saved its tag order with it (see HistoryItem).
+        self.newest_history_item = None
+        # Set only while a rename-like operation reports its change: maps each
+        # renamed tag to the tag(s) that replaced it, so the grid view can keep
+        # the new name in the old tag's position.
+        self.tag_renames: dict[str, list[str]] | None = None
+        # Image path -> tags shown with an orange "unviewed" dot (added by the
+        # Auto-Captioner or marked by the user) until the tag is selected.
+        # Kept in memory only, for as long as the app is open. Connected first
+        # so markers of removed tags are dropped before any view refreshes.
+        self.unviewed_tags: dict[Path, set[str]] = {}
+        self.dataChanged.connect(self._sync_unviewed_tags)
         self.image_list_selection_model = None
         self.thumbnail_loaders = set()
+        # Image path -> row it was in when its thumbnail load was started.
+        self._thumbnail_row_hints: dict[Path, int] = {}
         self._current_scanner = None
         self._pending_images: list = []
+        # Subfolders the last completed folder scan could not read.
+        self.skipped_directories: list[Path] = []
         # Dedicated pool for all thumbnail work (both on-demand and bulk
         # preloading); capped so thumbnails can't starve the global pool, which
         # is reserved for the interactive image load, the directory scanner, and
@@ -531,6 +750,14 @@ class ImageListModel(QAbstractListModel):
 
     def rowCount(self, parent=None) -> int:
         return len(self.images)
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        # Images can be dragged out of the Images pane as files (see
+        # `ImageListView.startDrag`).
+        flags = super().flags(index)
+        if index.isValid():
+            flags |= Qt.ItemFlag.ItemIsDragEnabled
+        return flags
 
     def set_tokenizer(self, tokenizer):
         self.tokenizer = tokenizer
@@ -576,6 +803,7 @@ class ImageListModel(QAbstractListModel):
             return
         self._preload_pool.clear()
         self._preload_generation += 1
+        self._thumbnail_row_hints.clear()
         self.image_list_image_width = normalized_width
         for image in self.images:
             image.thumbnail = None
@@ -589,10 +817,14 @@ class ImageListModel(QAbstractListModel):
         # Thumbnails are keyed by width, so the new size needs its own cache.
         self._start_background_warm()
 
-    def load_thumbnail(self, image: Image):
+    def load_thumbnail(self, image: Image, row: int | None = None):
         if image.thumbnail or image.thumbnail_loading:
             return
         image.thumbnail_loading = True
+        if row is not None:
+            # Lets `on_thumbnail_loaded` find the row without searching the
+            # whole list (slow for very large folders).
+            self._thumbnail_row_hints[image.path] = row
         thumbnail_loader = ThumbnailLoader(
             image.path, self.image_list_image_width, image.file_modified_time_ns)
         thumbnail_loader.thumbnail_loaded.connect(self.on_thumbnail_loaded)
@@ -611,7 +843,15 @@ class ImageListModel(QAbstractListModel):
         if thumbnail_loader in self.thumbnail_loaders:
             self.thumbnail_loaders.remove(thumbnail_loader)
             thumbnail_loader.deleteLater()
-        for row, image in enumerate(self.images):
+        row = self._thumbnail_row_hints.pop(image_path, None)
+        # The list may have been re-sorted or changed since the load started,
+        # so only trust the hint if it still points at this image.
+        if (row is not None and 0 <= row < len(self.images)
+                and self.images[row].path == image_path):
+            rows_and_images = [(row, self.images[row])]
+        else:
+            rows_and_images = enumerate(self.images)
+        for row, image in rows_and_images:
             if image.path != image_path:
                 continue
             if image_width != self.image_list_image_width:
@@ -632,7 +872,12 @@ class ImageListModel(QAbstractListModel):
                 [Qt.ItemDataRole.DecorationRole, Qt.ItemDataRole.SizeHintRole])
             return
 
-    def data(self, index, role=None) -> Image | str | QIcon | QSize:
+    def data(self, index, role=None) -> Image | str | QIcon | QSize | None:
+        # An invalid index has row -1, which Python would read as the last
+        # image. Return nothing instead so edits never land on the wrong image.
+        if (index is None or not index.isValid()
+                or not 0 <= index.row() < len(self.images)):
+            return None
         image = self.images[index.row()]
         if role == Qt.ItemDataRole.UserRole:
             return image
@@ -668,6 +913,7 @@ class ImageListModel(QAbstractListModel):
             if cache_path is not None and cache_path.exists():
                 cached_image = QImage(str(cache_path))
                 if not cached_image.isNull():
+                    mark_thumbnail_used(cache_path)
                     pixmap = QPixmap.fromImage(cached_image)
                     thumbnail = QIcon(pixmap)
                     image.thumbnail = thumbnail
@@ -675,7 +921,7 @@ class ImageListModel(QAbstractListModel):
                     return thumbnail
             # Cache miss — start async loader, don't block main thread.
             if not image.thumbnail_loading:
-                self.load_thumbnail(image)
+                self.load_thumbnail(image, index.row())
             return None
         if role == Qt.ItemDataRole.SizeHintRole:
             if image.thumbnail:
@@ -798,8 +1044,10 @@ class ImageListModel(QAbstractListModel):
         # Cancel any pending preload workers from the previous directory.
         self._preload_pool.clear()
         self._preload_generation += 1
+        self._thumbnail_row_hints.clear()
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self._last_undo_push = None
         self.update_undo_and_redo_actions_requested.emit()
         # Scan in a background thread; the old list stays visible until done.
         image_suffixes = self.get_image_suffixes()
@@ -807,8 +1055,16 @@ class ImageListModel(QAbstractListModel):
                                    self.tag_separator)
         scanner.scan_complete.connect(
             lambda images, s=scanner: self._on_directory_scanned(images, s))
+        scanner.scan_failed.connect(
+            lambda message, s=scanner: self._on_directory_scan_failed(
+                message, s))
         self._current_scanner = scanner
         QThreadPool.globalInstance().start(scanner)
+
+    def _on_directory_scan_failed(self, message: str, scanner):
+        if scanner is not self._current_scanner:
+            return
+        self.directory_load_failed.emit(scanner.directory_path, message)
 
     @Slot(list)
     def _on_directory_scanned(self, images: list, scanner=None):
@@ -817,6 +1073,8 @@ class ImageListModel(QAbstractListModel):
         # current and this stale result must not overwrite its images.
         if scanner is not None and scanner is not self._current_scanner:
             return
+        self.skipped_directories = (list(scanner.skipped_directories)
+                                    if scanner is not None else [])
         # Store images for main_window._on_directory_loaded to sort and commit
         # in a single model reset (avoids the double-reset from sort + load).
         self._pending_images = images
@@ -834,9 +1092,13 @@ class ImageListModel(QAbstractListModel):
         never overwritten with stale data.
         """
         structure_changed = False
+        # Images whose captions changed outside the app (or that disappeared).
+        # Undo/redo must not overwrite those outside changes.
+        paths_to_forget_in_history = set()
 
         # Removals: files that disappeared from the directory.
         if result.removed_paths:
+            paths_to_forget_in_history.update(result.removed_paths)
             rows_to_remove = [row for row, image in enumerate(self.images)
                               if image.path in result.removed_paths]
             for row in sorted(rows_to_remove, reverse=True):
@@ -910,6 +1172,7 @@ class ImageListModel(QAbstractListModel):
                         image.caption_file_modified_time_ns = new_mtime
                         image.tags = tags
                         image.natural_language_prompt = natural_language_prompt
+                        paths_to_forget_in_history.add(image_path)
                         did_change = True
                 if did_change:
                     changed_rows.append(row)
@@ -957,28 +1220,101 @@ class ImageListModel(QAbstractListModel):
         if structure_changed or changed_rows:
             self._preload_generation += 1
             self._start_background_warm()
+        self.forget_history_for_paths(paths_to_forget_in_history)
         return structure_changed, set(changed_rows)
 
     def add_to_undo_stack(self, action_name: str,
                           should_ask_for_confirmation: bool):
         """Add the current state of the image tags to the undo stack."""
-        tags = [image.tags.copy() for image in self.images]
-        natural_language_prompts = [
-            image.natural_language_prompt for image in self.images
-        ]
-        self.undo_stack.append(HistoryItem(action_name, tags,
-                                           natural_language_prompts,
-                                           should_ask_for_confirmation))
+        captions = {
+            image.path: (image.tags.copy(), image.natural_language_prompt)
+            for image in self.images
+        }
+        dropped_item = (self.undo_stack[0]
+                        if len(self.undo_stack) == self.undo_stack.maxlen
+                        else None)
+        self._last_undo_push = (dropped_item, self.redo_stack.copy())
+        self.newest_history_item = HistoryItem(action_name, captions,
+                                               should_ask_for_confirmation)
+        self.undo_stack.append(self.newest_history_item)
         self.redo_stack.clear()
         self.update_undo_and_redo_actions_requested.emit()
+
+    def discard_last_undo_entry(self):
+        """Remove the entry just added by `add_to_undo_stack`, for an operation
+        that turned out to change nothing, restoring the history exactly as it
+        was before (including the redo stack)."""
+        if self._last_undo_push is None or not self.undo_stack:
+            return
+        dropped_item, previous_redo_stack = self._last_undo_push
+        self._last_undo_push = None
+        if self.undo_stack[-1] is self.newest_history_item:
+            self.newest_history_item = None
+        self.undo_stack.pop()
+        if dropped_item is not None:
+            self.undo_stack.appendleft(dropped_item)
+        self.redo_stack[:] = previous_redo_stack
+        self.update_undo_and_redo_actions_requested.emit()
+
+    def forget_history_for_paths(self, paths):
+        """Stop undo/redo from touching these images, e.g. because their
+        captions were changed outside the app or the files were removed."""
+        if not paths:
+            return
+        for history_item in (*self.undo_stack, *self.redo_stack):
+            for path in paths:
+                history_item.captions.pop(path, None)
+
+    @contextmanager
+    def batch_write_errors(self):
+        """While active, caption save failures are collected and reported in
+        one message at the end instead of one message per file."""
+        self.begin_write_error_batch()
+        try:
+            yield
+        finally:
+            self.end_write_error_batch()
+
+    def begin_write_error_batch(self):
+        self._write_error_batch_depth += 1
+
+    def end_write_error_batch(self):
+        if self._write_error_batch_depth == 0:
+            return
+        self._write_error_batch_depth -= 1
+        if self._write_error_batch_depth > 0 or not self._failed_write_paths:
+            return
+        failed_paths = self._failed_write_paths
+        self._failed_write_paths = []
+        self.show_write_errors(failed_paths)
+
+    @staticmethod
+    def show_write_errors(failed_paths: list[Path]):
+        error_message_box = QMessageBox()
+        error_message_box.setWindowTitle('Error')
+        error_message_box.setIcon(QMessageBox.Icon.Critical)
+        if len(failed_paths) == 1:
+            error_message_box.setText(
+                f'Failed to save tags for {failed_paths[0]}.')
+        else:
+            listed_paths = '\n'.join(
+                str(path) for path in failed_paths[:MAX_LISTED_WRITE_ERRORS])
+            remaining_count = len(failed_paths) - MAX_LISTED_WRITE_ERRORS
+            if remaining_count > 0:
+                listed_paths += f'\n...and {remaining_count} more.'
+            error_message_box.setText(
+                f'Failed to save tags for {len(failed_paths)} images. The '
+                f'caption files may be read-only or open in another '
+                f'program.\n\n{listed_paths}')
+        error_message_box.exec()
 
     def write_image_tags_to_disk(self, image: Image):
         text_file_path = image.path.with_suffix('.txt')
         try:
-            text_file_path.write_text(
+            write_text_atomically(
+                text_file_path,
                 build_caption_text(image.tags, image.natural_language_prompt,
-                                   self.tag_separator),
-                encoding='utf-8', errors='replace')
+                                   self.tag_separator))
             image.caption_file_modified_time_ns = text_file_path.stat().st_mtime_ns
             # Keep the completion store's caption hash current for complete
             # images so an external move/rename still confirms as the same
@@ -986,12 +1322,25 @@ class ImageListModel(QAbstractListModel):
             if image.is_complete:
                 get_completion_store().refresh_caption(image.path)
         except OSError:
-            error_message_box = QMessageBox()
-            error_message_box.setWindowTitle('Error')
-            error_message_box.setIcon(QMessageBox.Icon.Critical)
-            error_message_box.setText(f'Failed to save tags for {image.path}.')
-            error_message_box.exec()
+            if self._write_error_batch_depth > 0:
+                self._failed_write_paths.append(image.path)
+            else:
+                self.show_write_errors([image.path])
 
+    @staticmethod
+    def is_caption_changed_outside_app(image: Image) -> bool:
+        """Whether the caption file on disk differs from the version the app
+        last read or wrote (e.g. it was edited in another program)."""
+        text_file_path = image.path.with_suffix('.txt')
+        try:
+            modified_time_ns = text_file_path.stat().st_mtime_ns
+        except FileNotFoundError:
+            modified_time_ns = None
+        except OSError:
+            return False
+        return modified_time_ns != image.caption_file_modified_time_ns
+
+    @collect_write_errors
     def restore_history_tags(self, is_undo: bool):
         if is_undo:
             source_stack = self.undo_stack
@@ -1012,34 +1361,59 @@ class ImageListModel(QAbstractListModel):
             if reply != QMessageBox.StandardButton.Yes:
                 return
         source_stack.pop()
-        tags = [image.tags for image in self.images]
-        natural_language_prompts = [
-            image.natural_language_prompt for image in self.images
-        ]
-        destination_stack.append(HistoryItem(
-            history_item.action_name, tags, natural_language_prompts,
-            history_item.should_ask_for_confirmation))
-        changed_image_indices = []
-        for image_index, (image, history_image_tags,
-                          history_natural_language_prompt) in enumerate(
-                zip(self.images, history_item.tags,
-                    history_item.natural_language_prompts)):
-            if (image.tags == history_image_tags
+        self._last_undo_push = None
+        path_to_row = {image.path: row
+                       for row, image in enumerate(self.images)}
+        reverse_captions = {}
+        changed_rows = []
+        skipped_paths = set()
+        for path, (history_tags, history_natural_language_prompt) in (
+                history_item.captions.items()):
+            row = path_to_row.get(path)
+            if row is None:
+                # The image is no longer in the list.
+                continue
+            image = self.images[row]
+            if (image.tags == history_tags
                     and image.natural_language_prompt
                     == history_natural_language_prompt):
+                reverse_captions[path] = (image.tags.copy(),
+                                          image.natural_language_prompt)
                 continue
-            changed_image_indices.append(image_index)
-            image.tags = history_image_tags
+            if self.is_caption_changed_outside_app(image):
+                skipped_paths.add(path)
+                continue
+            reverse_captions[path] = (image.tags.copy(),
+                                      image.natural_language_prompt)
+            image.tags = history_tags.copy()
             image.natural_language_prompt = history_natural_language_prompt
             self.write_image_tags_to_disk(image)
-        if changed_image_indices:
+            changed_rows.append(row)
+        reverse_item = HistoryItem(
+            history_item.action_name, reverse_captions,
+            history_item.should_ask_for_confirmation)
+        destination_stack.append(reverse_item)
+        self.forget_history_for_paths(skipped_paths)
+        if changed_rows:
             self.is_restoring_history = True
+            # Lets the grid view restore the tag order saved with the item
+            # being restored, and save the current order with its reverse.
+            self.restoring_history_items = (history_item, reverse_item)
             try:
-                self.dataChanged.emit(self.index(changed_image_indices[0]),
-                                      self.index(changed_image_indices[-1]))
+                self.dataChanged.emit(self.index(min(changed_rows)),
+                                      self.index(max(changed_rows)))
             finally:
                 self.is_restoring_history = False
+                self.restoring_history_items = None
         self.update_undo_and_redo_actions_requested.emit()
+        if skipped_paths:
+            skipped_count = len(skipped_paths)
+            QMessageBox.information(
+                None, 'Undo' if is_undo else 'Redo',
+                f'{skipped_count} {pluralize("image", skipped_count)} '
+                f'{"was" if skipped_count == 1 else "were"} skipped because '
+                f'{"its caption was" if skipped_count == 1 else "their captions were"} '
+                f'changed outside TagGUI Plus.')
 
     @Slot()
     def undo(self):
@@ -1066,42 +1440,74 @@ class ImageListModel(QAbstractListModel):
     def get_text_match_count(self, text: str, scope: Scope | str,
                              whole_tags_only: bool, use_regex: bool) -> int:
         """Get the number of instances of a text in all captions."""
-        match_count = 0
-        for image_index, image in enumerate(self.images):
-            if not self.is_image_in_scope(scope, image_index, image):
-                continue
-            if whole_tags_only:
-                if use_regex:
-                    match_count += len([
-                        tag for tag in image.tags
-                        if re.fullmatch(pattern=text, string=tag)
-                    ])
-                else:
-                    match_count += image.tags.count(text)
-            else:
-                caption = self.tag_separator.join(image.tags)
-                if use_regex:
-                    match_count += len(re.findall(pattern=text,
-                                                  string=caption))
-                else:
-                    match_count += caption.count(text)
-        return match_count
+        return self.get_text_matches(text, scope, whole_tags_only,
+                                     use_regex)[0]
+
+    def split_tag_text(self, text: str) -> list[str]:
+        """Split text on the tag separator into stripped, non-empty tags."""
+        return [tag.strip() for tag in text.split(self.tag_separator)
+                if tag.strip()]
+
+    def find_text_spans_tags(self, find_text: str) -> bool:
+        """Whether substring Find and Replace should search the whole caption
+        (across tag boundaries) instead of inside each tag separately. Only
+        find text that contains the tag separator (e.g. a comma) can
+        deliberately match across tags; anything else is matched per tag so
+        that, for example, replacing spaces never touches the separators."""
+        separator = self.tag_separator.strip() or self.tag_separator
+        return separator in find_text
+
+    @staticmethod
+    def count_text_matches(text: str, find_text: str,
+                           pattern: re.Pattern | None) -> int:
+        """Count matches of `find_text` (or `pattern`) in `text`, ignoring
+        zero-length regex matches."""
+        if pattern is None:
+            return text.count(find_text)
+        return sum(1 for match in pattern.finditer(text) if match.group(0))
+
+    @staticmethod
+    def substitute_text(text: str, find_text: str, replace_text: str,
+                        pattern: re.Pattern | None) -> str:
+        """Replace matches in `text`. Regex replacements support group
+        references (\\1, \\g<name>); zero-length matches (e.g. from "x*")
+        are left alone instead of inserting the replacement between every
+        character."""
+        if pattern is None:
+            return text.replace(find_text, replace_text)
+        return pattern.sub(
+            lambda match: (match.expand(replace_text) if match.group(0)
+                           else ''), text)
+
+    @staticmethod
+    def validate_regex_replacement(pattern: re.Pattern, replace_text: str):
+        """Raise re.error if `replace_text` is not a valid replacement for
+        `pattern` (e.g. a reference to a group that does not exist)."""
+        try:
+            pattern.sub(replace_text, '')
+        except IndexError as exception:
+            raise re.error(str(exception)) from exception
 
     def get_text_matches(self, text: str, scope: Scope | str,
                          whole_tags_only: bool, use_regex: bool
                          ) -> tuple[int, list[tuple[str, int]]]:
         """Return the total instance count and a per-tag breakdown in one pass.
 
-        The first value mirrors ``get_text_match_count`` exactly. The second is
+        Substring matches are counted inside each tag unless the find text
+        contains the tag separator (see ``find_text_spans_tags``), so the
+        count matches what ``find_and_replace`` will change. The second is
         a list of ``(tag, occurrences)`` for every distinct tag that contains a
         match, ordered most frequent first (ties broken alphabetically), so the
-        Find and Replace dialog can preview which tags will be affected. The
+        Find and Replace dialog can preview which tags will be affected. When
+        the search spans tags, no single tag contains a match, so the list
+        holds ``(matched text, occurrences)`` instead. The
         regex is compiled once up front; an invalid pattern raises ``re.error``
         for the caller to handle, matching ``get_text_match_count``.
         """
         match_count = 0
         tag_counts: dict[str, int] = {}
         pattern = re.compile(text) if use_regex else None
+        spans_tags = self.find_text_spans_tags(text)
         for image_index, image in enumerate(self.images):
             if not self.is_image_in_scope(scope, image_index, image):
                 continue
@@ -1111,15 +1517,24 @@ class ImageListModel(QAbstractListModel):
                             else tag == text):
                         match_count += 1
                         tag_counts[tag] = tag_counts.get(tag, 0) + 1
-            else:
+            elif spans_tags:
                 caption = self.tag_separator.join(image.tags)
-                if use_regex:
-                    match_count += len(pattern.findall(caption))
+                if pattern is None:
+                    matched_texts = [text] * caption.count(text)
                 else:
-                    match_count += caption.count(text)
-                for tag in image.tags:
-                    occurrences = (len(pattern.findall(tag)) if use_regex
-                                   else tag.count(text))
+                    matched_texts = [match.group(0) for match
+                                     in pattern.finditer(caption)
+                                     if match.group(0)]
+                match_count += len(matched_texts)
+                for matched_text in matched_texts:
+                    tag_counts[matched_text] = (
+                        tag_counts.get(matched_text, 0) + 1)
+            else:
+                tag_occurrences = [
+                    self.count_text_matches(tag, text, pattern)
+                    for tag in image.tags]
+                match_count += sum(tag_occurrences)
+                for tag, occurrences in zip(image.tags, tag_occurrences):
                     if occurrences:
                         tag_counts[tag] = (tag_counts.get(tag, 0)
                                            + occurrences)
@@ -1127,53 +1542,169 @@ class ImageListModel(QAbstractListModel):
                          key=lambda item: (-item[1], item[0]))
         return match_count, ordered
 
+    def get_unviewed_tags(self, images) -> set[str]:
+        """Tags of `images` that have an unviewed marker on any of them."""
+        marks = set()
+        for image in images:
+            image_marks = self.unviewed_tags.get(image.path)
+            if image_marks:
+                marks |= image_marks.intersection(image.tags)
+        return marks
+
+    def mark_tags_unviewed(self, images, tags=None):
+        """Mark `tags` (default: every tag) of each of `images` unviewed."""
+        changed = False
+        for image in images:
+            new_marks = set(image.tags)
+            if tags is not None:
+                new_marks &= set(tags)
+            if not new_marks:
+                continue
+            marks = self.unviewed_tags.setdefault(image.path, set())
+            if not new_marks <= marks:
+                marks |= new_marks
+                changed = True
+        if changed:
+            self.unviewed_tags_changed.emit()
+
+    def clear_unviewed_tags(self, images, tags=None):
+        """Remove the unviewed markers of `tags` (default: all) from each of
+        `images`."""
+        changed = False
+        for image in images:
+            marks = self.unviewed_tags.get(image.path)
+            if not marks:
+                continue
+            if tags is None:
+                marks.clear()
+                changed = True
+            elif not marks.isdisjoint(tags):
+                marks.difference_update(tags)
+                changed = True
+            if not marks:
+                del self.unviewed_tags[image.path]
+        if changed:
+            self.unviewed_tags_changed.emit()
+
+    def _sync_unviewed_tags(self, top_left: QModelIndex,
+                            bottom_right: QModelIndex, *args):
+        """Drop the markers of tags that were removed from the changed images,
+        so re-adding such a tag later doesn't bring its dot back. A renamed
+        tag passes its marker on to its replacement(s)."""
+        if not self.unviewed_tags or not top_left.isValid():
+            return
+        last = (bottom_right.row() if bottom_right.isValid()
+                else top_left.row())
+        for row in range(max(top_left.row(), 0),
+                         min(last, len(self.images) - 1) + 1):
+            image = self.images[row]
+            marks = self.unviewed_tags.get(image.path)
+            if not marks:
+                continue
+            present = set(image.tags)
+            if self.tag_renames:
+                for old_tag, new_tags in self.tag_renames.items():
+                    if old_tag in marks and old_tag not in present:
+                        marks.update(present.intersection(new_tags))
+            marks &= present
+            if not marks:
+                del self.unviewed_tags[image.path]
+
+    def _emit_renamed(self, first_index: QModelIndex, last_index: QModelIndex,
+                      renames: dict[str, list[str]]):
+        """Emit dataChanged while publishing which tags were renamed to what
+        (see `tag_renames`)."""
+        self.tag_renames = renames
+        try:
+            self.dataChanged.emit(first_index, last_index)
+        finally:
+            self.tag_renames = None
+
+    @staticmethod
+    def _note_rename(renames: dict[str, list[str]], old_tag: str,
+                     new_tags: list[str]):
+        """Record the first replacement seen for `old_tag` (ignoring no-ops)."""
+        if new_tags != [old_tag] and old_tag not in renames:
+            renames[old_tag] = list(new_tags)
+
+    @collect_write_errors
     def find_and_replace(self, find_text: str, replace_text: str,
                          scope: Scope | str, use_regex: bool):
         """
-        Find and replace arbitrary text in captions, within and across tag
-        boundaries.
+        Find and replace arbitrary text in captions. Matches are replaced
+        inside each tag separately, unless the find text contains the tag
+        separator, in which case the whole caption is searched so a match can
+        span several tags. Replacements containing the separator are split
+        into separate tags.
         """
         if not find_text:
             return
+        pattern = re.compile(find_text) if use_regex else None
+        if pattern is not None:
+            # Raise before touching the undo stack or any image.
+            self.validate_regex_replacement(pattern, replace_text)
+        spans_tags = self.find_text_spans_tags(find_text)
         self.add_to_undo_stack(action_name='Find and Replace',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
+        renames: dict[str, list[str]] = {}
         for image_index, image in enumerate(self.images):
             if not self.is_image_in_scope(scope, image_index, image):
                 continue
-            caption = self.tag_separator.join(image.tags)
-            if use_regex:
-                if not re.search(pattern=find_text, string=caption):
+            if spans_tags:
+                caption = self.tag_separator.join(image.tags)
+                if not self.count_text_matches(caption, find_text, pattern):
                     continue
-                caption = re.sub(pattern=find_text, repl=replace_text,
-                                 string=caption)
+                new_tags = self.split_tag_text(self.substitute_text(
+                    caption, find_text, replace_text, pattern))
             else:
-                if find_text not in caption:
+                if not any(self.count_text_matches(tag, find_text, pattern)
+                           for tag in image.tags):
                     continue
-                caption = caption.replace(find_text, replace_text)
+                new_tags = []
+                for tag in image.tags:
+                    if self.count_text_matches(tag, find_text, pattern):
+                        replacements = self.split_tag_text(
+                            self.substitute_text(tag, find_text,
+                                                 replace_text, pattern))
+                        self._note_rename(renames, tag, replacements)
+                        new_tags.extend(replacements)
+                    else:
+                        new_tags.append(tag)
+            new_tags = list(dict.fromkeys(new_tags))
+            if new_tags == image.tags:
+                continue
             changed_image_indices.append(image_index)
-            image.tags = list(dict.fromkeys(
-                t.strip() for t in caption.split(self.tag_separator)
-                if t.strip()))
+            image.tags = new_tags
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
-            self.dataChanged.emit(self.index(changed_image_indices[0]),
-                                  self.index(changed_image_indices[-1]))
+            self._emit_renamed(self.index(changed_image_indices[0]),
+                               self.index(changed_image_indices[-1]),
+                               renames)
+        else:
+            self.discard_last_undo_entry()
 
-    def sort_tags_alphabetically(self, do_not_reorder_first_tag: bool):
+    @collect_write_errors
+    def sort_tags_alphabetically(self, do_not_reorder_first_tag: bool,
+                                 scope: Scope | str = Scope.ALL_IMAGES):
         """Sort the tags for each image in alphabetical order."""
         self.add_to_undo_stack(action_name='Sort Tags',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
             old_caption = self.tag_separator.join(image.tags)
+            # Case-insensitive, like the app's other tag lists; the sort is
+            # stable, so tags differing only in case keep their order.
             if do_not_reorder_first_tag:
                 first_tag = image.tags[0]
-                image.tags = [first_tag] + sorted(image.tags[1:])
+                image.tags = [first_tag] + sorted(image.tags[1:],
+                                                  key=str.casefold)
             else:
-                image.tags.sort()
+                image.tags.sort(key=str.casefold)
             new_caption = self.tag_separator.join(image.tags)
             if new_caption != old_caption:
                 changed_image_indices.append(image_index)
@@ -1181,9 +1712,13 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
+    @collect_write_errors
     def sort_tags_by_frequency(self, tag_counter: Counter,
-                               do_not_reorder_first_tag: bool):
+                               do_not_reorder_first_tag: bool,
+                               scope: Scope | str = Scope.ALL_IMAGES):
         """
         Sort the tags for each image by the total number of times a tag appears
         across all images.
@@ -1192,6 +1727,8 @@ class ImageListModel(QAbstractListModel):
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
             old_caption = self.tag_separator.join(image.tags)
@@ -1209,53 +1746,83 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
-    def reverse_tags_order(self, do_not_reorder_first_tag: bool):
+    @collect_write_errors
+    def reverse_tags_order(self, do_not_reorder_first_tag: bool,
+                           scope: Scope | str = Scope.ALL_IMAGES):
         """Reverse the order of the tags for each image."""
         self.add_to_undo_stack(action_name='Reverse Order of Tags',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
-            changed_image_indices.append(image_index)
             if do_not_reorder_first_tag:
-                image.tags = [image.tags[0]] + list(reversed(image.tags[1:]))
+                new_tags = [image.tags[0]] + list(reversed(image.tags[1:]))
             else:
-                image.tags = list(reversed(image.tags))
+                new_tags = list(reversed(image.tags))
+            if new_tags == image.tags:
+                continue
+            changed_image_indices.append(image_index)
+            image.tags = new_tags
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
-    def shuffle_tags(self, do_not_reorder_first_tag: bool):
+    @collect_write_errors
+    def shuffle_tags(self, do_not_reorder_first_tag: bool,
+                     scope: Scope | str = Scope.ALL_IMAGES):
         """Shuffle the tags for each image randomly."""
         self.add_to_undo_stack(action_name='Shuffle Tags',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
-            changed_image_indices.append(image_index)
             if do_not_reorder_first_tag:
                 first_tag, *remaining_tags = image.tags
                 random.shuffle(remaining_tags)
-                image.tags = [first_tag] + remaining_tags
+                new_tags = [first_tag] + remaining_tags
             else:
-                random.shuffle(image.tags)
+                new_tags = image.tags.copy()
+                random.shuffle(new_tags)
+            if new_tags == image.tags:
+                continue
+            changed_image_indices.append(image_index)
+            image.tags = new_tags
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
-    def move_tags_to_front(self, tags_to_move: list[str]):
+    @collect_write_errors
+    def move_tags_to_front(self, tags_to_move: list[str],
+                           scope: Scope | str = Scope.ALL_IMAGES):
         """
         Move one or more tags to the front of the tags list for each image.
         """
+        # Repeated or empty entries (e.g. "zz, zz" or a trailing comma) would
+        # otherwise duplicate tags in the image.
+        tags_to_move = list(dict.fromkeys(tag for tag in tags_to_move if tag))
+        if not tags_to_move:
+            return
         self.add_to_undo_stack(action_name='Move Tags to Front',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if not any(tag in image.tags for tag in tags_to_move):
                 continue
             old_caption = self.tag_separator.join(image.tags)
@@ -1272,10 +1839,14 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
+    @collect_write_errors
     def sort_tags_by_category(self, get_category_for_tag,
                               category_order_map: dict[str, int],
-                              do_not_reorder_first_tag: bool):
+                              do_not_reorder_first_tag: bool,
+                              scope: Scope | str = Scope.ALL_IMAGES):
         """
         Move categorized tags to the front using the configured category order,
         while preserving the relative order of tags within each category and for
@@ -1286,6 +1857,8 @@ class ImageListModel(QAbstractListModel):
         changed_image_indices = []
         uncategorized_sort_index = len(category_order_map)
         for image_index, image in enumerate(self.images):
+            if not self.is_image_in_scope(scope, image_index, image):
+                continue
             if len(image.tags) < 2:
                 continue
             old_caption = self.tag_separator.join(image.tags)
@@ -1318,6 +1891,8 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()
 
     def set_images_complete(self, image_indices: list[QModelIndex],
                             is_complete: bool):
@@ -1342,9 +1917,16 @@ class ImageListModel(QAbstractListModel):
                                   [Qt.ItemDataRole.DecorationRole,
                                    Qt.ItemDataRole.UserRole])
 
+    def _valid_indices(self, image_indices: list) -> list[QModelIndex]:
+        """Drop indices that no longer point at an image (e.g. after the
+        image was removed), so a stale target can't write elsewhere."""
+        return [index for index in image_indices
+                if index is not None and index.isValid()
+                and 0 <= index.row() < len(self.images)]
+
     def update_image_tags(self, image_index: QModelIndex, tags: list[str]):
         image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-        if image.tags == tags:
+        if image is None or image.tags == tags:
             return
         image.tags = tags
         self.dataChanged.emit(image_index, image_index)
@@ -1353,6 +1935,8 @@ class ImageListModel(QAbstractListModel):
     def update_image_caption(self, image_index: QModelIndex, tags: list[str],
                              natural_language_prompt: str):
         image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
+        if image is None:
+            return
         tags = list(dict.fromkeys(tags))
         if (image.tags == tags
                 and image.natural_language_prompt == natural_language_prompt):
@@ -1365,7 +1949,8 @@ class ImageListModel(QAbstractListModel):
     def update_image_natural_language_prompt(self, image_index: QModelIndex,
                                              natural_language_prompt: str):
         image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-        if image.natural_language_prompt == natural_language_prompt:
+        if (image is None
+                or image.natural_language_prompt == natural_language_prompt):
             return
         image.natural_language_prompt = natural_language_prompt
         self.dataChanged.emit(image_index, image_index)
@@ -1374,22 +1959,48 @@ class ImageListModel(QAbstractListModel):
     @Slot(list, list)
     def add_tags(self, tags: list[str], image_indices: list[QModelIndex]):
         """Add one or more tags to one or more images."""
-        if not image_indices:
+        self.add_tags_per_image([(index, tags) for index in image_indices],
+                                f'Add {pluralize("Tag", len(tags))}')
+
+    @collect_write_errors
+    def add_tags_per_image(self, tags_by_index: list[tuple[QModelIndex,
+                                                            list[str]]],
+                           action_name: str):
+        """Add each image's own list of tags to it, as one undo step. Tags
+        an image already has are skipped."""
+        valid_rows = range(len(self.images))
+        tags_by_index = [(index, tags) for index, tags in tags_by_index
+                         if tags and index is not None and index.isValid()
+                         and index.row() in valid_rows]
+        if not tags_by_index:
             return
-        action_name = f'Add {pluralize("Tag", len(tags))}'
-        should_ask_for_confirmation = len(image_indices) > 1
+        should_ask_for_confirmation = len(tags_by_index) > 1
         self.add_to_undo_stack(action_name, should_ask_for_confirmation)
-        for image_index in image_indices:
+        changed_indices = []
+        for image_index, tags in tags_by_index:
             image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-            existing = set(image.tags)
-            new_tags = [t for t in tags if t not in existing]
+            # A tag that only differs in letter case from one the image
+            # already has counts as a duplicate, like in the Image Tags pane.
+            existing = {tag.casefold() for tag in image.tags}
+            new_tags = []
+            for tag in tags:
+                if tag.casefold() not in existing:
+                    existing.add(tag.casefold())
+                    new_tags.append(tag)
+            if not new_tags:
+                continue
             image.tags.extend(new_tags)
             self.write_image_tags_to_disk(image)
-        min_image_index = min(image_indices, key=lambda index: index.row())
-        max_image_index = max(image_indices, key=lambda index: index.row())
+            changed_indices.append(image_index)
+        if not changed_indices:
+            self.discard_last_undo_entry()
+            return
+        min_image_index = min(changed_indices, key=lambda index: index.row())
+        max_image_index = max(changed_indices, key=lambda index: index.row())
         self.dataChanged.emit(min_image_index, max_image_index)
 
     @Slot(list, list)
+    @collect_write_errors
     def remove_tags_from_images(self, tags: list[str],
                                 image_indices: list[QModelIndex]):
         """Remove one or more tags from an explicit set of images.
@@ -1400,6 +2011,7 @@ class ImageListModel(QAbstractListModel):
         current image"). Only images that actually contain one of the tags are
         modified and written to disk.
         """
+        image_indices = self._valid_indices(image_indices)
         if not image_indices or not tags:
             return
         tags_to_remove = set(tags)
@@ -1416,12 +2028,14 @@ class ImageListModel(QAbstractListModel):
             self.write_image_tags_to_disk(image)
             changed_indices.append(image_index)
         if not changed_indices:
+            self.discard_last_undo_entry()
             return
         min_image_index = min(changed_indices, key=lambda index: index.row())
         max_image_index = max(changed_indices, key=lambda index: index.row())
         self.dataChanged.emit(min_image_index, max_image_index)
 
     @Slot(str, str, list)
+    @collect_write_errors
     def rename_tag_in_images(self, old_tag: str, new_tag: str,
                              image_indices: list[QModelIndex]):
         """Rename a tag on an explicit set of images (grouped view in-place edit).
@@ -1429,10 +2043,15 @@ class ImageListModel(QAbstractListModel):
         Mirrors ``remove_tags_from_images`` but for an in-place rename: only the
         given images that actually contain ``old_tag`` are modified, the new tag
         takes the old tag's position, and duplicates are collapsed. No-op when
-        the new tag is empty or unchanged.
+        the new tag is empty or unchanged. A new name containing the tag
+        separator (e.g. "a, b") is split into several tags, like the Add Tag
+        box does, so the list matches what the caption file reloads as.
         """
-        new_tag = new_tag.strip()
-        if not image_indices or not old_tag or not new_tag or old_tag == new_tag:
+        new_tags = [tag.strip() for tag in new_tag.split(self.tag_separator)
+                    if tag.strip()]
+        image_indices = self._valid_indices(image_indices)
+        if (not image_indices or not old_tag or not new_tags
+                or new_tags == [old_tag]):
             return
         targets = [index for index in image_indices
                    if old_tag in self.data(index,
@@ -1444,45 +2063,110 @@ class ImageListModel(QAbstractListModel):
             should_ask_for_confirmation=len(targets) > 1)
         for image_index in targets:
             image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-            image.tags = list(dict.fromkeys(
-                new_tag if tag == old_tag else tag for tag in image.tags))
+            renamed = []
+            for tag in image.tags:
+                renamed.extend(new_tags if tag == old_tag else [tag])
+            image.tags = list(dict.fromkeys(renamed))
             self.write_image_tags_to_disk(image)
         min_image_index = min(targets, key=lambda index: index.row())
         max_image_index = max(targets, key=lambda index: index.row())
-        self.dataChanged.emit(min_image_index, max_image_index)
+        self._emit_renamed(min_image_index, max_image_index,
+                           {old_tag: new_tags})
 
     @Slot(list, str)
-    def rename_tags(self, old_tags: list[str], new_tag: str,
+    @collect_write_errors
+    def rename_tags(self, old_tags: list[str], new_tag: str | list[str],
                     scope: Scope | str = Scope.ALL_IMAGES,
                     use_regex: bool = False):
+        # A list of new tags replaces each old tag with all of them, in order.
+        # A new name containing the tag separator (e.g. "a, b") is split into
+        # several tags, so the list matches what the caption file reloads as.
+        raw_new_tags = ([new_tag] if isinstance(new_tag, str)
+                        else list(new_tag))
+        new_tags = [tag for raw_tag in raw_new_tags
+                    for tag in self.split_tag_text(raw_tag)]
+        if use_regex:
+            # The regex replacement may use group references (\1); it is
+            # expanded per matching tag and split afterwards.
+            new_tag = raw_new_tags[0]
+            pattern = re.compile(old_tags[0])
+            self.validate_regex_replacement(pattern, new_tag)
         self.add_to_undo_stack(
             action_name=f'Rename {pluralize("Tag", len(old_tags))}',
             should_ask_for_confirmation=True)
         changed_image_indices = []
+        renames: dict[str, list[str]] = {}
         for image_index, image in enumerate(self.images):
             if not self.is_image_in_scope(scope, image_index, image):
                 continue
             if use_regex:
-                pattern = old_tags[0]
-                if not any(re.fullmatch(pattern=pattern, string=image_tag)
+                if not any(pattern.fullmatch(image_tag)
                            for image_tag in image.tags):
                     continue
-                image.tags = list(dict.fromkeys(
-                    new_tag if re.fullmatch(pattern=pattern, string=image_tag)
-                    else image_tag for image_tag in image.tags))
+                renamed_tags = []
+                for image_tag in image.tags:
+                    match = pattern.fullmatch(image_tag)
+                    if match:
+                        replacements = self.split_tag_text(
+                            match.expand(new_tag))
+                        self._note_rename(renames, image_tag, replacements)
+                        renamed_tags.extend(replacements)
+                    else:
+                        renamed_tags.append(image_tag)
+                image.tags = list(dict.fromkeys(renamed_tags))
             else:
                 if not any(old_tag in image.tags for old_tag in old_tags):
                     continue
                 image.tags = list(dict.fromkeys(
-                    new_tag if image_tag in old_tags else image_tag
-                    for image_tag in image.tags))
+                    replacement
+                    for image_tag in image.tags
+                    for replacement in (new_tags if image_tag in old_tags
+                                        else [image_tag])))
+            changed_image_indices.append(image_index)
+            self.write_image_tags_to_disk(image)
+        if not use_regex:
+            for old_tag in old_tags:
+                self._note_rename(renames, old_tag, new_tags)
+        if changed_image_indices:
+            self._emit_renamed(self.index(changed_image_indices[0]),
+                               self.index(changed_image_indices[-1]),
+                               renames)
+        else:
+            self.discard_last_undo_entry()
+
+    @collect_write_errors
+    def apply_tag_mapping(self, mapping: dict[str, str],
+                          action_name: str) -> int:
+        """Replace tags on all images using `mapping` in a single pass, as one
+        undo step. Every mapping is applied to the original tags at the same
+        time, so chained (a→b, b→c) or swapped (a↔b) mappings do not cascade.
+        An empty replacement removes the tag. Returns the number of images
+        changed."""
+        self.add_to_undo_stack(action_name=action_name,
+                               should_ask_for_confirmation=True)
+        changed_image_indices = []
+        for image_index, image in enumerate(self.images):
+            if not any(tag in mapping for tag in image.tags):
+                continue
+            new_tags = []
+            for tag in image.tags:
+                replacement = mapping.get(tag, tag)
+                if replacement:
+                    new_tags.append(replacement)
+            image.tags = list(dict.fromkeys(new_tags))
             changed_image_indices.append(image_index)
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
-            self.dataChanged.emit(self.index(changed_image_indices[0]),
-                                  self.index(changed_image_indices[-1]))
+            self._emit_renamed(
+                self.index(changed_image_indices[0]),
+                self.index(changed_image_indices[-1]),
+                {old: [new] for old, new in mapping.items() if new})
+        else:
+            self.discard_last_undo_entry()
+        return len(changed_image_indices)
 
     @Slot(list)
+    @collect_write_errors
     def delete_tags(self, tags: list[str],
                     scope: Scope | str = Scope.ALL_IMAGES,
                     use_regex: bool = False):
@@ -1511,3 +2195,5 @@ class ImageListModel(QAbstractListModel):
         if changed_image_indices:
             self.dataChanged.emit(self.index(changed_image_indices[0]),
                                   self.index(changed_image_indices[-1]))
+        else:
+            self.discard_last_undo_entry()

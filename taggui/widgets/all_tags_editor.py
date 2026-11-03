@@ -1,7 +1,8 @@
 from enum import Enum
 
-from PySide6.QtCore import (QItemSelection, QItemSelectionModel, QPoint, Qt,
-                            QTimer, Signal, Slot)
+from PySide6.QtCore import (QItemSelection, QItemSelectionModel,
+                            QPersistentModelIndex, QPoint, Qt, QTimer, Signal,
+                            Slot)
 from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget,
                                QHBoxLayout, QLabel, QMenu, QMessageBox,
@@ -13,7 +14,7 @@ from utils.big_widgets import TallPushButton
 from utils.elided_tooltip import ElidedToolTipListView
 from utils.enums import AllTagsFilterLogic, AllTagsSortBy, SortOrder
 from utils.settings import get_settings, get_tag_separator
-from utils.settings_widgets import SettingsComboBox
+from utils.settings_widgets import FocusedScrollSettingsComboBox
 from utils.tag_filter import TagFilterLineEdit
 from utils.text_edit_item_delegate import TextEditItemDelegate
 from utils.utils import get_confirmation_dialog_reply, list_with_and, pluralize
@@ -57,54 +58,90 @@ class AllTagsList(ElidedToolTipListView):
         # selected again.
         self.selectionModel().selectionChanged.connect(
             self.handle_selection_change)
-        self.pending_click_row = None
+        self.pending_click_index = None
         self.pending_click_timer = QTimer()
         self.pending_click_timer.setSingleShot(True)
         self.pending_click_timer.timeout.connect(self.emit_tag_addition)
 
     def emit_tag_addition(self):
         """Emit tag_addition_requested for a pending click."""
-        if self.pending_click_row is not None:
-            index = self.model().index(self.pending_click_row, 0)
-            tag = index.data(Qt.ItemDataRole.EditRole)
+        pending_index = self.pending_click_index
+        self.pending_click_index = None
+        if pending_index is None or not pending_index.isValid():
+            return
+        tag = self.model().index(pending_index.row(), 0).data(
+            Qt.ItemDataRole.EditRole)
+        if tag:
             self.tag_addition_requested.emit(tag)
-        self.pending_click_row = None
 
     def mousePressEvent(self, event: QMouseEvent):
         click_action = (self.all_tags_editor.click_action_combo_box
                         .currentText())
-        if event.button() == Qt.MouseButton.RightButton:
-            self.suppress_filter_on_selection_change = True
         if (event.button() == Qt.MouseButton.LeftButton
                 and click_action == ClickAction.ADD_TO_SELECTED):
             # Don't emit tag_addition_requested if an editor is active or if
             # a modal dialog is open (indicating the user is in the middle of
             # renaming or other operations).
-            from PySide6.QtWidgets import QApplication
             modal_widgets = QApplication.instance().topLevelWidgets()
             has_modal_dialog = any(
                 w.isModal() and w.isVisible() for w in modal_widgets
             )
             if self.state() != QAbstractItemView.State.EditingState and not has_modal_dialog:
                 index = self.indexAt(event.pos())
-                row = index.row() if index.isValid() else -1
-                # Check if this is a second click on the same row (part of a
+                # Check if this is a second click on the same tag (part of a
                 # double-click). If so, cancel the pending signal emission.
-                if row == self.pending_click_row and row >= 0:
+                if (index.isValid() and self.pending_click_index is not None
+                        and self.pending_click_index == index):
                     self.pending_click_timer.stop()
-                    self.pending_click_row = None
-                elif row >= 0:
+                    self.pending_click_index = None
+                elif index.isValid():
                     # This might be the first click of a double-click, so defer
                     # the signal emission to allow double-click detection.
-                    self.pending_click_row = row
+                    # A persistent index follows the tag if the list re-sorts.
+                    self.pending_click_index = QPersistentModelIndex(index)
                     self.pending_click_timer.start(500)
+        if event.button() == Qt.MouseButton.RightButton:
+            # A right-click only selects the tag for the context menu; it
+            # shouldn't filter the images.
+            self.suppress_filter_on_selection_change = True
+            try:
+                super().mousePressEvent(event)
+            finally:
+                self.suppress_filter_on_selection_change = False
+            return
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """Cancel pending tag addition when double-click is detected."""
         self.pending_click_timer.stop()
-        self.pending_click_row = None
+        self.pending_click_index = None
         super().mouseDoubleClickEvent(event)
+
+    def select_tag_after_edit(self, edited_tag):
+        """After an edit is committed with Enter, select the renamed tag (or
+        the edited tag if the rename was cancelled) by name, since re-counting
+        moves rows. This doesn't change the Images filter."""
+        tag_counter_model = self.all_tags_editor.tag_counter_model
+        tag = tag_counter_model.renamed_tag or edited_tag
+        tag_counter_model.renamed_tag = None
+        model = self.model()
+        target = None
+        for row in range(model.rowCount()):
+            index = model.index(row, 0)
+            if index.data(Qt.ItemDataRole.EditRole) == tag:
+                target = index
+                break
+        self.suppress_filter_on_selection_change = True
+        try:
+            if target is None:
+                self.selectionModel().clearSelection()
+                return
+            self.setCurrentIndex(target)
+            self.selectionModel().select(
+                target, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            self.scrollTo(target)
+        finally:
+            self.suppress_filter_on_selection_change = False
 
     @Slot(QPoint)
     def show_context_menu(self, position: QPoint):
@@ -113,10 +150,13 @@ class AllTagsList(ElidedToolTipListView):
             return
         if selected_index not in self.selectedIndexes():
             self.suppress_filter_on_selection_change = True
-            self.selectionModel().select(
-                selected_index,
-                QItemSelectionModel.SelectionFlag.ClearAndSelect)
-            self.setCurrentIndex(selected_index)
+            try:
+                self.selectionModel().select(
+                    selected_index,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                self.setCurrentIndex(selected_index)
+            finally:
+                self.suppress_filter_on_selection_change = False
 
         tag = selected_index.data(Qt.ItemDataRole.EditRole)
         if not tag:
@@ -210,18 +250,16 @@ class AllTagsList(ElidedToolTipListView):
 
     def handle_selection_change(self, selected: QItemSelection, _):
         if self.suppress_filter_on_selection_change:
-            self.suppress_filter_on_selection_change = False
             return
         click_action = (self.all_tags_editor.click_action_combo_box
                         .currentText())
         if click_action != ClickAction.FILTER_IMAGES:
             return
-        selected_indices = self.selectedIndexes()
-        if not selected_indices:
-            return
         selected_tags = [index.data(Qt.ItemDataRole.EditRole)
-                         for index in selected_indices]
-        self.image_list_filter_requested.emit(selected_tags)
+                         for index in self.selectedIndexes()]
+        # An empty list (last tag deselected) clears the Images filter.
+        self.image_list_filter_requested.emit(
+            [tag for tag in selected_tags if tag])
 
     def selected_tag_for_wiki(self) -> str:
         """Return the single selected tag to look up in the wiki, or '' when
@@ -273,16 +311,16 @@ class AllTagsEditor(QDockWidget):
         # Combined click action + filter logic row (idea 4)
         combined_layout = QHBoxLayout()
         combined_layout.addWidget(QLabel('Click action'))
-        self.click_action_combo_box = SettingsComboBox(
+        self.click_action_combo_box = FocusedScrollSettingsComboBox(
             key='all_tags_click_action')
         self.click_action_combo_box.addItems(list(ClickAction))
         self.click_action_combo_box.setSizeAdjustPolicy(
-            SettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            FocusedScrollSettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.click_action_combo_box.setMinimumContentsLength(3)
         combined_layout.addWidget(self.click_action_combo_box, stretch=1)
         combined_layout.addSpacing(8)
         combined_layout.addWidget(QLabel('Logic'))
-        self.filter_logic_combo_box = SettingsComboBox(
+        self.filter_logic_combo_box = FocusedScrollSettingsComboBox(
             key='all_tags_filter_logic', default='AND')
         self.filter_logic_combo_box.addItems(list(AllTagsFilterLogic))
         self.filter_logic_combo_box.setMinimumContentsLength(2)
@@ -293,11 +331,11 @@ class AllTagsEditor(QDockWidget):
         # Sort row with toggle button (idea 3)
         sort_layout = QHBoxLayout()
         sort_label = QLabel('Sort by')
-        self.sort_by_combo_box = SettingsComboBox(key='all_tags_sort_by',
+        self.sort_by_combo_box = FocusedScrollSettingsComboBox(key='all_tags_sort_by',
                                                   default='Frequency')
         self.sort_by_combo_box.addItems(list(AllTagsSortBy))
         self.sort_by_combo_box.setSizeAdjustPolicy(
-            SettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            FocusedScrollSettingsComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.sort_by_combo_box.setMinimumContentsLength(6)
         self.sort_by_combo_box.currentTextChanged.connect(self.sort_tags)
         self.sort_order_button = QPushButton()

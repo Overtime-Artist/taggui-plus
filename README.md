@@ -184,7 +184,7 @@ next to your images and are never touched by uninstalling.
 
 > [!TIP]
 > **Planning to reinstall later?** Export your settings first
-> (**`File` → `Export / Import Settings…`**) and keep the exported file
+> (**`File` → `Export Settings…`**) and keep the exported file
 > somewhere safe. Removing app data clears your saved preferences, Tag Library,
 > and other settings, so exporting first lets you import everything back after
 > you reinstall instead of setting it all up again from scratch.
@@ -197,6 +197,13 @@ downloaded models are optional and off by default. TagGUI Plus deletes the selec
 items and then **closes immediately** so nothing gets written back. Afterwards,
 delete the app folder yourself (the app can't delete its own folder while it's
 running).
+
+For safety, the tool will not delete a models or Hugging Face folder that is (or
+contains) your user folder, a system folder, the app folder, or your current
+image folder. Such a folder is shown greyed out with the reason; if you really
+want it gone, delete only the model files inside it by hand. Settings backups
+made by **Reset to Defaults** live in the cache folder, so removing the caches
+also removes those backups.
 
 You can also clear just the thumbnail cache from
 **`Settings` → `Clear Thumbnail Cache`**.
@@ -211,7 +218,9 @@ You can also clear just the thumbnail cache from
 | App settings (preferences, autocomplete/local tags, categories, hidden models, etc.) | Registry key `HKEY_CURRENT_USER\Software\taggui\taggui` | `~/Library/Preferences/com.taggui.taggui.plist` | `~/.config/taggui/taggui.conf` |
 | Thumbnail cache | `%LOCALAPPDATA%\taggui\thumbnails` | `~/Library/Caches/taggui/thumbnails` | `~/.cache/taggui/thumbnails` |
 | Scan caches (`dimension_cache.json`, `caption_cache.json`, `completion_cache.json`) | `%LOCALAPPDATA%\taggui` | `~/Library/Caches/taggui` | `~/.cache/taggui` |
-| Downloaded captioning models (often several GB) | Your configured models directory, or the Hugging Face cache `%USERPROFILE%\.cache\huggingface` (or wherever `HF_HOME` points) | Your models directory, or `~/.cache/huggingface` | Your models directory, or `~/.cache/huggingface` |
+| Settings backups made by Reset to Defaults (`settings-backup-*.json`) | `%LOCALAPPDATA%\taggui` | `~/Library/Caches/taggui` | `~/.cache/taggui` |
+| Danbooru wiki browser profile (Cloudflare/login cookies and a small cache) | `%APPDATA%\taggui\taggui\QtWebEngine\taggui-danbooru` and `%LOCALAPPDATA%\taggui\taggui\cache\QtWebEngine\taggui-danbooru` | A `QtWebEngine/taggui-danbooru` folder under `~/Library/Application Support/taggui` and under `~/Library/Caches/taggui` | A `QtWebEngine/taggui-danbooru` folder under `~/.local/share/taggui` and under `~/.cache/taggui` |
+| Downloaded captioning models (often several GB) | Your configured models directory, or the Hugging Face cache `%USERPROFILE%\.cache\huggingface` (or wherever `HF_HUB_CACHE` / `HF_HOME` points) | Your models directory, or `~/.cache/huggingface` | Your models directory, or `~/.cache/huggingface` |
 
 </details>
 
@@ -223,6 +232,9 @@ You can also clear just the thumbnail cache from
 ```powershell
 # Thumbnail cache and scan caches
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\taggui"
+
+# Danbooru wiki browser profile (saved cookies)
+Remove-Item -Recurse -Force "$env:APPDATA\taggui"
 
 # Saved settings (stored in the Windows Registry, not a file)
 Remove-Item -Recurse -Force "HKCU:\Software\taggui"
@@ -240,6 +252,10 @@ Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface"
 # Caches (thumbnails + scan caches)
 rm -rf ~/.cache/taggui          # Linux
 rm -rf ~/Library/Caches/taggui  # macOS
+
+# Danbooru wiki browser profile (saved cookies)
+rm -rf ~/.local/share/taggui                       # Linux
+rm -rf ~/Library/Application\ Support/taggui       # macOS
 
 # Saved settings
 rm -f ~/.config/taggui/taggui.conf                     # Linux
@@ -346,6 +362,11 @@ The scrollable list of thumbnails for the loaded folder.
   under a thumbnail are colored by their category.
 - Select multiple images with `Ctrl`/`Shift`+click to edit or caption them as a
   batch.
+- **Use images outside the app:** right-click → **`Copy Image to Clipboard`**
+  (`Ctrl`+`Shift`+`I`) copies the current image itself, ready to paste into a
+  chat or image editor. You can also **drag** thumbnails out of the list into a
+  file upload field or folder; dragging always copies the files and never moves
+  them out of your dataset.
 
 <p align='center'>
   <img src='images/TagGUI_Images_Pane.png' alt='TagGUI Plus Images Pane'>
@@ -358,6 +379,7 @@ The large view of the currently selected image.
 - **Zoom** with the mouse wheel or `Ctrl`+`+` / `Ctrl`+`-`.
 - **Pan** a zoomed image by dragging, or with `Alt`+arrow keys.
 - **Reset** the view by double-clicking or pressing `Ctrl`+`0`.
+- **Right-click** the image to copy it to the clipboard.
 - Select **multiple images** to switch the preview into a **synchronized grid**:
   zooming, panning, and resetting apply to every cell at once. The current image
   is outlined in blue; press `Left` / `Right` to move through the selection. See
@@ -451,7 +473,12 @@ The grouped list behaves like the normal tag list:
 double-click to rename, `Delete` to remove, copy the selected tags, look a tag up
 on a wiki, or assign it to a category. Tags keep a **stable position** as you
 edit, so removing a tag from one image only updates its `k/N` count instead of
-reshuffling the list. At the bottom of the pane, the **`X common` /
+reshuffling the list. Newly added tags go to the end, renamed tags stay in place,
+and undo/redo puts tags back exactly where they were. Positions are remembered
+while you change the selection, as long as the new grid shares at least one
+image with the previous grid (single-image selections in between don't count);
+selecting a grid with no images in common, or loading a folder, starts a fresh
+order. At the bottom of the pane, the **`X common` /
 `Y differences` counts** double as **filters**: click one to show only those
 tags, and click it again to show everything. Choosing `differences` also turns
 the `Current image only` toggle on and `common` turns it off, so the Add Tag
@@ -482,6 +509,8 @@ vocabulary — the source of autocomplete and category coloring.
   `replacement`). Apply a profile to swap every matching tag across the loaded
   directory in one step, or revert it to change those tags back — handy for
   switching a folder between different tag vocabularies or naming conventions.
+  All mappings apply at once (so swapping two tags works), and a mapping with
+  an **empty replacement removes** that tag.
 
 <p align='center'>
   <img src='images/TagGUI_Tag_Library.png' alt='TagGUI Plus Tag Library'>
@@ -492,18 +521,25 @@ vocabulary — the source of autocomplete and category coloring.
 **`Edit` → `Find and Replace…`** (`Ctrl`+`R`). Batch-replace text in tags and
 captions.
 
-- **Scope:** current image, all selected images, or the entire folder.
+- **Scope:** all images, the images shown by the current filter, or the
+  selected images.
 - **`Whole tags only`** matches complete tags as units (leave the replace box
   empty to *delete* matching tags, or fill it to *rename* them).
+- Otherwise text is found and replaced **inside each tag**. Only find text that
+  contains your tag separator (a comma by default) can match across neighbouring tags.
+  A replacement containing the separator splits into separate tags.
 - **`Use regex for find text`** enables regular-expression patterns.
 - The button shows a live count of how many instances will change.
 
 ### Batch Reorder Tags
 
-**`Edit` → `Batch Reorder Tags…`** (`Ctrl`+`B`). Reorder tags across all
-selected images in one action:
+**`Edit` → `Batch Reorder Tags…`** (`Ctrl`+`B`). Reorder tags across many
+images in one action. The **Scope** option picks all images, the images shown
+by the current filter, or the selected images; the default-reorder shortcut
+below uses the same scope.
 
-- Sort **alphabetically**, by **frequency**, or by **category order**.
+- Sort **alphabetically** (ignoring upper/lower case), by **frequency**, or by
+  **category order**.
 - **Reverse** or **shuffle** the tag order.
 - **Move specific tags to the front** (comma-separated).
 - Optionally **keep the first tag fixed** during any operation.
@@ -522,6 +558,30 @@ using perceptual hashing and shows each group side by side.
 - For each group you **keep one image**; the rest can be sent to the **Recycle
   Bin/Trash**, **moved to a folder**, or **tagged as `duplicate`** for later
   review.
+- **Keep in each group** picks the kept image automatically: *Largest
+  resolution*, *Largest file*, *Newest file*, *Oldest file* or *Most tags*.
+  *Newest* and *Oldest* compare each file's **modified** date, which is shown
+  on every image. **Apply to all groups** replaces any picks you made by hand
+  and skips groups marked *Ignore this group*.
+- **Copy the tags of the other images to the kept image** adds any tags the
+  kept image is missing (at the end of its tag list) before the others are
+  deleted, moved or tagged.
+- Each image is labelled with how it relates to the kept one: **Identical
+  file** means byte-for-byte the same file; **Looks identical** or **Differs
+  by N** compare a 256-bit visual fingerprint, where N is how many of those
+  bits differ (lower = more alike).
+- Mouse-wheel scrolling over a group's row scrolls the results list; use
+  `Shift`+wheel (or sideways scrolling on a touchpad) to scroll along the row.
+- **Click a thumbnail** to open the group in a larger viewer:
+  - Zoom with the mouse wheel, `+`/`-` or the main window's zoom keys
+    (`Ctrl`+`+`, `Ctrl`+`-`), drag to pan, and press `0`/`Ctrl`+`0` or
+    double-click to reset the zoom. The zoom level is kept when moving between
+    images, so you can compare the same detail.
+  - `←`/`→` move between the group's images, `G` toggles a grid of the whole
+    group (in the grid, double-click or `Enter` opens an image; if the grid is
+    zoomed, the first double-click only resets the zoom), `K` or `Enter` keeps
+    the shown image, `F11` toggles full screen and `Esc` leaves full screen or
+    closes the viewer.
 
 > [!WARNING]
 > The strictness slider is **very sensitive to variant sets** — groups of images
@@ -538,11 +598,24 @@ using perceptual hashing and shows each group side by side.
 
 ### Directory Analytics
 
-**`Tools` → `Directory Analytics…`**. A read-only report on the loaded folder —
-nothing is changed. Tabs cover an **overview** (counts, size, formats),
-**resolution** stats, **captions & tags** coverage, **housekeeping** (orphaned
-or missing caption files), and a **per-subfolder** breakdown. Results can be
-exported to CSV or Markdown.
+**`Tools` → `Directory Analytics…`** (available once a folder is loaded). A
+read-only report on the loaded folder — nothing is changed. Tabs cover an
+**overview** (counts, size, formats), **resolution** stats, **captions & tags**
+coverage (including images missing a caption file), **housekeeping** (orphaned
+caption files and other non-image files), and a **per-subfolder** breakdown you
+can sort by clicking a column header. Each folder's figures include its
+subfolders; the **Direct** column counts only the images saved in that folder
+itself. Results can be exported to CSV or
+Markdown; listed paths are shown relative to the loaded folder.
+
+The window can stay open while you work. After the first scan it widens to show
+the whole per-subfolder table (up to 90% of the screen width; beyond that the
+table scrolls sideways). Click a listed image to select it in
+the Images pane (an image hidden by the current filter can't be selected — clear
+the filter first), or a listed non-image file to show it in your file manager.
+The report isn't updated automatically; press **Rescan** after making changes.
+Common system files (`Thumbs.db`, `desktop.ini`, `.DS_Store`) are not counted
+as non-image files.
 
 <p align='center'>
   <img src='images/TagGUI_Directory_Analytics.png' alt='TagGUI Plus Directory Analytics'>
@@ -641,9 +714,24 @@ prefixes:
 
 </details>
 
-You can also **export** and **import** your settings (**`File` → `Export /
-Import Settings…`**), choosing which parts (Tag Library, auto-captioner
-settings, completion marks) to include.
+**Reset to Defaults** first saves a backup of all your settings (the message
+tells you where) and then resets everything **except your Tag Library**, which
+is kept. To undo a reset, import the backup with **`File` → `Import
+Settings…`**.
+
+You can also **export** and **import** your settings (**`File` → `Export
+Settings…`** and **`File` → `Import Settings…`**), choosing which parts
+(general preferences, keyboard shortcuts, auto-captioner settings, window
+layout, Tag Library, completed image marks) to include. Before anything
+changes, a preview shows what the file contains. Notes:
+
+- Importing the **Tag Library** *replaces* your current one (use the Tag
+  Library dialog's own Import if you want to merge instead). A file with no
+  tags never empties your library — that part is skipped.
+- **Completed image marks** belong to a particular set of images; they only
+  apply to images that match the exported ones.
+- Invalid or out-of-range values in the file are skipped. If the file can't be
+  read properly, nothing is changed.
 
 ## Automatic captioning
 
@@ -668,10 +756,19 @@ you choose to caption **all selected images** or **only the current image**
 variant), and whether to **show an alert when it finishes**. Captioning a single
 image runs immediately without this prompt.
 
-After a run, any tags it **added or increased the count of** are flagged with a
-small **amber dot** in the tag list (in both the single-image and grouped views),
-so you can review what changed at a glance. Selecting a flagged tag clears its
-dot.
+Tags the captioner **adds** to an image are flagged with a small **amber dot** in
+the tag list, so you can review what changed at a glance. Each image remembers
+its dots, even after you switch to other images, until you select the tag (or
+close the app). Clicking an already-selected dotted tag also clears its dot. In
+the grid view a tag shows a dot if any selected image has
+it flagged, and selecting it there clears the dot for all of them. Renaming a
+flagged tag keeps the dot; deleting it removes the dot. To start a review pass
+on any images, select them and press `Ctrl`+`U` to flag all their tags;
+`Ctrl`+`Shift`+`U` clears the dots.
+
+You can keep working while captioning runs, but **Undo/Redo are unavailable**
+until it finishes, and loading another folder asks you to cancel or wait first.
+Closing the app cancels the run.
 
 ### Supported models
 
@@ -805,7 +902,12 @@ Click a tag in the **All Tags** pane to filter for it, or type a filter in the
 - `complete:` — completion state (`complete:true`, `complete:false`)
 - `name:` — the term appears in the file name
 - `path:` — the term appears in the full file path
+- `category:` — the image has a tag in a category whose name contains the term
+  (`category:character`); `category:none` or `category:uncategorized` finds
+  images with a tag that has no category
 - No prefix — matches the caption **or** file path
+
+Matching ignores upper/lower case.
 
 **Numeric prefixes** (operators `=`/`==`, `!=`, `<`, `>`, `<=`, `>=`)
 
@@ -887,6 +989,7 @@ shortcuts`**; the defaults are listed below.
 | Previous / next image | `Ctrl`+`Up` / `Ctrl`+`Down` |
 | Jump to first untagged / incomplete image | `Ctrl`+`J` / `Ctrl`+`Shift`+`J` |
 | Toggle `Natural language mode` / `Current image only` (mode button) | `Ctrl`+`Space` |
+| Focus mode (also in the `View` menu): full screen showing only the image preview, with an image-count overlay, and the Image Tags pane; `Esc` also exits, and `Alt+F` / `Alt+S` exit before focusing their box | `F11` |
 
 ### Focus shortcuts
 
@@ -908,9 +1011,15 @@ shortcuts`**; the defaults are listed below.
 - Switch between selected images without changing the selection: `Left` /
   `Right`
 - Mark complete / incomplete: `Ctrl`+`K` / `Ctrl`+`Shift`+`K`
-- **Right-click menu:** copy tags/caption/name/path, paste tags, open image or
+- Add / clear amber "unviewed" dots on every tag of the selected images (see
+  [Automatic captioning](#automatic-captioning)): `Ctrl`+`U` /
+  `Ctrl`+`Shift`+`U`
+- Copy the current image to the clipboard: `Ctrl`+`Shift`+`I`; drag thumbnails
+  out to copy the files elsewhere
+- **Right-click menu:** copy tags/caption/name/path/image, paste tags, open image or
   caption file, open in your configured editor, rename the image file, move or
-  copy images to another folder, delete images, and mark complete/incomplete.
+  copy images to another folder, delete images, mark complete/incomplete, and
+  mark tags as unviewed / clear unviewed tag markers.
   When several images are selected, the open/rename actions target the **current**
   (highlighted) image.
 
