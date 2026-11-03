@@ -305,14 +305,17 @@ class MainWindow(QMainWindow):
                              Qt.Key.Key_PageDown, Qt.Key.Key_Home,
                              Qt.Key.Key_End))
         self.installEventFilter(key_press_forwarder)
-        # Remove the Ctrl+Z shortcut from text input boxes to prevent it from
-        # conflicting with the undo action.
+        # Let the Undo/Redo keys reach the app's undo actions instead of being
+        # taken by these text boxes' own undo. The keys are kept in sync with
+        # the (possibly customized) Undo/Redo shortcuts in
+        # ``apply_configured_shortcuts``.
         ctrl_z = QKeyCombination(Qt.KeyboardModifier.ControlModifier,
                                  key=Qt.Key.Key_Z)
         ctrl_y = QKeyCombination(Qt.KeyboardModifier.ControlModifier,
                                  key=Qt.Key.Key_Y)
         shortcut_remover = ShortcutRemover(parent=self,
                                            shortcuts=(ctrl_z, ctrl_y))
+        self._text_box_shortcut_remover = shortcut_remover
         self.image_list.filter_line_edit.installEventFilter(shortcut_remover)
         self.image_tags_editor.tag_input_box.installEventFilter(
             shortcut_remover)
@@ -1372,6 +1375,19 @@ class MainWindow(QMainWindow):
                     handlers_by_id.get(shortcut_id, []))
             else:
                 action.setShortcuts(key_sequences)
+        remover = getattr(self, '_text_box_shortcut_remover', None)
+        if remover is not None:
+            # Only key combinations with Ctrl/Alt/Meta; a bare key (e.g.
+            # Backspace) must keep editing the text.
+            command_modifiers = (Qt.KeyboardModifier.ControlModifier
+                                 | Qt.KeyboardModifier.AltModifier
+                                 | Qt.KeyboardModifier.MetaModifier)
+            remover.shortcuts = tuple(
+                sequence[0]
+                for action in (self.undo_action, self.redo_action)
+                for sequence in action.shortcuts()
+                if sequence.count() == 1
+                and sequence[0].keyboardModifiers() & command_modifiers)
         # Refresh menu to recalculate layout with shortcuts now set
         self.menu_bar.update()
         self._apply_tag_library_dialog_shortcuts()

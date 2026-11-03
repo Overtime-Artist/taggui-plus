@@ -22,6 +22,8 @@ def pluralize(word: str, count: int) -> str:
 
 
 def list_with_and(items: list[str]) -> str:
+    if not items:
+        return ''
     if len(items) == 1:
         return items[0]
     if len(items) == 2:
