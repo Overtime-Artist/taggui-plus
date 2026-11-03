@@ -82,8 +82,11 @@ class NumberSummary:
 
 @dataclass
 class SubfolderStats:
+    """Totals for a folder *including all of its subfolders*;
+    ``direct_image_count`` counts only images saved in the folder itself."""
     name: str  # Path relative to the scan root ('.' for the root itself).
     image_count: int
+    direct_image_count: int
     total_size_bytes: int
     average_megapixels: float | None  # None when no image had dimensions.
     caption_coverage_percent: float
@@ -409,18 +412,43 @@ def compute_analytics(images, root_directory, image_suffixes,
     report.non_image_file_paths = non_image_files
 
     # --- Finalise per-subfolder table -----------------------------------------
+    # Each folder's figures include everything beneath it, so every folder on
+    # the way from the root to a folder with images gets a row (the root too).
+    totals: dict[str, dict] = {}
+    for name, direct_count in sub_images.items():
+        if name == '.':
+            chain = ['.']
+        elif Path(name).is_absolute():
+            # Outside the root (not expected); listed on its own.
+            chain = [name]
+        else:
+            name_parts = Path(name).parts
+            chain = ['.'] + [str(Path(*name_parts[:length]))
+                             for length in range(1, len(name_parts) + 1)]
+        for folder in chain:
+            entry = totals.setdefault(folder, {
+                'images': 0, 'direct': 0, 'size': 0, 'mp': [],
+                'caption': 0, 'complete': 0})
+            entry['images'] += direct_count
+            entry['size'] += sub_size.get(name, 0)
+            entry['mp'].extend(sub_mp.get(name, []))
+            entry['caption'] += sub_caption.get(name, 0)
+            entry['complete'] += sub_complete.get(name, 0)
+        totals[name]['direct'] = direct_count
     subfolders: list[SubfolderStats] = []
-    for name in sorted(sub_images):
-        count = sub_images[name]
-        mp_values = sub_mp.get(name, [])
-        avg_mp = statistics.fmean(mp_values) if mp_values else None
+    for name in sorted(totals,
+                       key=lambda n: () if n == '.' else Path(n).parts):
+        entry = totals[name]
+        count = entry['images']
         subfolders.append(SubfolderStats(
             name=name,
             image_count=count,
-            total_size_bytes=sub_size.get(name, 0),
-            average_megapixels=avg_mp,
-            caption_coverage_percent=_percent(sub_caption.get(name, 0), count),
-            completion_percent=_percent(sub_complete.get(name, 0), count),
+            direct_image_count=entry['direct'],
+            total_size_bytes=entry['size'],
+            average_megapixels=(statistics.fmean(entry['mp'])
+                                if entry['mp'] else None),
+            caption_coverage_percent=_percent(entry['caption'], count),
+            completion_percent=_percent(entry['complete'], count),
         ))
     report.subfolders = subfolders
 
@@ -613,10 +641,14 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     # Per-subfolder
     add('## Per-subfolder')
     add('')
-    add('| Folder | Images | Size | Avg MP | Caption % | Complete % |')
-    add('| --- | ---: | ---: | ---: | ---: | ---: |')
+    add('Figures include subfolders; *Direct* counts only the images saved in '
+        'the folder itself.')
+    add('')
+    add('| Folder | Images | Direct | Size | Avg MP | Caption % | Complete % |')
+    add('| --- | ---: | ---: | ---: | ---: | ---: | ---: |')
     for sub in report.subfolders:
         add(f'| {_md_text(sub.name)} | {sub.image_count} | '
+            f'{sub.direct_image_count} | '
             f'{format_size(sub.total_size_bytes)} | '
             f'{format_megapixels(sub.average_megapixels)} | '
             f'{sub.caption_coverage_percent:.1f}% | '
@@ -738,12 +770,14 @@ def report_to_csv(report: AnalyticsReport) -> str:
     write_paths(report.non_image_file_paths)
     blank()
 
-    writer.writerow(['Per-subfolder'])
-    writer.writerow(['Folder', 'Images', 'Size (bytes)', 'Average megapixels',
-                     'Caption coverage %', 'Completion %'])
+    writer.writerow(['Per-subfolder (figures include subfolders)'])
+    writer.writerow(['Folder', 'Images', 'Direct images', 'Size (bytes)',
+                     'Average megapixels', 'Caption coverage %',
+                     'Completion %'])
     for sub in report.subfolders:
         writer.writerow([
-            sub.name, sub.image_count, sub.total_size_bytes,
+            sub.name, sub.image_count, sub.direct_image_count,
+            sub.total_size_bytes,
             format_megapixels(sub.average_megapixels, no_data=''),
             f'{sub.caption_coverage_percent:.1f}',
             f'{sub.completion_percent:.1f}'])

@@ -567,7 +567,9 @@ read-only report on the loaded folder — nothing is changed. Tabs cover an
 **overview** (counts, size, formats), **resolution** stats, **captions & tags**
 coverage (including images missing a caption file), **housekeeping** (orphaned
 caption files and other non-image files), and a **per-subfolder** breakdown you
-can sort by clicking a column header. Results can be exported to CSV or
+can sort by clicking a column header. Each folder's figures include its
+subfolders; the **Direct** column counts only the images saved in that folder
+itself. Results can be exported to CSV or
 Markdown; listed paths are shown relative to the loaded folder.
 
 The window can stay open while you work. Click a listed image to select it in

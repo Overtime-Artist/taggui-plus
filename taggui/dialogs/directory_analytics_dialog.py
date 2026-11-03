@@ -21,12 +21,12 @@ from pathlib import Path
 
 from PySide6.QtCore import (QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl,
                             Signal, Slot)
-from PySide6.QtGui import QDesktopServices, QPalette
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QAbstractItemView, QDialog, QFileDialog,
                                QHBoxLayout, QHeaderView, QLabel, QMessageBox,
                                QProgressDialog, QPushButton, QTabWidget,
                                QTextBrowser, QTreeWidget, QTreeWidgetItem,
-                               QVBoxLayout)
+                               QVBoxLayout, QWidget)
 
 from models.image_list_model import ImageListModel
 from utils.directory_analytics import (_EXTREME_ASPECT_RATIO,
@@ -129,8 +129,8 @@ class _SubfolderItem(QTreeWidgetItem):
 
 
 class DirectoryAnalyticsDialog(QDialog):
-    _SUBFOLDER_HEADERS = ['Folder', 'Images', 'Size', 'Avg MP', 'Caption %',
-                          'Complete %']
+    _SUBFOLDER_HEADERS = ['Folder', 'Images', 'Direct', 'Size', 'Avg MP',
+                          'Caption %', 'Complete %']
 
     def __init__(self, parent, image_list_model: ImageListModel,
                  directory_path, select_image_callback=None):
@@ -182,7 +182,7 @@ class DirectoryAnalyticsDialog(QDialog):
         header = self.subfolder_tree.header()
         header.setStretchLastSection(False)
         # Room between the right-aligned numbers of neighbouring columns.
-        header.setMinimumSectionSize(90)
+        header.setMinimumSectionSize(80)
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         for column in range(1, len(self._SUBFOLDER_HEADERS)):
             self.subfolder_tree.headerItem().setTextAlignment(
@@ -190,7 +190,17 @@ class DirectoryAnalyticsDialog(QDialog):
                 | Qt.AlignmentFlag.AlignVCenter)
         self.subfolder_tree.setSortingEnabled(True)
         self.subfolder_tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
-        self.tabs.addTab(self.subfolder_tree, 'Per-subfolder')
+        subfolder_tab = QWidget()
+        subfolder_layout = QVBoxLayout(subfolder_tab)
+        subfolder_layout.setContentsMargins(0, 6, 0, 0)
+        subfolder_note = QLabel(
+            'Figures include subfolders. Direct counts only the images saved '
+            'in the folder itself.')
+        subfolder_note.setWordWrap(True)
+        subfolder_note.setContentsMargins(6, 0, 6, 0)
+        subfolder_layout.addWidget(subfolder_note)
+        subfolder_layout.addWidget(self.subfolder_tree, stretch=1)
+        self.tabs.addTab(subfolder_tab, 'Per-subfolder')
         layout.addWidget(self.tabs, stretch=1)
 
         button_row = QHBoxLayout()
@@ -497,56 +507,43 @@ class DirectoryAnalyticsDialog(QDialog):
         return ''.join(parts)
 
     def _populate_subfolder_tree(self, report: AnalyticsReport):
-        """Show subfolders as a sortable tree under the main folder. Folders
-        with no images of their own still get a (dimmed) row when a deeper
-        folder has images, so every child sits under its real parent."""
+        """Show subfolders as a sortable tree under the main folder. Each
+        row's figures include its subfolders; "Direct" counts only the images
+        saved in that folder itself."""
         tree = self.subfolder_tree
         tree.setSortingEnabled(False)
         tree.clear()
-        by_parts: dict[tuple, object] = {(): None}
-        for sub in report.subfolders:
-            by_parts[() if sub.name == '.' else Path(sub.name).parts] = sub
-        for parts_key in list(by_parts):
-            for length in range(1, len(parts_key)):
-                by_parts.setdefault(parts_key[:length], None)
-
-        dim_color = self.palette().color(QPalette.ColorRole.PlaceholderText)
         right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         items: dict[tuple, _SubfolderItem] = {}
-        # Sorted, so every parent is created before its children.
-        for name_parts in sorted(by_parts):
-            sub = by_parts[name_parts]
-            if name_parts:
-                item = _SubfolderItem(items[name_parts[:-1]])
-                name = name_parts[-1]
-            else:
-                item = _SubfolderItem(tree)
+        # The report lists parents before their children.
+        for sub in report.subfolders:
+            if sub.name == '.':
+                key = ()
                 root_name = (Path(report.root_directory).name
                              or report.root_directory or '.')
                 name = f'{root_name} (main folder)'
-            items[name_parts] = item
+            else:
+                key = Path(sub.name).parts
+                name = key[-1] if key[:-1] in items else sub.name
+            parent = items.get(key[:-1]) if key else None
+            item = _SubfolderItem(parent if parent is not None else tree)
+            items[key] = item
             item.setText(0, name)
             item.setData(0, _SORT_ROLE, name.casefold())
-            if sub is None:
-                values = [(None, '')] * (len(self._SUBFOLDER_HEADERS) - 1)
-            else:
-                values = [
-                    (sub.image_count, str(sub.image_count)),
-                    (sub.total_size_bytes, format_size(sub.total_size_bytes)),
-                    (sub.average_megapixels,
-                     format_megapixels(sub.average_megapixels)),
-                    (sub.caption_coverage_percent,
-                     f'{sub.caption_coverage_percent:.1f}%'),
-                    (sub.completion_percent,
-                     f'{sub.completion_percent:.1f}%'),
-                ]
+            values = [
+                (sub.image_count, str(sub.image_count)),
+                (sub.direct_image_count, str(sub.direct_image_count)),
+                (sub.total_size_bytes, format_size(sub.total_size_bytes)),
+                (sub.average_megapixels,
+                 format_megapixels(sub.average_megapixels)),
+                (sub.caption_coverage_percent,
+                 f'{sub.caption_coverage_percent:.1f}%'),
+                (sub.completion_percent, f'{sub.completion_percent:.1f}%'),
+            ]
             for column, (sort_value, text) in enumerate(values, start=1):
                 item.setText(column, text)
                 item.setData(column, _SORT_ROLE, sort_value)
                 item.setTextAlignment(column, right)
-            if sub is None:
-                for column in range(len(self._SUBFOLDER_HEADERS)):
-                    item.setForeground(column, dim_color)
         tree.setSortingEnabled(True)
         tree.expandAll()
 
