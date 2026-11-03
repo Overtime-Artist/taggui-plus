@@ -678,6 +678,8 @@ class NaturalLanguageTextEdit(QPlainTextEdit):
 class ImageTagsList(ElidedToolTipListView):
     danbooru_wiki_requested = Signal(str)
     gelbooru_wiki_requested = Signal(str)
+    # Tags whose unviewed marker was just dropped because they were selected.
+    unviewed_tags_viewed = Signal(list)
 
     def __init__(self, image_tag_list_model: QStringListModel,
                  tag_library_model: TagLibraryModel):
@@ -703,15 +705,16 @@ class ImageTagsList(ElidedToolTipListView):
         # this, Qt paints the selection with the muted "inactive" color, so a
         # newly added tag would not appear highlighted.
         self._sync_inactive_selection_colors()
-        # Tags the most recent Auto-Captioner run added to this image. The
-        # delegate paints a small amber "review" dot next to each so the user
-        # can see at a glance which tags to check (mirrors the grouped view).
+        # Tags of the displayed image with an unviewed marker (set by
+        # ImageTagsEditor from the image list model). The delegate paints a
+        # small amber dot next to each so the user can see at a glance which
+        # tags to check (mirrors the grouped view).
         self._recently_captioned: set[str] = set()
         self.selectionModel().selectionChanged.connect(
             self._clear_captioned_markers_on_selection)
 
     def set_recently_captioned(self, tags):
-        """Flag the given tags as newly auto-captioned and repaint."""
+        """Show unviewed markers on the given tags and repaint."""
         new_marks = set(tags)
         if new_marks != self._recently_captioned:
             self._recently_captioned = new_marks
@@ -735,6 +738,7 @@ class ImageTagsList(ElidedToolTipListView):
         if newly_cleared:
             self._recently_captioned -= newly_cleared
             self.viewport().update()
+            self.unviewed_tags_viewed.emit(sorted(newly_cleared))
 
     def _sync_inactive_selection_colors(self):
         palette = self.palette()
@@ -1018,9 +1022,9 @@ class ImageTagsEditor(QDockWidget):
         self.tag_separator = tag_separator
         self.image_index = None
         self.is_loading_image_tags = False
-        # Snapshot of the displayed image's tags taken when an Auto-Captioner
-        # run starts, so the run's newly added tags can be flagged for review.
-        self._auto_caption_snapshot: set[str] | None = None
+        # True while a model change reloads the tags (see
+        # reload_image_tags_if_changed).
+        self._keep_unviewed_markers = False
 
         # Each `QDockWidget` needs a unique object name for saving its state.
         self.setObjectName('image_tags_editor')
@@ -1065,6 +1069,15 @@ class ImageTagsEditor(QDockWidget):
         # persistent "Current image only" toggle in the top button row.
         self.group_tags_panel = GroupTagsPanel(tag_library_model)
         self.group_tags_panel.setVisible(False)
+        # Orange "unviewed" tag markers live in the image list model (per
+        # image); push them to whichever tag list is showing, and drop a marker
+        # once its tag is selected.
+        self.image_list_model.unviewed_tags_changed.connect(
+            self._sync_unviewed_markers)
+        self.image_tags_list.unviewed_tags_viewed.connect(
+            self._on_unviewed_tags_viewed)
+        self.group_tags_panel.unviewed_tags_viewed.connect(
+            self._on_unviewed_tags_viewed)
         # Apply the shared checked-button style to both the Natural language
         # mode button and the scope toggle.
         self._update_nl_button_style()
@@ -1358,13 +1371,9 @@ class ImageTagsEditor(QDockWidget):
             self.clear_for_no_image()
             return
         self._set_editing_enabled(True)
-        # Auto-caption review markers belong to one image, so drop them when the
-        # displayed image actually changes (but keep them across in-place tag
-        # edits such as undo/redo of the same image).
-        if (self.image_index is None
-                or self.image_index.row() != next_image_index.row()):
-            self.image_tags_list.clear_recently_captioned()
         self.image_index = next_image_index
+        self.image_tags_list.set_recently_captioned(
+            self.image_list_model.get_unviewed_tags([image]))
         self.complete_label.setVisible(bool(image.is_complete))
         # If the string list already contains the image's tags, do not reload
         # them. This is the case when the tags are edited directly through the
@@ -1510,30 +1519,6 @@ class ImageTagsEditor(QDockWidget):
 
     def is_group_mode(self) -> bool:
         return self._group_mode
-
-    def begin_auto_caption_run(self):
-        """Forward an auto-caption run start to the grouped tag panel so it can
-        flag which tags the run touches. In single-image mode, snapshot the
-        displayed image's tags instead."""
-        if self._group_mode:
-            self.group_tags_panel.begin_auto_caption_run()
-            return
-        self._auto_caption_snapshot = set(
-            self.image_tag_list_model.stringList())
-
-    def end_auto_caption_run(self):
-        """Forward an auto-caption run finish to the grouped tag panel so it can
-        mark the touched tags for review. In single-image mode, flag the tags
-        the run added to the displayed image."""
-        if self._group_mode:
-            self.group_tags_panel.end_auto_caption_run()
-            return
-        if self._auto_caption_snapshot is None:
-            return
-        before = self._auto_caption_snapshot
-        self._auto_caption_snapshot = None
-        touched = set(self.image_tag_list_model.stringList()) - before
-        self.image_tags_list.set_recently_captioned(touched)
 
     @Slot(bool)
     def _on_scope_toggled(self, checked: bool):
@@ -1695,18 +1680,58 @@ class ImageTagsEditor(QDockWidget):
         self.grid_peek_changed.emit(False)
         self.set_natural_language_mode()
 
-    def _refresh_group_panel(self, restore_positions: bool = False,
-                             renames: dict[str, list[str]] | None = None,
-                             saved_order=None):
+    def _group_images(self) -> list[Image]:
         images = []
         for index in self._group_source_indices:
             image = self.image_list_model.data(index, Qt.ItemDataRole.UserRole)
             if image is not None:
                 images.append(image)
+        return images
+
+    def _displayed_images(self) -> list[Image]:
+        """The images whose tags the pane is showing."""
+        if self._group_mode:
+            return self._group_images()
+        if self.image_index is None or not self.image_index.isValid():
+            return []
+        image = self.image_list_model.data(self.image_index,
+                                           Qt.ItemDataRole.UserRole)
+        return [image] if image is not None else []
+
+    @Slot()
+    def _sync_unviewed_markers(self):
+        marks = self.image_list_model.get_unviewed_tags(
+            self._displayed_images())
+        if self._group_mode:
+            self.group_tags_panel.set_recently_captioned(marks)
+        else:
+            self.image_tags_list.set_recently_captioned(marks)
+
+    @Slot(list)
+    def _on_unviewed_tags_viewed(self, tags: list[str]):
+        if self._keep_unviewed_markers:
+            return
+        self.image_list_model.clear_unviewed_tags(self._displayed_images(),
+                                                  tags)
+
+    def mark_displayed_tags_unviewed(self):
+        """Put an unviewed marker on every tag of the displayed image(s)."""
+        self.image_list_model.mark_tags_unviewed(self._displayed_images())
+
+    def clear_displayed_unviewed_tags(self):
+        """Remove every unviewed marker from the displayed image(s)."""
+        self.image_list_model.clear_unviewed_tags(self._displayed_images())
+
+    def _refresh_group_panel(self, restore_positions: bool = False,
+                             renames: dict[str, list[str]] | None = None,
+                             saved_order=None):
+        images = self._group_images()
         self.group_tags_panel.set_images(images,
                                          restore_positions=restore_positions,
                                          renames=renames,
                                          saved_order=saved_order)
+        self.group_tags_panel.set_recently_captioned(
+            self.image_list_model.get_unviewed_tags(images))
 
     def _refresh_group_panel_after_change(self):
         """Refresh the grid view's tag list after the image tags changed,
@@ -1870,6 +1895,19 @@ class ImageTagsEditor(QDockWidget):
         Reload the tags for the current image if its index is in the range of
         changed indices.
         """
+        # The reload may move the tag cursor by itself (e.g. onto a renamed or
+        # re-added tag). Only the user selecting a tag counts as viewing it, so
+        # keep the unviewed markers through the reload.
+        self._keep_unviewed_markers = True
+        try:
+            self._reload_image_tags_if_changed(first_changed_index,
+                                               last_changed_index)
+        finally:
+            self._keep_unviewed_markers = False
+        self._sync_unviewed_markers()
+
+    def _reload_image_tags_if_changed(self, first_changed_index: QModelIndex,
+                                      last_changed_index: QModelIndex):
         if self._group_mode:
             # A group edit (or undo/redo) changed tags: recompute the
             # Common/Differences view from the current selection. An undo/redo

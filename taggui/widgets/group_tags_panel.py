@@ -207,9 +207,10 @@ class _TagBadgeDelegate(_UniformHeightDelegate):
                          badge)
 
         tag = index.data(Qt.ItemDataRole.DisplayRole)
-        # Draw a subtle "review" marker for tags the most recent Auto-Captioner
-        # run added or increased the count of, so the user can see at a glance
-        # which existing tags were touched. The dot sits just left of the k/N
+        # Draw a subtle "review" marker for unviewed tags (added by the
+        # Auto-Captioner, or marked by the user, and not selected since), so
+        # the user can see at a glance which tags to check. The dot sits just
+        # left of the k/N
         # badge; when present it reserves a little extra width so it never
         # overlaps the (right-elided) tag text or the badge.
         panel = self.parent()
@@ -448,6 +449,8 @@ class GroupTagsPanel(QWidget):
     # Look up a tag in the Danbooru / Gelbooru wiki (right-click a tag).
     danbooru_wiki_requested = Signal(str)
     gelbooru_wiki_requested = Signal(str)
+    # Tags whose unviewed marker was just dropped because they were selected.
+    unviewed_tags_viewed = Signal(list)
     # Rename a tag (old, new) on the selected images that contain it.
     rename_tag_requested = Signal(str, str)
     # The tag-list filter changed via the clickable summary. Carries the new
@@ -494,13 +497,11 @@ class GroupTagsPanel(QWidget):
         # that (re)appeared on a normal edit (-> fresh slot at the end) from one
         # that was merely restored by undo/redo (-> keep its permanent slot).
         self._present_prev: set[str] = set()
-        # Tags touched by the most recent auto-caption run (newly added or whose
-        # image count increased). Shown with a subtle marker so they are easy to
-        # review; cleared when the selection changes or a marked tag is clicked.
+        # Tags with an unviewed marker on any selected image (set by
+        # ImageTagsEditor from the image list model). Shown with a subtle dot
+        # so they are easy to review; a marker is dropped once its tag is
+        # selected.
         self._recently_captioned: set[str] = set()
-        # Per-tag image counts snapshotted when an auto-caption run starts, so
-        # the touched set can be computed when it finishes. None outside a run.
-        self._auto_caption_counts: dict[str, int] | None = None
         # Tags to select after the next refresh (undo/redo re-adds): mirrors the
         # single-image list, which selects a re-added tag. One-shot.
         self._pending_select_tags: list[str] = []
@@ -568,10 +569,7 @@ class GroupTagsPanel(QWidget):
                 self.reset_order_memory()
             if order_key:
                 self._order_key = order_key
-            # Drop leftover auto-caption markers, which belonged to the old
-            # selection.
             self._present_prev = set()
-            self._recently_captioned = set()
         # When an external edit (auto-captioning, undo/redo) changes the tags of
         # the same selection without the panel setting an explicit row anchor,
         # remember the selected tags by name so they stay selected across the
@@ -690,9 +688,6 @@ class GroupTagsPanel(QWidget):
             for position, tag in enumerate(new_tags):
                 self._slot_of[tag] = base + position * step
                 placed.add(tag)
-            if old_tag in self._recently_captioned:
-                self._recently_captioned.discard(old_tag)
-                self._recently_captioned.update(new_tags)
         return placed
 
     def _refresh_view(self, prev_tags: list[str]):
@@ -829,28 +824,14 @@ class GroupTagsPanel(QWidget):
             if newly_cleared:
                 self._recently_captioned -= newly_cleared
                 self.tag_list.viewport().update()
+                self.unviewed_tags_viewed.emit(sorted(newly_cleared))
         self.partial_focus_changed.emit(self._selected_difference_tags())
 
-    def begin_auto_caption_run(self):
-        """Snapshot the current per-tag image counts so the next
-        end_auto_caption_run() can flag which tags the run added or grew.
-
-        Called when the Auto-Captioner starts while the grouped view is active.
-        """
-        self._auto_caption_counts = {tag: count
-                                     for tag, count in self._rows_full}
-
-    def end_auto_caption_run(self):
-        """Mark every tag the just-finished auto-caption run added or increased
-        the image count of, so the user can review them at a glance."""
-        if self._auto_caption_counts is None:
-            return
-        before = self._auto_caption_counts
-        self._auto_caption_counts = None
-        touched = {tag for tag, count in self._rows_full
-                   if count > before.get(tag, 0)}
-        if touched != self._recently_captioned:
-            self._recently_captioned = touched
+    def set_recently_captioned(self, tags):
+        """Show unviewed markers on the given tags and repaint."""
+        new_marks = set(tags)
+        if new_marks != self._recently_captioned:
+            self._recently_captioned = new_marks
             self.tag_list.viewport().update()
 
     @Slot(str)

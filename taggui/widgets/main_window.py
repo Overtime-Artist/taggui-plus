@@ -2593,12 +2593,8 @@ class MainWindow(QMainWindow):
             self._close_if_waiting_for_captioning)
         self.auto_captioner.captioning_started.connect(
             self.clear_pending_auto_caption_category_tags)
-        self.auto_captioner.captioning_started.connect(
-            self.image_tags_editor.begin_auto_caption_run)
         self.auto_captioner.captioning_finished.connect(
             self.schedule_pending_auto_caption_category_prompt)
-        self.auto_captioner.captioning_finished.connect(
-            self.image_tags_editor.end_auto_caption_run)
         self.auto_captioner.caption_generated.connect(
             self.handle_auto_caption_generated)
         self.auto_captioner.caption_generated.connect(
@@ -2621,8 +2617,15 @@ class MainWindow(QMainWindow):
     def handle_auto_caption_generated(self, image_index: QModelIndex,
                                       _caption: str, tags: list[str],
                                       natural_language_prompt: str):
+        image = self.image_list_model.data(image_index,
+                                           Qt.ItemDataRole.UserRole)
+        tags_before = set(image.tags) if image is not None else set()
         self.image_list_model.update_image_caption(image_index, tags,
                                                    natural_language_prompt)
+        # Flag the tags this caption added with an orange "unviewed" dot.
+        if image is not None:
+            self.image_list_model.mark_tags_unviewed(
+                [image], set(image.tags) - tags_before)
 
     @Slot()
     def clear_pending_auto_caption_category_tags(self):

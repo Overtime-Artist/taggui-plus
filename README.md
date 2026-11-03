@@ -756,10 +756,12 @@ you choose to caption **all selected images** or **only the current image**
 variant), and whether to **show an alert when it finishes**. Captioning a single
 image runs immediately without this prompt.
 
-After a run, any tags it **added or increased the count of** are flagged with a
-small **amber dot** in the tag list (in both the single-image and grouped views),
-so you can review what changed at a glance. Selecting a flagged tag clears its
-dot.
+Tags the captioner **adds** to an image are flagged with a small **amber dot** in
+the tag list, so you can review what changed at a glance. Each image remembers
+its dots, even after you switch to other images, until you select the tag (or
+close the app). In the grid view a tag shows a dot if any selected image has
+it flagged, and selecting it there clears the dot for all of them. Renaming a
+flagged tag keeps the dot; deleting it removes the dot.
 
 You can keep working while captioning runs, but **Undo/Redo are unavailable**
 until it finishes, and loading another folder asks you to cancel or wait first.

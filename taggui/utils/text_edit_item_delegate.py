@@ -64,8 +64,8 @@ class TextEditItemDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         # Add some left padding.
         option.rect.adjust(4, 0, 0, 0)
-        # Draw a subtle amber "review" marker for tags the most recent
-        # Auto-Captioner run added, matching the grouped (grid) view. Only the
+        # Draw a subtle amber "review" marker for unviewed tags, matching the
+        # grouped (grid) view. Only the
         # Image Tags list carries a ``_recently_captioned`` set, so other views
         # sharing this delegate (e.g. All Tags) never get a dot. When present,
         # the dot reserves a little width on the right so it never overlaps the

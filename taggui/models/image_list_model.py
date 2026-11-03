@@ -689,6 +689,8 @@ class ImageListModel(QAbstractListModel):
     directory_loaded = Signal()
     # A folder scan failed; carries the folder path and the reason.
     directory_load_failed = Signal(object, str)
+    # The "unviewed" (orange dot) tag markers changed.
+    unviewed_tags_changed = Signal()
 
     def __init__(self, image_list_image_width: int, tag_separator: str):
         super().__init__()
@@ -721,6 +723,12 @@ class ImageListModel(QAbstractListModel):
         # renamed tag to the tag(s) that replaced it, so the grid view can keep
         # the new name in the old tag's position.
         self.tag_renames: dict[str, list[str]] | None = None
+        # Image path -> tags shown with an orange "unviewed" dot (added by the
+        # Auto-Captioner or marked by the user) until the tag is selected.
+        # Kept in memory only, for as long as the app is open. Connected first
+        # so markers of removed tags are dropped before any view refreshes.
+        self.unviewed_tags: dict[Path, set[str]] = {}
+        self.dataChanged.connect(self._sync_unviewed_tags)
         self.image_list_selection_model = None
         self.thumbnail_loaders = set()
         # Image path -> row it was in when its thumbnail load was started.
@@ -1533,6 +1541,74 @@ class ImageListModel(QAbstractListModel):
         ordered = sorted(tag_counts.items(),
                          key=lambda item: (-item[1], item[0]))
         return match_count, ordered
+
+    def get_unviewed_tags(self, images) -> set[str]:
+        """Tags of `images` that have an unviewed marker on any of them."""
+        marks = set()
+        for image in images:
+            image_marks = self.unviewed_tags.get(image.path)
+            if image_marks:
+                marks |= image_marks.intersection(image.tags)
+        return marks
+
+    def mark_tags_unviewed(self, images, tags=None):
+        """Mark `tags` (default: every tag) of each of `images` unviewed."""
+        changed = False
+        for image in images:
+            new_marks = set(image.tags)
+            if tags is not None:
+                new_marks &= set(tags)
+            if not new_marks:
+                continue
+            marks = self.unviewed_tags.setdefault(image.path, set())
+            if not new_marks <= marks:
+                marks |= new_marks
+                changed = True
+        if changed:
+            self.unviewed_tags_changed.emit()
+
+    def clear_unviewed_tags(self, images, tags=None):
+        """Remove the unviewed markers of `tags` (default: all) from each of
+        `images`."""
+        changed = False
+        for image in images:
+            marks = self.unviewed_tags.get(image.path)
+            if not marks:
+                continue
+            if tags is None:
+                marks.clear()
+                changed = True
+            elif not marks.isdisjoint(tags):
+                marks.difference_update(tags)
+                changed = True
+            if not marks:
+                del self.unviewed_tags[image.path]
+        if changed:
+            self.unviewed_tags_changed.emit()
+
+    def _sync_unviewed_tags(self, top_left: QModelIndex,
+                            bottom_right: QModelIndex, *args):
+        """Drop the markers of tags that were removed from the changed images,
+        so re-adding such a tag later doesn't bring its dot back. A renamed
+        tag passes its marker on to its replacement(s)."""
+        if not self.unviewed_tags or not top_left.isValid():
+            return
+        last = (bottom_right.row() if bottom_right.isValid()
+                else top_left.row())
+        for row in range(max(top_left.row(), 0),
+                         min(last, len(self.images) - 1) + 1):
+            image = self.images[row]
+            marks = self.unviewed_tags.get(image.path)
+            if not marks:
+                continue
+            present = set(image.tags)
+            if self.tag_renames:
+                for old_tag, new_tags in self.tag_renames.items():
+                    if old_tag in marks and old_tag not in present:
+                        marks.update(present.intersection(new_tags))
+            marks &= present
+            if not marks:
+                del self.unviewed_tags[image.path]
 
     def _emit_renamed(self, first_index: QModelIndex, last_index: QModelIndex,
                       renames: dict[str, list[str]]):
