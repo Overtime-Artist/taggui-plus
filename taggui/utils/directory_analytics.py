@@ -146,6 +146,13 @@ def _summarize(values: list[float]) -> NumberSummary:
     )
 
 
+def _caption_key(path: Path) -> str:
+    """Same matching rule the app uses to pair an image with its caption
+    file (`models.image_list_model.get_caption_key`): the `.txt` path,
+    ignoring upper/lower case on Windows."""
+    return os.path.normcase(str(path.with_suffix('.txt')))
+
+
 def _percent(part: int, whole: int) -> float:
     return (100.0 * part / whole) if whole else 0.0
 
@@ -216,7 +223,8 @@ def compute_analytics(images, root_directory, image_suffixes,
     # --- One filesystem walk: file sizes + caption / non-image discovery. -----
     # ``sizes`` maps str(path) -> on-disk byte size for every file in the tree.
     sizes: dict[str, int] = {}
-    caption_stems: set[str] = set()   # str(path without suffix) for .txt files
+    # Caption match key -> actual .txt path, for every caption file found.
+    caption_files: dict[str, str] = {}
     non_image_files: list[str] = []
     if root.exists():
         for dirpath, _dirnames, filenames in os.walk(root):
@@ -230,7 +238,7 @@ def compute_analytics(images, root_directory, image_suffixes,
                     sizes[str(file_path)] = 0
                 suffix = file_path.suffix.lower()
                 if suffix == '.txt':
-                    caption_stems.add(str(file_path.with_suffix('')))
+                    caption_files[_caption_key(file_path)] = str(file_path)
                 elif suffix not in suffix_set:
                     non_image_files.append(str(file_path))
 
@@ -248,7 +256,7 @@ def compute_analytics(images, root_directory, image_suffixes,
     tag_counter: dict[str, int] = {}
     tags_per_image: list[float] = []
     prompt_lengths: list[float] = []
-    image_stems: set[str] = set()
+    image_caption_keys: set[str] = set()
 
     # Per-subfolder accumulators keyed by relative folder name.
     sub_images: dict[str, int] = {}
@@ -261,7 +269,7 @@ def compute_analytics(images, root_directory, image_suffixes,
         if should_cancel is not None and should_cancel():
             return None
         path = Path(image.path)
-        image_stems.add(str(path.with_suffix('')))
+        image_caption_keys.add(_caption_key(path))
 
         # File format.
         suffix = path.suffix.lower() or '(none)'
@@ -374,10 +382,10 @@ def compute_analytics(images, root_directory, image_suffixes,
     report.completion_percent = _percent(report.complete_count, total)
 
     # --- Finalise housekeeping ------------------------------------------------
-    orphan_stems = sorted(caption_stems - image_stems)
-    report.orphan_caption_count = len(orphan_stems)
-    report.orphan_caption_examples = [stem + '.txt'
-                                      for stem in orphan_stems[:20]]
+    orphans = sorted(caption_path for key, caption_path in caption_files.items()
+                     if key not in image_caption_keys)
+    report.orphan_caption_count = len(orphans)
+    report.orphan_caption_examples = orphans[:20]
     report.missing_caption_count = report.images_without_caption
     non_image_files.sort()
     report.non_image_file_count = len(non_image_files)
@@ -429,6 +437,29 @@ def _summary_row(label: str, summary: NumberSummary, unit: str = '',
 
 # --- Exporters ----------------------------------------------------------------
 
+_MARKDOWN_SPECIAL = set('\\`*_[]<>|#')
+
+
+def _md_text(text) -> str:
+    """Escape user text (tags, folder names) for a Markdown table cell, so a
+    `|` cannot split the cell and characters like `*` or `_` show as-is."""
+    return ''.join('\\' + char if char in _MARKDOWN_SPECIAL else char
+                   for char in str(text))
+
+
+def _md_code(text) -> str:
+    """Wrap a path in a Markdown code span, using a longer backtick fence if
+    the path itself contains backticks."""
+    text = str(text)
+    longest = run = 0
+    for char in text:
+        run = run + 1 if char == '`' else 0
+        longest = max(longest, run)
+    fence = '`' * (longest + 1)
+    padding = ' ' if text.startswith('`') or text.endswith('`') else ''
+    return f'{fence}{padding}{text}{padding}{fence}'
+
+
 def report_to_markdown(report: AnalyticsReport) -> str:
     """Render the report as a Markdown document."""
     lines: list[str] = []
@@ -436,7 +467,7 @@ def report_to_markdown(report: AnalyticsReport) -> str:
 
     add(f'# Directory Analytics')
     add('')
-    add(f'**Folder:** `{report.root_directory}`')
+    add(f'**Folder:** {_md_code(report.root_directory)}')
     add('')
 
     # Overview
@@ -450,7 +481,7 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add('| Format | Count | % |')
     add('| --- | ---: | ---: |')
     for item in report.format_breakdown:
-        add(f'| {item.suffix} | {item.count} | {item.percent:.1f}% |')
+        add(f'| {_md_text(item.suffix)} | {item.count} | {item.percent:.1f}% |')
     add('')
 
     # Resolution
@@ -505,6 +536,7 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add('')
     add(f'- Images with a natural-language prompt: '
         f'**{report.images_with_prompt}**')
+    add('')
     add('| Prompt length (chars) | Min | Median | Max | Average |')
     add('| --- | ---: | ---: | ---: | ---: |')
     add('| ' + ' | '.join(_summary_row('Length',
@@ -518,7 +550,7 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add('| Most common tag | Count | % of instances |')
     add('| --- | ---: | ---: |')
     for item in report.most_common_tags:
-        add(f'| {item.suffix} | {item.count} | {item.percent:.1f}% |')
+        add(f'| {_md_text(item.suffix)} | {item.count} | {item.percent:.1f}% |')
     add('')
 
     # Housekeeping
@@ -527,13 +559,13 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add(f'- Orphaned caption files (no matching image): '
         f'**{report.orphan_caption_count}**')
     for example in report.orphan_caption_examples:
-        add(f'  - `{example}`')
+        add(f'  - {_md_code(example)}')
     add(f'- Images with no caption file: **{report.missing_caption_count}**')
     for example in report.missing_caption_examples:
-        add(f'  - `{example}`')
+        add(f'  - {_md_code(example)}')
     add(f'- Other (non-image) files: **{report.non_image_file_count}**')
     for example in report.non_image_file_examples:
-        add(f'  - `{example}`')
+        add(f'  - {_md_code(example)}')
     add('')
 
     # Per-subfolder
@@ -542,7 +574,7 @@ def report_to_markdown(report: AnalyticsReport) -> str:
     add('| Folder | Images | Size | Avg MP | Caption % | Complete % |')
     add('| --- | ---: | ---: | ---: | ---: | ---: |')
     for sub in report.subfolders:
-        add(f'| {sub.name} | {sub.image_count} | '
+        add(f'| {_md_text(sub.name)} | {sub.image_count} | '
             f'{format_size(sub.total_size_bytes)} | '
             f'{sub.average_megapixels:.2f} | '
             f'{sub.caption_coverage_percent:.1f}% | '

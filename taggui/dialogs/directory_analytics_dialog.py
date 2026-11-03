@@ -13,7 +13,8 @@ the "Find Duplicates" tool, so large folders stay responsive.
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal, Slot
+from PySide6.QtCore import (QObject, QRunnable, Qt, QThreadPool, QTimer,
+                            Signal, Slot)
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout,
                                QLabel, QMessageBox, QProgressDialog,
                                QPushButton, QTabWidget, QTextBrowser,
@@ -142,8 +143,9 @@ class DirectoryAnalyticsDialog(QDialog):
         layout.addLayout(button_row)
 
         self._set_placeholder('Scanning\u2026')
-        # Run the first scan automatically once the dialog is shown.
-        self.start_scan()
+        # Run the first scan once the dialog is on screen, so the progress
+        # window appears over it rather than on its own beforehand.
+        QTimer.singleShot(0, self.start_scan)
 
     # ------------------------------------------------------------------
     # Scanning
@@ -346,13 +348,18 @@ class DirectoryAnalyticsDialog(QDialog):
         # sits directly beneath its parent, indent by depth, and show only the
         # leaf folder name (the indentation conveys the parent). The underlying
         # data and the CSV/Markdown exports keep the full relative path.
-        ordered = sorted(
-            report.subfolders,
-            key=lambda sub: () if sub.name == '.' else Path(sub.name).parts)
+        # Folders with no images of their own still get a (dimmed) row when a
+        # deeper folder has images, so every child sits under its real parent.
+        by_parts: dict[tuple, object] = {}
+        for sub in report.subfolders:
+            by_parts[() if sub.name == '.' else Path(sub.name).parts] = sub
+        for parts_key in list(by_parts):
+            for length in range(1, len(parts_key)):
+                by_parts.setdefault(parts_key[:length], None)
         body = []
-        for sub in ordered:
-            name_parts = Path(sub.name).parts
-            if sub.name == '.' or not name_parts:
+        for name_parts in sorted(by_parts):
+            sub = by_parts[name_parts]
+            if not name_parts:
                 depth = 0
                 root_name = (Path(report.root_directory).name
                              or report.root_directory or '.')
@@ -363,16 +370,20 @@ class DirectoryAnalyticsDialog(QDialog):
             indent = '&nbsp;' * (4 * depth)
             connector = ('<span style="color:gray;">\u2514</span>&nbsp;'
                          if depth > 0 else '')
+            dim = '' if sub is not None else ' color:gray;'
             folder_cell = (f'<td style="text-align:left; padding:2px 10px; '
-                           f'white-space:nowrap;">'
+                           f'white-space:nowrap;{dim}">'
                            f'{indent}{connector}{escape(leaf)}</td>')
-            values = [sub.image_count, format_size(sub.total_size_bytes),
-                      f'{sub.average_megapixels:.2f}',
-                      f'{sub.caption_coverage_percent:.1f}%',
-                      f'{sub.completion_percent:.1f}%']
+            if sub is None:
+                values = [0, '', '', '', '']
+            else:
+                values = [sub.image_count, format_size(sub.total_size_bytes),
+                          f'{sub.average_megapixels:.2f}',
+                          f'{sub.caption_coverage_percent:.1f}%',
+                          f'{sub.completion_percent:.1f}%']
             value_cells = ''.join(
                 f'<td style="text-align:right; padding:2px 10px; '
-                f'white-space:nowrap;">{escape(str(value))}</td>'
+                f'white-space:nowrap;{dim}">{escape(str(value))}</td>'
                 for value in values)
             body.append(f'<tr>{folder_cell}{value_cells}</tr>')
         parts.append(
@@ -402,12 +413,15 @@ class DirectoryAnalyticsDialog(QDialog):
         return f'{base}.{extension}'
 
     def _export_csv(self):
-        self._export(report_to_csv, 'CSV files (*.csv)', 'csv')
+        # utf-8-sig so Excel reads accented / non-Latin text correctly.
+        self._export(report_to_csv, 'CSV files (*.csv)', 'csv',
+                     encoding='utf-8-sig')
 
     def _export_markdown(self):
         self._export(report_to_markdown, 'Markdown files (*.md)', 'md')
 
-    def _export(self, serializer, file_filter: str, extension: str):
+    def _export(self, serializer, file_filter: str, extension: str,
+                encoding: str = 'utf-8'):
         if self._report is None:
             return
         start_dir = (str(self.directory_path)
@@ -419,8 +433,10 @@ class DirectoryAnalyticsDialog(QDialog):
         if not file_path:
             return
         try:
-            Path(file_path).write_text(serializer(self._report),
-                                       encoding='utf-8')
+            # newline='' writes the text's own line endings unchanged (the CSV
+            # writer already uses \r\n; translating again added blank rows).
+            with open(file_path, 'w', encoding=encoding, newline='') as file:
+                file.write(serializer(self._report))
         except OSError as error:
             QMessageBox.warning(self, 'Export failed',
                                 f'Could not write the file:\n{error}')
