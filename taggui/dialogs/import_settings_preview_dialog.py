@@ -2,7 +2,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QLabel, QVBoxLayout, QCheckBox,
                                QPushButton, QHBoxLayout, QGroupBox)
 
-from utils.settings_export_import import EXPORT_CATEGORIES, get_category_summary
+from utils.settings_export_import import (EXPORT_CATEGORIES,
+                                          _sanitize_tag_library,
+                                          get_category_summary)
 
 
 class ImportSettingsPreviewDialog(QDialog):
@@ -29,10 +31,17 @@ class ImportSettingsPreviewDialog(QDialog):
             
             summary = get_category_summary(import_data, category_key)
             summary_label = QLabel(summary)
+            summary_label.setWordWrap(True)
             summary_label.setStyleSheet('color: #666; font-size: 11px;')
             
             checkbox = QCheckBox('Import')
             checkbox.setChecked(True)
+            if ((category_key == 'tag_library'
+                    and _sanitize_tag_library(data[category_key]) is None)
+                    or not isinstance(data[category_key], dict)):
+                # Nothing usable to import; never empty the library.
+                checkbox.setChecked(False)
+                checkbox.setEnabled(False)
             self.category_checkboxes[category_key] = checkbox
             
             group_layout.addWidget(checkbox)

@@ -3,7 +3,6 @@ import os
 import sys
 import traceback
 import warnings
-from datetime import datetime
 from pathlib import Path
 
 import transformers
@@ -106,20 +105,8 @@ def install_qt_message_filter():
 def _backup_settings_before_reset() -> Path | None:
     """Save every setting (including the Tag Library) to a JSON file that can
     be restored with File > Import Settings. Returns None if it failed."""
-    from utils.scan_cache import _get_cache_dir
-    from utils.settings_export_import import save_settings_to_file
-    file_name = f'settings-backup-{datetime.now():%Y-%m-%d_%H-%M-%S}.json'
-    for folder in (_get_cache_dir(), Path.home()):
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            backup_path = folder / file_name
-            if save_settings_to_file(str(backup_path),
-                                     include_tag_library=True,
-                                     include_auto_captioner=True):
-                return backup_path
-        except Exception:
-            continue
-    return None
+    from utils.settings_export_import import backup_all_settings
+    return backup_all_settings()
 
 
 def show_startup_error(exception: Exception):

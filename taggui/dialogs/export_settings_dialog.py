@@ -29,9 +29,6 @@ class ExportSettingsDialog(QDialog):
         self.include_completed_images_checkbox = QCheckBox(
             'Include Completed Image Marks')
         self.include_completed_images_checkbox.setChecked(False)
-        self.include_completed_images_checkbox.setToolTip(
-            'Export which images you have marked complete. These marks are '
-            'specific to your own image dataset.')
         layout.addWidget(self.include_completed_images_checkbox)
         
         layout.addStretch()

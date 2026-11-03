@@ -434,23 +434,8 @@ class MainWindow(QMainWindow):
         get_completion_store().save_if_dirty()
         # Don't overwrite geometry/state if we're closing after importing settings
         if not self.should_skip_save_state_on_close:
-            self.settings.setValue('geometry', self.saveGeometry())
-            current_state = self.saveState()
-            self.settings.setValue('window_state', current_state)
-            # Keep the current mode's cached per-mode layout in sync with what
-            # is on screen (the user may have resized panels without switching
-            # modes since the last swap), then persist both layouts so the
-            # maximized vs. normal panel sizes survive a restart.
-            if self.isMaximized() or self.isFullScreen():
-                self._expanded_dock_state = current_state
-            else:
-                self._normal_dock_state = current_state
-            if self._expanded_dock_state:
-                self.settings.setValue('expanded_dock_state',
-                                       self._expanded_dock_state)
-            if self._normal_dock_state:
-                self.settings.setValue('normal_dock_state',
-                                       self._normal_dock_state)
+            if not getattr(self, '_keep_imported_ui_layout', False):
+                self._save_window_layout()
             # Persist the active image filter so the same filtered view (and
             # position within it) is restored on the next launch.
             self.settings.setValue(
@@ -458,6 +443,25 @@ class MainWindow(QMainWindow):
                 self.image_list.filter_line_edit.text())
             self.settings.sync()
         super().closeEvent(event)
+
+    def _save_window_layout(self):
+        self.settings.setValue('geometry', self.saveGeometry())
+        current_state = self.saveState()
+        self.settings.setValue('window_state', current_state)
+        # Keep the current mode's cached per-mode layout in sync with what
+        # is on screen (the user may have resized panels without switching
+        # modes since the last swap), then persist both layouts so the
+        # maximized vs. normal panel sizes survive a restart.
+        if self.isMaximized() or self.isFullScreen():
+            self._expanded_dock_state = current_state
+        else:
+            self._normal_dock_state = current_state
+        if self._expanded_dock_state:
+            self.settings.setValue('expanded_dock_state',
+                                   self._expanded_dock_state)
+        if self._normal_dock_state:
+            self.settings.setValue('normal_dock_state',
+                                   self._normal_dock_state)
 
     @Slot()
     def _show_window(self):
@@ -1132,7 +1136,13 @@ class MainWindow(QMainWindow):
         if not selected_categories:
             return
         
-        if import_settings(import_data, selected_categories):
+        if import_settings(import_data, selected_categories,
+                           tag_library_model=self.tag_library_model):
+            if 'ui_layout' in selected_categories:
+                # Keep the imported window layout even if the user declines
+                # the restart: closing would otherwise save the current one
+                # over it.
+                self._keep_imported_ui_layout = True
             # Completion marks apply without a restart: re-home imported marks
             # onto matching images (by hash) and refresh the completion icons
             # by re-scanning the current directory.
@@ -1152,7 +1162,8 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(
                 self, 'Import Failed',
-                'Failed to import settings. Please check file permissions.')
+                'The settings in this file could not be imported. Nothing '
+                'was changed.')
 
     def _restart_application(self):
         """Restart the application.

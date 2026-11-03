@@ -184,7 +184,7 @@ next to your images and are never touched by uninstalling.
 
 > [!TIP]
 > **Planning to reinstall later?** Export your settings first
-> (**`File` → `Export / Import Settings…`**) and keep the exported file
+> (**`File` → `Export Settings…`**) and keep the exported file
 > somewhere safe. Removing app data clears your saved preferences, Tag Library,
 > and other settings, so exporting first lets you import everything back after
 > you reinstall instead of setting it all up again from scratch.
@@ -197,6 +197,13 @@ downloaded models are optional and off by default. TagGUI Plus deletes the selec
 items and then **closes immediately** so nothing gets written back. Afterwards,
 delete the app folder yourself (the app can't delete its own folder while it's
 running).
+
+For safety, the tool will not delete a models or Hugging Face folder that is (or
+contains) your user folder, a system folder, the app folder, or your current
+image folder. Such a folder is shown greyed out with the reason; if you really
+want it gone, delete only the model files inside it by hand. Settings backups
+made by **Reset to Defaults** live in the cache folder, so removing the caches
+also removes those backups.
 
 You can also clear just the thumbnail cache from
 **`Settings` → `Clear Thumbnail Cache`**.
@@ -211,7 +218,9 @@ You can also clear just the thumbnail cache from
 | App settings (preferences, autocomplete/local tags, categories, hidden models, etc.) | Registry key `HKEY_CURRENT_USER\Software\taggui\taggui` | `~/Library/Preferences/com.taggui.taggui.plist` | `~/.config/taggui/taggui.conf` |
 | Thumbnail cache | `%LOCALAPPDATA%\taggui\thumbnails` | `~/Library/Caches/taggui/thumbnails` | `~/.cache/taggui/thumbnails` |
 | Scan caches (`dimension_cache.json`, `caption_cache.json`, `completion_cache.json`) | `%LOCALAPPDATA%\taggui` | `~/Library/Caches/taggui` | `~/.cache/taggui` |
-| Downloaded captioning models (often several GB) | Your configured models directory, or the Hugging Face cache `%USERPROFILE%\.cache\huggingface` (or wherever `HF_HOME` points) | Your models directory, or `~/.cache/huggingface` | Your models directory, or `~/.cache/huggingface` |
+| Settings backups made by Reset to Defaults (`settings-backup-*.json`) | `%LOCALAPPDATA%\taggui` | `~/Library/Caches/taggui` | `~/.cache/taggui` |
+| Danbooru wiki browser profile (Cloudflare/login cookies and a small cache) | `%APPDATA%\taggui\taggui\QtWebEngine\taggui-danbooru` and `%LOCALAPPDATA%\taggui\taggui\cache\QtWebEngine\taggui-danbooru` | A `QtWebEngine/taggui-danbooru` folder under `~/Library/Application Support/taggui` and under `~/Library/Caches/taggui` | A `QtWebEngine/taggui-danbooru` folder under `~/.local/share/taggui` and under `~/.cache/taggui` |
+| Downloaded captioning models (often several GB) | Your configured models directory, or the Hugging Face cache `%USERPROFILE%\.cache\huggingface` (or wherever `HF_HUB_CACHE` / `HF_HOME` points) | Your models directory, or `~/.cache/huggingface` | Your models directory, or `~/.cache/huggingface` |
 
 </details>
 
@@ -223,6 +232,9 @@ You can also clear just the thumbnail cache from
 ```powershell
 # Thumbnail cache and scan caches
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\taggui"
+
+# Danbooru wiki browser profile (saved cookies)
+Remove-Item -Recurse -Force "$env:APPDATA\taggui"
 
 # Saved settings (stored in the Windows Registry, not a file)
 Remove-Item -Recurse -Force "HKCU:\Software\taggui"
@@ -240,6 +252,10 @@ Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface"
 # Caches (thumbnails + scan caches)
 rm -rf ~/.cache/taggui          # Linux
 rm -rf ~/Library/Caches/taggui  # macOS
+
+# Danbooru wiki browser profile (saved cookies)
+rm -rf ~/.local/share/taggui                       # Linux
+rm -rf ~/Library/Application\ Support/taggui       # macOS
 
 # Saved settings
 rm -f ~/.config/taggui/taggui.conf                     # Linux
@@ -678,9 +694,24 @@ prefixes:
 
 </details>
 
-You can also **export** and **import** your settings (**`File` → `Export /
-Import Settings…`**), choosing which parts (Tag Library, auto-captioner
-settings, completion marks) to include.
+**Reset to Defaults** first saves a backup of all your settings (the message
+tells you where) and then resets everything **except your Tag Library**, which
+is kept. To undo a reset, import the backup with **`File` → `Import
+Settings…`**.
+
+You can also **export** and **import** your settings (**`File` → `Export
+Settings…`** and **`File` → `Import Settings…`**), choosing which parts
+(general preferences, keyboard shortcuts, auto-captioner settings, window
+layout, Tag Library, completed image marks) to include. Before anything
+changes, a preview shows what the file contains. Notes:
+
+- Importing the **Tag Library** *replaces* your current one (use the Tag
+  Library dialog's own Import if you want to merge instead). A file with no
+  tags never empties your library — that part is skipped.
+- **Completed image marks** belong to a particular set of images; they only
+  apply to images that match the exported ones.
+- Invalid or out-of-range values in the file are skipped. If the file can't be
+  read properly, nothing is changed.
 
 ## Automatic captioning
 

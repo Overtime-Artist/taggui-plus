@@ -11,6 +11,8 @@ from models.tag_library_model import TagLibraryModel
 from auto_captioning.models_list import MODELS
 from dialogs.remove_app_data_dialog import RemoveAppDataDialog
 from utils.enums import ThemeMode
+from utils.settings_export_import import (EXPORT_CATEGORIES,
+                                          backup_all_settings)
 from utils.settings import (DEFAULT_SETTINGS, REORDER_OPTIONS, get_settings,
                             get_hidden_model_ids, save_hidden_model_ids)
 from utils.settings_widgets import (SettingsBigCheckBox, SettingsComboBox,
@@ -901,32 +903,52 @@ class SettingsDialog(QDialog):
 
     @Slot()
     def reset_to_defaults(self):
-        """Reset all settings to their default values."""
+        """Reset all settings to their default values, keeping the Tag
+        Library. A backup of everything is saved first."""
         reply = QMessageBox.question(
             self,
             'Reset to Defaults',
-            'Are you sure you want to reset all settings to their default values? '
-            'This action cannot be undone.',
+            'Reset all settings (including keyboard shortcuts and the window '
+            'layout) to their default values?\n\n'
+            'Your Tag Library is kept. A backup of your current settings is '
+            'saved first and can be restored with File > Import Settings.',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         
         if reply != QMessageBox.StandardButton.Yes:
             return
-        
-        # Clear all settings and restore defaults
+
+        backup_path = backup_all_settings()
+        if backup_path is None:
+            QMessageBox.critical(
+                self, 'Settings Not Reset',
+                'A backup of your settings could not be saved, so they were '
+                'not reset.')
+            return
+
+        tag_library_keys = EXPORT_CATEGORIES['tag_library']['keys']
+        kept_values = {key: self.settings.value(key)
+                       for key in tag_library_keys
+                       if self.settings.contains(key)}
         self.settings.clear()
-        
-        # Re-apply all default values
         for key, value in DEFAULT_SETTINGS.items():
+            if key not in tag_library_keys:
+                self.settings.setValue(key, value)
+        for key, value in kept_values.items():
             self.settings.setValue(key, value)
-        
         self.settings.sync()
-        
-        # Show confirmation message
+
+        # Closing would otherwise save the current window layout again.
+        main_window = self.parent()
+        if hasattr(main_window, 'should_skip_save_state_on_close'):
+            main_window.should_skip_save_state_on_close = True
+
         QMessageBox.information(
             self,
             'Reset Complete',
-            'All settings have been reset to their default values. '
+            'All settings have been reset to their default values. Your Tag '
+            'Library was kept.\n\n'
+            f'A backup was saved to:\n{backup_path}\n\n'
             'Please restart the application for all changes to take effect.',
             QMessageBox.StandardButton.Ok)
         
