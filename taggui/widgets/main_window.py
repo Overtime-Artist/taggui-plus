@@ -182,6 +182,14 @@ class MainWindow(QMainWindow):
         # in changeEvent() whenever the window switches between the two modes.
         self._expanded_dock_state = None
         self._normal_dock_state = None
+        # (geometry, dock state, window state) from before focus mode was
+        # entered, or None when focus mode is off. Restored on exit and saved
+        # instead of the focus layout if the app is closed in focus mode.
+        self._focus_mode_saved = None
+        self._focus_mode_tracking_was_ready = False
+        # Images pane actions also attached to the main window while focus
+        # mode hides that pane (Qt ignores shortcuts of hidden widgets).
+        self._focus_mode_extra_actions = []
         # Guard so the layout tracking below ignores the window-state changes
         # that happen while the app is still starting up and restoring itself.
         self._dock_state_tracking_ready = False
@@ -288,6 +296,7 @@ class MainWindow(QMainWindow):
         self.toggle_all_tags_editor_action = QAction('All Tags', parent=self)
         self.toggle_auto_captioner_action = QAction('Auto-Captioner',
                                                     parent=self)
+        self.toggle_focus_mode_action = QAction('Focus Mode', parent=self)
         self.open_danbooru_wiki_action = QAction('Danbooru Wiki...', parent=self)
         self.open_gelbooru_wiki_action = QAction('Gelbooru Wiki...', parent=self)
         self.create_menus()
@@ -453,17 +462,28 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _save_window_layout(self):
-        self.settings.setValue('geometry', self.saveGeometry())
-        current_state = self.saveState()
-        self.settings.setValue('window_state', current_state)
-        # Keep the current mode's cached per-mode layout in sync with what
-        # is on screen (the user may have resized panels without switching
-        # modes since the last swap), then persist both layouts so the
-        # maximized vs. normal panel sizes survive a restart.
-        if self.isMaximized() or self.isFullScreen():
-            self._expanded_dock_state = current_state
+        if self._focus_mode_saved is not None:
+            # Save the layout from before focus mode, so the next launch
+            # doesn't start full screen with the panes hidden.
+            geometry, current_state, window_state = self._focus_mode_saved
+            self.settings.setValue('geometry', geometry)
+            self.settings.setValue('window_state', current_state)
+            if self._window_state_is_expanded(window_state):
+                self._expanded_dock_state = current_state
+            else:
+                self._normal_dock_state = current_state
         else:
-            self._normal_dock_state = current_state
+            self.settings.setValue('geometry', self.saveGeometry())
+            current_state = self.saveState()
+            self.settings.setValue('window_state', current_state)
+            # Keep the current mode's cached per-mode layout in sync with
+            # what is on screen (the user may have resized panels without
+            # switching modes since the last swap), then persist both layouts
+            # so the maximized vs. normal panel sizes survive a restart.
+            if self.isMaximized() or self.isFullScreen():
+                self._expanded_dock_state = current_state
+            else:
+                self._normal_dock_state = current_state
         if self._expanded_dock_state:
             self.settings.setValue('expanded_dock_state',
                                    self._expanded_dock_state)
@@ -574,6 +594,102 @@ class MainWindow(QMainWindow):
         # events caused by the restoreState() above have been processed.
         QTimer.singleShot(
             0, lambda: setattr(self, '_suppress_dock_snapshot', False))
+
+    def is_focus_mode(self) -> bool:
+        return self._focus_mode_saved is not None
+
+    def toggle_focus_mode(self, enabled: bool | None = None):
+        """Switch focus mode on or off (toggle when `enabled` is None).
+
+        Focus mode makes the window full screen and hides every pane except
+        the image preview and the Image Tags pane. Leaving it restores the
+        previous window size, state and panel layout exactly.
+        """
+        if enabled is None:
+            enabled = not self.is_focus_mode()
+        if enabled == self.is_focus_mode():
+            self.toggle_focus_mode_action.setChecked(enabled)
+            return
+        if enabled:
+            self._enter_focus_mode()
+        else:
+            self._exit_focus_mode()
+        self.toggle_focus_mode_action.setChecked(enabled)
+
+    def _enter_focus_mode(self):
+        self._focus_mode_saved = (self.saveGeometry(), self.saveState(),
+                                  self.windowState())
+        # Pause the per-mode (maximized/normal) layout tracking so going full
+        # screen neither re-applies the saved maximized layout (which would
+        # re-show the hidden panes) nor records the focus layout.
+        self._focus_mode_tracking_was_ready = self._dock_state_tracking_ready
+        self._dock_state_tracking_ready = False
+        self._dock_settle_timer.stop()
+        self._pending_dock_restore = None
+        hidden_docks = (self.image_list, self.all_tags_editor,
+                        self.auto_captioner)
+        focus_widget = QApplication.focusWidget()
+        focus_was_hidden = focus_widget is not None and any(
+            dock.isAncestorOf(focus_widget) for dock in hidden_docks)
+        for dock in hidden_docks:
+            dock.hide()
+        self.image_tags_editor.show()
+        # Qt ignores shortcuts whose only widget is hidden, so attach the
+        # Images pane actions (Copy Tags, Mark as Complete, etc.) to the main
+        # window while that pane is hidden. Select All is left out because it
+        # only applies while the thumbnails have focus.
+        list_view = self.image_list.list_view
+        self._focus_mode_extra_actions = [
+            action for (_, action) in list_view.get_shortcut_actions().values()
+            if action is not list_view.select_all_images_action]
+        self.addActions(self._focus_mode_extra_actions)
+        if focus_was_hidden:
+            self._focus_image_tags_pane()
+        self.showFullScreen()
+
+    def _focus_image_tags_pane(self):
+        editor = self.image_tags_editor
+        if editor.tag_input_box.isVisible() and editor.tag_input_box.isEnabled():
+            editor.tag_input_box.setFocus()
+        else:
+            editor.setFocus()
+
+    def _exit_focus_mode(self):
+        geometry, dock_state, window_state = self._focus_mode_saved
+        self._focus_mode_saved = None
+        for action in self._focus_mode_extra_actions:
+            self.removeAction(action)
+        self._focus_mode_extra_actions = []
+        if window_state & Qt.WindowState.WindowFullScreen:
+            pass
+        elif window_state & Qt.WindowState.WindowMaximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+            self.restoreGeometry(geometry)
+        self.restoreState(dock_state)
+        # Re-apply the layout once the window has finished resizing back
+        # (the resize can squash the panels), then resume layout tracking.
+        QTimer.singleShot(
+            250, lambda: self._finish_exit_focus_mode(dock_state))
+
+    def _finish_exit_focus_mode(self, dock_state):
+        if self.is_focus_mode():
+            return
+        self.restoreState(dock_state)
+        self._suppress_dock_snapshot = False
+        self._dock_state_tracking_ready = self._focus_mode_tracking_was_ready
+
+    def keyPressEvent(self, event):
+        # Only reached when the focused widget didn't use the key, so Esc
+        # still cancels tag editing, completions, etc. first.
+        if (event.key() == Qt.Key.Key_Escape
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and self.is_focus_mode()):
+            self.toggle_focus_mode(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _snapshot_current_dock_state(self):
         """Cache the current panel layout for whichever mode is active now.
@@ -1271,7 +1387,8 @@ class MainWindow(QMainWindow):
             ('focus_all_tags_search', 'Focus All Tags Search Box', 'Alt+S'),
             ('focus_auto_caption_button', 'Focus Auto-Caption Button', 'Alt+C'),
             ('toggle_editor_mode',
-             'Toggle Natural Language Mode / Current Image Only', 'Ctrl+Space')
+             'Toggle Natural Language Mode / Current Image Only', 'Ctrl+Space'),
+            ('toggle_focus_mode', 'Toggle Focus Mode', 'F11')
         ]
 
     def get_shortcut_action_map(self) -> dict[str, QAction]:
@@ -1314,6 +1431,7 @@ class MainWindow(QMainWindow):
             'focus_all_tags_search': self.focus_search_tags_box_shortcut,
             'focus_auto_caption_button': self.focus_caption_button_shortcut,
             'toggle_editor_mode': self.toggle_editor_mode_shortcut,
+            'toggle_focus_mode': self.toggle_focus_mode_action,
             **image_list_shortcuts
         }
 
@@ -1749,6 +1867,11 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.toggle_image_tags_editor_action)
         view_menu.addAction(self.toggle_all_tags_editor_action)
         view_menu.addAction(self.toggle_auto_captioner_action)
+        view_menu.addSeparator()
+        self.toggle_focus_mode_action.setCheckable(True)
+        self.toggle_focus_mode_action.triggered.connect(
+            lambda: self.toggle_focus_mode())
+        view_menu.addAction(self.toggle_focus_mode_action)
 
         tools_menu = self.menu_bar.addMenu('Tools')
         self.open_danbooru_wiki_action.triggered.connect(
