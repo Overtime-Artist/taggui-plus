@@ -73,6 +73,11 @@ def ensure_menu_shortcut_gap(menu: QMenu):
     """
     menu.setMinimumWidth(0)
     menu.ensurePolished()
+    # QMenu caches its item layout, and that cache includes the minimum width
+    # set on the previous call, so sizeHint() would keep the old widened size
+    # and the menu would grow on every open. A font-change event makes Qt
+    # recompute the layout without the old minimum.
+    QApplication.sendEvent(menu, QEvent(QEvent.Type.FontChange))
     font_metrics = menu.fontMetrics()
     actions = [action for action in menu.actions()
                if action.isVisible() and not action.isSeparator()]
