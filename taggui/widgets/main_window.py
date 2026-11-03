@@ -190,6 +190,8 @@ class MainWindow(QMainWindow):
         # Images pane actions also attached to the main window while focus
         # mode hides that pane (Qt ignores shortcuts of hidden widgets).
         self._focus_mode_extra_actions = []
+        self._focus_mode_pre_size = None
+        self._focus_mode_restore_min_size = False
         # Guard so the layout tracking below ignores the window-state changes
         # that happen while the app is still starting up and restoring itself.
         self._dock_state_tracking_ready = False
@@ -619,6 +621,7 @@ class MainWindow(QMainWindow):
     def _enter_focus_mode(self):
         self._focus_mode_saved = (self.saveGeometry(), self.saveState(),
                                   self.windowState())
+        self._focus_mode_pre_size = self.size()
         # Pause the per-mode (maximized/normal) layout tracking so going full
         # screen neither re-applies the saved maximized layout (which would
         # re-show the hidden panes) nor records the focus layout.
@@ -663,6 +666,15 @@ class MainWindow(QMainWindow):
         if window_state & Qt.WindowState.WindowFullScreen:
             pass
         elif window_state & Qt.WindowState.WindowMaximized:
+            # On Windows, leaving full screen for maximized briefly passes
+            # through the normal (restored) window size, which shows as a
+            # visible shrink-and-grow. Holding the minimum size at the
+            # maximized size until the switch finishes hides that step.
+            self._focus_mode_restore_min_size = True
+            available = self.screen().availableGeometry().size()
+            self.setMinimumSize(
+                self._focus_mode_pre_size.boundedTo(available).expandedTo(
+                    self.minimumSize()))
             self.showMaximized()
         else:
             self.showNormal()
@@ -674,6 +686,14 @@ class MainWindow(QMainWindow):
             250, lambda: self._finish_exit_focus_mode(dock_state))
 
     def _finish_exit_focus_mode(self, dock_state):
+        if self._focus_mode_restore_min_size:
+            self._focus_mode_restore_min_size = False
+            # The main window's minimum normally comes from its layout, so
+            # clear the temporary one and let the layout recalculate it.
+            self.setMinimumSize(0, 0)
+            if self.layout() is not None:
+                self.layout().invalidate()
+                self.layout().activate()
         if self.is_focus_mode():
             return
         self.restoreState(dock_state)
