@@ -572,7 +572,9 @@ subfolders; the **Direct** column counts only the images saved in that folder
 itself. Results can be exported to CSV or
 Markdown; listed paths are shown relative to the loaded folder.
 
-The window can stay open while you work. Click a listed image to select it in
+The window can stay open while you work. After the first scan it widens to show
+the whole per-subfolder table (up to 90% of the screen width; beyond that the
+table scrolls sideways). Click a listed image to select it in
 the Images pane (an image hidden by the current filter can't be selected — clear
 the filter first), or a listed non-image file to show it in your file manager.
 The report isn't updated automatically; press **Rescan** after making changes.

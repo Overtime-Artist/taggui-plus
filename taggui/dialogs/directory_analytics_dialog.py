@@ -22,9 +22,11 @@ from pathlib import Path
 from PySide6.QtCore import (QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl,
                             Signal, Slot)
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QAbstractItemView, QDialog, QFileDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDialog,
+                               QFileDialog,
                                QHBoxLayout, QHeaderView, QLabel, QMessageBox,
-                               QProgressDialog, QPushButton, QTabWidget,
+                               QProgressDialog, QPushButton, QStyle,
+                               QTabWidget,
                                QTextBrowser, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
@@ -143,11 +145,18 @@ class DirectoryAnalyticsDialog(QDialog):
         self._scanner: AnalyticsScanner | None = None
         self._report: AnalyticsReport | None = None
         self._closed = False
+        # The window is widened to fit the Per-subfolder table only after the
+        # first scan, so a size the user picks later is left alone.
+        self._fitted_to_report = False
         # (kind, path) for each clickable list entry; links are "item:<index>".
         self._link_targets: list[tuple[str, str]] = []
 
         self.setWindowTitle('Directory Analytics')
-        self.resize(960, 640)
+        self.resize(1040, 720)
+        available = self._available_screen_geometry()
+        if available is not None:
+            self.resize(min(1040, int(available.width() * 0.9)),
+                        min(720, int(available.height() * 0.9)))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -181,9 +190,10 @@ class DirectoryAnalyticsDialog(QDialog):
         self.subfolder_tree.setUniformRowHeights(True)
         header = self.subfolder_tree.header()
         header.setStretchLastSection(False)
-        # Room between the right-aligned numbers of neighbouring columns.
-        header.setMinimumSectionSize(80)
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        # Widths are set to fit the contents after each scan (with a gap
+        # between neighbouring right-aligned numbers); the user can still
+        # drag them.
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for column in range(1, len(self._SUBFOLDER_HEADERS)):
             self.subfolder_tree.headerItem().setTextAlignment(
                 column, Qt.AlignmentFlag.AlignRight
@@ -303,6 +313,9 @@ class DirectoryAnalyticsDialog(QDialog):
                 return
             self._report = report
             self._render_report(report)
+            if not self._fitted_to_report:
+                self._fitted_to_report = True
+                self._fit_width_to_subfolder_table()
             self.export_csv_button.setEnabled(True)
             self.export_markdown_button.setEnabled(True)
             self.status_label.setText(
@@ -546,6 +559,61 @@ class DirectoryAnalyticsDialog(QDialog):
                 item.setTextAlignment(column, right)
         tree.setSortingEnabled(True)
         tree.expandAll()
+        self._fit_subfolder_columns()
+
+    _COLUMN_GAP = 24
+
+    def _fit_subfolder_columns(self) -> int:
+        """Size each column to its contents plus a gap; returns the total."""
+        tree = self.subfolder_tree
+        header = tree.header()
+        total = 0
+        for column in range(tree.columnCount()):
+            width = max(tree.sizeHintForColumn(column),
+                        header.sectionSizeHint(column)) + self._COLUMN_GAP
+            header.resizeSection(column, width)
+            total += width
+        return total
+
+    def _available_screen_geometry(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        return screen.availableGeometry() if screen is not None else None
+
+    def _fit_width_to_subfolder_table(self):
+        """Widen the window so the whole Per-subfolder table fits, up to 90%
+        of the screen width (beyond that its horizontal scrollbar is used).
+        The window is never made narrower."""
+        available = self._available_screen_geometry()
+        if available is None:
+            return
+        tree = self.subfolder_tree
+        columns_width = sum(tree.header().sectionSize(column)
+                            for column in range(tree.columnCount()))
+        # Everything around the table: dialog margins and tab frame (measured
+        # from the visible page, as hidden pages aren't laid out), the tree's
+        # frame and a vertical scrollbar.
+        page = self.tabs.currentWidget()
+        surrounding = (self.width() - page.width()
+                       + 2 * tree.frameWidth()
+                       + tree.style().pixelMetric(
+                           QStyle.PixelMetric.PM_ScrollBarExtent, None, tree)
+                       + 4)
+        needed = columns_width + surrounding
+        target = min(needed, int(available.width() * 0.9))
+        if target <= self.width():
+            return
+        center = self.frameGeometry().center()
+        self.resize(target, self.height())
+        frame = self.frameGeometry()
+        frame.moveCenter(center)
+        # Keep the whole window on screen.
+        frame.moveLeft(max(available.left(),
+                           min(frame.left(),
+                               available.right() - frame.width() + 1)))
+        frame.moveTop(max(available.top(),
+                          min(frame.top(),
+                              available.bottom() - frame.height() + 1)))
+        self.move(frame.topLeft())
 
     # ------------------------------------------------------------------
     # Export
