@@ -472,20 +472,24 @@ class GroupTagsPanel(QWidget):
         # top (mirrors the normal Image Tags list). One-shot: set right before
         # an edit is requested, consumed by the next refresh.
         self._pending_anchor: int | None = None
-        # Stable display order for the tag list. Every tag seen during the
-        # current selection is assigned a permanent slot number the first time
-        # it appears; the list is always shown sorted by that slot. Because a
-        # slot is NEVER reused or pruned while the selection is unchanged, a tag
-        # that is removed from every image (and so vanishes) reclaims its exact
-        # original position if it comes back via undo/redo — independent of the
-        # order it was removed from / re-added to the individual images. A
-        # brand-new tag (manual add or auto-caption), or a fully-removed tag
-        # that is manually re-added, gets a fresh slot at the end.
-        # `_order_key` identifies the current selection (by image paths); when
-        # it changes the slots are rebuilt from natural first-appearance order.
+        # Stable display order for the tag list. Every tag seen is assigned a
+        # permanent slot number the first time it appears; the list is always
+        # shown sorted by that slot. Slots are never pruned, so a tag that
+        # vanishes (removed from every image, or its only image deselected)
+        # reclaims its exact position if it comes back via undo/redo or by
+        # reselecting the image. A brand-new tag (manual add or auto-caption),
+        # or a fully-removed tag that is manually re-added, gets a fresh slot
+        # at the end. A renamed tag takes over the old name's slot.
+        # `_order_key` is the image paths of the last grid selection. The slots
+        # are kept while each new grid selection shares an image with the last
+        # one, and rebuilt from natural first-appearance order otherwise (and
+        # when a directory is loaded).
         self._order_key: frozenset[str] | None = None
-        self._slot_of: dict[str, int] = {}
+        self._slot_of: dict[str, float] = {}
         self._next_slot = 0
+        # Incremented whenever the slots are rebuilt, so a tag order saved with
+        # an undo entry is only restored into the order it came from.
+        self._order_generation = 0
         # Tags that were present at the previous refresh. Used to tell a tag
         # that (re)appeared on a normal edit (-> fresh slot at the end) from one
         # that was merely restored by undo/redo (-> keep its permanent slot).
@@ -541,20 +545,31 @@ class GroupTagsPanel(QWidget):
     # ------------------------------------------------------------------
     # Population and stable ordering
     # ------------------------------------------------------------------
-    def set_images(self, images: list[Image], restore_positions: bool = False):
+    def set_images(self, images: list[Image], restore_positions: bool = False,
+                   renames: dict[str, list[str]] | None = None,
+                   saved_order=None):
+        """Show the tags of ``images``.
+
+        ``restore_positions`` is set for an undo/redo, with ``saved_order``
+        the tag order saved (by ``order_state``) just before the change being
+        undone/redone. ``renames`` maps each tag renamed by this change to its
+        replacement(s), so the new name keeps the old one's position.
+        """
         rows, total = compute_tag_rows(images)
         counts = dict(rows)
         present = [tag for tag, _ in rows]  # natural first-appearance order
         present_set = set(present)
-        # When the selected image set changes, start a fresh stable order (and
-        # drop any leftover auto-caption markers, which belonged to the old
-        # selection).
         order_key = frozenset(str(image.path) for image in images)
         same_selection = order_key == self._order_key
         if not same_selection:
-            self._order_key = order_key
-            self._slot_of = {}
-            self._next_slot = 0
+            # Keep the remembered positions while the new selection shares an
+            # image with the last one; otherwise start a fresh order.
+            if order_key and not order_key & (self._order_key or frozenset()):
+                self.reset_order_memory()
+            if order_key:
+                self._order_key = order_key
+            # Drop leftover auto-caption markers, which belonged to the old
+            # selection.
             self._present_prev = set()
             self._recently_captioned = set()
         # When an external edit (auto-captioning, undo/redo) changes the tags of
@@ -567,20 +582,26 @@ class GroupTagsPanel(QWidget):
         prev_tags = self.tag_list.selected_tags() if preserve else []
         # Assign / keep permanent slots (see _slot_of docs in __init__).
         if not same_selection:
-            # Fresh selection: slot every tag in natural first-appearance order.
+            # Selection changed: remembered tags keep their slots; tags never
+            # seen before go to the end in natural first-appearance order.
             for tag in present:
                 self._assign_slot(tag)
         elif restore_positions:
-            # Undo/redo: never reassign an existing slot, so a returning tag
-            # reclaims its exact position. Only a tag never seen this selection
-            # (shouldn't normally happen on a restore) gets a new end slot.
+            # Undo/redo: put every tag back where it was before the change, so
+            # a returning tag reclaims its exact position. Only a tag never
+            # seen before (shouldn't normally happen) gets a new end slot.
+            self._apply_order_state(saved_order)
             for tag in present:
                 if tag not in self._slot_of:
                     self._assign_slot(tag)
         else:
-            # Normal edit: a tag that just (re)appeared gets a fresh slot at the
-            # end; tags already present keep their slots.
+            # Normal edit: a renamed tag takes the old name's slot; any other
+            # tag that just (re)appeared gets a fresh slot at the end; tags
+            # already present keep their slots.
+            renamed = self._apply_renames(renames or {}, present_set)
             for tag in present:
+                if tag in renamed:
+                    continue
                 if tag not in self._present_prev or tag not in self._slot_of:
                     self._assign_slot(tag, force_end=True)
         ordered_tags = sorted(present, key=lambda tag: self._slot_of[tag])
@@ -619,6 +640,60 @@ class GroupTagsPanel(QWidget):
         if force_end or tag not in self._slot_of:
             self._slot_of[tag] = self._next_slot
             self._next_slot += 1
+
+    def reset_order_memory(self):
+        """Forget every remembered tag position (e.g. a new directory was
+        loaded), so the next grid selection starts in natural order."""
+        self._order_key = None
+        self._slot_of = {}
+        self._next_slot = 0
+        self._order_generation += 1
+        self._present_prev = set()
+
+    def order_state(self):
+        """The current tag order, to be saved with an undo entry and passed
+        back to ``set_images`` when that entry is undone or redone."""
+        return self._order_generation, dict(self._slot_of)
+
+    def _apply_order_state(self, state):
+        """Put tags back in the positions saved by ``order_state``, unless the
+        order has been rebuilt since. Tags seen only after the save keep their
+        current positions."""
+        if state is None:
+            return
+        generation, slots = state
+        if generation == self._order_generation:
+            self._slot_of.update(slots)
+
+    def _apply_renames(self, renames: dict[str, list[str]],
+                       present: set[str]) -> set[str]:
+        """Give each newly appeared replacement of a renamed tag the old tag's
+        slot (several replacements are placed together, in order, before the
+        next tag). A replacement that was already shown (the rename merged into
+        it) keeps its own slot. The old tag keeps its slot too, so an undo
+        brings it back in place. Returns the tags given a slot."""
+        placed: set[str] = set()
+        old_tags = sorted((tag for tag in renames
+                           if tag in self._present_prev
+                           and tag in self._slot_of),
+                          key=lambda tag: self._slot_of[tag])
+        for old_tag in old_tags:
+            new_tags = [tag for tag in dict.fromkeys(renames[old_tag])
+                        if tag in present and tag not in self._present_prev
+                        and tag not in placed]
+            if not new_tags:
+                continue
+            base = self._slot_of[old_tag]
+            following = min((slot for slot in self._slot_of.values()
+                             if slot > base), default=base + 1)
+            step = (following - base) / len(new_tags)
+            for position, tag in enumerate(new_tags):
+                self._slot_of[tag] = base + position * step
+                placed.add(tag)
+            if old_tag in self._recently_captioned:
+                self._recently_captioned.discard(old_tag)
+                self._recently_captioned.update(new_tags)
+        return placed
 
     def _refresh_view(self, prev_tags: list[str]):
         """Apply the current filter, repopulate the model, and restore state."""
@@ -934,35 +1009,11 @@ class GroupTagsPanel(QWidget):
             0, lambda: self._emit_rename(anchor, old_tag, new_tag))
 
     def _emit_rename(self, anchor: int | None, old_tag: str, new_tag: str):
-        # Keep the renamed tag in its slot. A new name would otherwise be
-        # treated as a brand-new tag and sent to the end, so move the old name's
-        # permanent slot to the new name in place. The pending anchor then
-        # restores the cursor to that row. A name containing the separator
-        # becomes several tags; the first one takes the slot.
-        separator = get_tag_separator()
-        parts = [part.strip() for part in new_tag.split(separator)
-                 if part.strip()]
-        self._rename_slot(old_tag, parts[0] if parts else new_tag)
+        # The renamed tag keeps its position (the model reports the rename, see
+        # `_apply_renames`), so the pending anchor restores the cursor to it.
         self._pending_anchor = anchor
         self.rename_tag_requested.emit(old_tag, new_tag)
         self._pending_anchor = None
-
-    def _rename_slot(self, old_tag: str, new_tag: str):
-        """Move ``old_tag``'s permanent slot to ``new_tag`` so a rename keeps the
-        tag's position. If ``new_tag`` already has a slot (the rename merges into
-        an existing tag), keep that slot and just drop ``old_tag``. Also updates
-        the "present at last refresh" set so the follow-up refresh doesn't treat
-        ``new_tag`` as a freshly (re)appeared tag and bump it to the end."""
-        if old_tag in self._slot_of:
-            slot = self._slot_of.pop(old_tag)
-            if new_tag not in self._slot_of:
-                self._slot_of[new_tag] = slot
-        if old_tag in self._present_prev:
-            self._present_prev.discard(old_tag)
-            self._present_prev.add(new_tag)
-        if old_tag in self._recently_captioned:
-            self._recently_captioned.discard(old_tag)
-            self._recently_captioned.add(new_tag)
 
     def _show_context_menu(self, position):
         tags = self.tag_list.selected_tags()

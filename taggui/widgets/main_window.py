@@ -819,6 +819,8 @@ class MainWindow(QMainWindow):
         # Filter to reapply once loading completes (empty clears the filter, as
         # every normal directory load does).
         self._pending_directory_filter = restore_filter
+        # Tag positions remembered by the grid view belong to the old folder.
+        self.image_tags_editor.group_tags_panel.reset_order_memory()
         self.image_list_model.load_directory(self.directory_path)
 
     @Slot(object, str)

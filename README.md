@@ -473,7 +473,12 @@ The grouped list behaves like the normal tag list:
 double-click to rename, `Delete` to remove, copy the selected tags, look a tag up
 on a wiki, or assign it to a category. Tags keep a **stable position** as you
 edit, so removing a tag from one image only updates its `k/N` count instead of
-reshuffling the list. At the bottom of the pane, the **`X common` /
+reshuffling the list. Newly added tags go to the end, renamed tags stay in place,
+and undo/redo puts tags back exactly where they were. Positions are remembered
+while you change the selection, as long as the new grid shares at least one
+image with the previous grid (single-image selections in between don't count);
+selecting a grid with no images in common, or loading a folder, starts a fresh
+order. At the bottom of the pane, the **`X common` /
 `Y differences` counts** double as **filters**: click one to show only those
 tags, and click it again to show everything. Choosing `differences` also turns
 the `Current image only` toggle on and `common` turns it off, so the Add Tag

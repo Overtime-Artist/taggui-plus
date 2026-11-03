@@ -254,6 +254,10 @@ class HistoryItem:
     # Values are (tags, natural_language_prompt).
     captions: dict[Path, tuple[list[str], str]]
     should_ask_for_confirmation: bool
+    # The grid view's tag order from just before this change was applied, so
+    # undoing/redoing it puts every tag back exactly where it was. Set by the
+    # Image Tags pane; None when the change was not made in the grid view.
+    group_order_state: object = None
 
 
 MAX_LISTED_WRITE_ERRORS = 10
@@ -707,7 +711,16 @@ class ImageListModel(QAbstractListModel):
         # new edit from a history restore, so an undone/redone tag returns to
         # its original position while a freshly added tag lands at the end.
         self.is_restoring_history = False
-        self.proxy_image_list_model = None
+        # While restoring: (item being restored, its reverse item). See
+        # `restore_history_tags`.
+        self.restoring_history_items = None
+        # The entry most recently added by `add_to_undo_stack`, until the
+        # grid view has saved its tag order with it (see HistoryItem).
+        self.newest_history_item = None
+        # Set only while a rename-like operation reports its change: maps each
+        # renamed tag to the tag(s) that replaced it, so the grid view can keep
+        # the new name in the old tag's position.
+        self.tag_renames: dict[str, list[str]] | None = None
         self.image_list_selection_model = None
         self.thumbnail_loaders = set()
         # Image path -> row it was in when its thumbnail load was started.
@@ -1213,8 +1226,9 @@ class ImageListModel(QAbstractListModel):
                         if len(self.undo_stack) == self.undo_stack.maxlen
                         else None)
         self._last_undo_push = (dropped_item, self.redo_stack.copy())
-        self.undo_stack.append(HistoryItem(action_name, captions,
-                                           should_ask_for_confirmation))
+        self.newest_history_item = HistoryItem(action_name, captions,
+                                               should_ask_for_confirmation)
+        self.undo_stack.append(self.newest_history_item)
         self.redo_stack.clear()
         self.update_undo_and_redo_actions_requested.emit()
 
@@ -1226,6 +1240,8 @@ class ImageListModel(QAbstractListModel):
             return
         dropped_item, previous_redo_stack = self._last_undo_push
         self._last_undo_push = None
+        if self.undo_stack[-1] is self.newest_history_item:
+            self.newest_history_item = None
         self.undo_stack.pop()
         if dropped_item is not None:
             self.undo_stack.appendleft(dropped_item)
@@ -1365,17 +1381,22 @@ class ImageListModel(QAbstractListModel):
             image.natural_language_prompt = history_natural_language_prompt
             self.write_image_tags_to_disk(image)
             changed_rows.append(row)
-        destination_stack.append(HistoryItem(
+        reverse_item = HistoryItem(
             history_item.action_name, reverse_captions,
-            history_item.should_ask_for_confirmation))
+            history_item.should_ask_for_confirmation)
+        destination_stack.append(reverse_item)
         self.forget_history_for_paths(skipped_paths)
         if changed_rows:
             self.is_restoring_history = True
+            # Lets the grid view restore the tag order saved with the item
+            # being restored, and save the current order with its reverse.
+            self.restoring_history_items = (history_item, reverse_item)
             try:
                 self.dataChanged.emit(self.index(min(changed_rows)),
                                       self.index(max(changed_rows)))
             finally:
                 self.is_restoring_history = False
+                self.restoring_history_items = None
         self.update_undo_and_redo_actions_requested.emit()
         if skipped_paths:
             skipped_count = len(skipped_paths)
@@ -1513,6 +1534,23 @@ class ImageListModel(QAbstractListModel):
                          key=lambda item: (-item[1], item[0]))
         return match_count, ordered
 
+    def _emit_renamed(self, first_index: QModelIndex, last_index: QModelIndex,
+                      renames: dict[str, list[str]]):
+        """Emit dataChanged while publishing which tags were renamed to what
+        (see `tag_renames`)."""
+        self.tag_renames = renames
+        try:
+            self.dataChanged.emit(first_index, last_index)
+        finally:
+            self.tag_renames = None
+
+    @staticmethod
+    def _note_rename(renames: dict[str, list[str]], old_tag: str,
+                     new_tags: list[str]):
+        """Record the first replacement seen for `old_tag` (ignoring no-ops)."""
+        if new_tags != [old_tag] and old_tag not in renames:
+            renames[old_tag] = list(new_tags)
+
     @collect_write_errors
     def find_and_replace(self, find_text: str, replace_text: str,
                          scope: Scope | str, use_regex: bool):
@@ -1533,6 +1571,7 @@ class ImageListModel(QAbstractListModel):
         self.add_to_undo_stack(action_name='Find and Replace',
                                should_ask_for_confirmation=True)
         changed_image_indices = []
+        renames: dict[str, list[str]] = {}
         for image_index, image in enumerate(self.images):
             if not self.is_image_in_scope(scope, image_index, image):
                 continue
@@ -1549,9 +1588,11 @@ class ImageListModel(QAbstractListModel):
                 new_tags = []
                 for tag in image.tags:
                     if self.count_text_matches(tag, find_text, pattern):
-                        new_tags.extend(self.split_tag_text(
+                        replacements = self.split_tag_text(
                             self.substitute_text(tag, find_text,
-                                                 replace_text, pattern)))
+                                                 replace_text, pattern))
+                        self._note_rename(renames, tag, replacements)
+                        new_tags.extend(replacements)
                     else:
                         new_tags.append(tag)
             new_tags = list(dict.fromkeys(new_tags))
@@ -1561,8 +1602,9 @@ class ImageListModel(QAbstractListModel):
             image.tags = new_tags
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
-            self.dataChanged.emit(self.index(changed_image_indices[0]),
-                                  self.index(changed_image_indices[-1]))
+            self._emit_renamed(self.index(changed_image_indices[0]),
+                               self.index(changed_image_indices[-1]),
+                               renames)
         else:
             self.discard_last_undo_entry()
 
@@ -1952,7 +1994,8 @@ class ImageListModel(QAbstractListModel):
             self.write_image_tags_to_disk(image)
         min_image_index = min(targets, key=lambda index: index.row())
         max_image_index = max(targets, key=lambda index: index.row())
-        self.dataChanged.emit(min_image_index, max_image_index)
+        self._emit_renamed(min_image_index, max_image_index,
+                           {old_tag: new_tags})
 
     @Slot(list, str)
     @collect_write_errors
@@ -1976,6 +2019,7 @@ class ImageListModel(QAbstractListModel):
             action_name=f'Rename {pluralize("Tag", len(old_tags))}',
             should_ask_for_confirmation=True)
         changed_image_indices = []
+        renames: dict[str, list[str]] = {}
         for image_index, image in enumerate(self.images):
             if not self.is_image_in_scope(scope, image_index, image):
                 continue
@@ -1987,8 +2031,10 @@ class ImageListModel(QAbstractListModel):
                 for image_tag in image.tags:
                     match = pattern.fullmatch(image_tag)
                     if match:
-                        renamed_tags.extend(self.split_tag_text(
-                            match.expand(new_tag)))
+                        replacements = self.split_tag_text(
+                            match.expand(new_tag))
+                        self._note_rename(renames, image_tag, replacements)
+                        renamed_tags.extend(replacements)
                     else:
                         renamed_tags.append(image_tag)
                 image.tags = list(dict.fromkeys(renamed_tags))
@@ -2002,9 +2048,13 @@ class ImageListModel(QAbstractListModel):
                                         else [image_tag])))
             changed_image_indices.append(image_index)
             self.write_image_tags_to_disk(image)
+        if not use_regex:
+            for old_tag in old_tags:
+                self._note_rename(renames, old_tag, new_tags)
         if changed_image_indices:
-            self.dataChanged.emit(self.index(changed_image_indices[0]),
-                                  self.index(changed_image_indices[-1]))
+            self._emit_renamed(self.index(changed_image_indices[0]),
+                               self.index(changed_image_indices[-1]),
+                               renames)
         else:
             self.discard_last_undo_entry()
 
@@ -2031,8 +2081,10 @@ class ImageListModel(QAbstractListModel):
             changed_image_indices.append(image_index)
             self.write_image_tags_to_disk(image)
         if changed_image_indices:
-            self.dataChanged.emit(self.index(changed_image_indices[0]),
-                                  self.index(changed_image_indices[-1]))
+            self._emit_renamed(
+                self.index(changed_image_indices[0]),
+                self.index(changed_image_indices[-1]),
+                {old: [new] for old, new in mapping.items() if new})
         else:
             self.discard_last_undo_entry()
         return len(changed_image_indices)

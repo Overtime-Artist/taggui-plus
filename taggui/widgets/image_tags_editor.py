@@ -1695,14 +1695,40 @@ class ImageTagsEditor(QDockWidget):
         self.grid_peek_changed.emit(False)
         self.set_natural_language_mode()
 
-    def _refresh_group_panel(self, restore_positions: bool = False):
+    def _refresh_group_panel(self, restore_positions: bool = False,
+                             renames: dict[str, list[str]] | None = None,
+                             saved_order=None):
         images = []
         for index in self._group_source_indices:
             image = self.image_list_model.data(index, Qt.ItemDataRole.UserRole)
             if image is not None:
                 images.append(image)
         self.group_tags_panel.set_images(images,
-                                         restore_positions=restore_positions)
+                                         restore_positions=restore_positions,
+                                         renames=renames,
+                                         saved_order=saved_order)
+
+    def _refresh_group_panel_after_change(self):
+        """Refresh the grid view's tag list after the image tags changed,
+        saving the tag order with the undo entry for this change (or restoring
+        the one saved with the entry being undone/redone)."""
+        model = self.image_list_model
+        panel = self.group_tags_panel
+        if model.is_restoring_history:
+            saved_order = None
+            if model.restoring_history_items is not None:
+                restored_item, reverse_item = model.restoring_history_items
+                reverse_item.group_order_state = panel.order_state()
+                saved_order = restored_item.group_order_state
+            self._refresh_group_panel(restore_positions=True,
+                                      saved_order=saved_order)
+            return
+        newest_item = model.newest_history_item
+        if newest_item is not None:
+            model.newest_history_item = None
+            if model.undo_stack and model.undo_stack[-1] is newest_item:
+                newest_item.group_order_state = panel.order_state()
+        self._refresh_group_panel(renames=model.tag_renames)
 
     def _update_group_placeholder(self):
         """Set the Add Tag box placeholder for grouped mode. Scope is chosen by
@@ -1846,13 +1872,14 @@ class ImageTagsEditor(QDockWidget):
         """
         if self._group_mode:
             # A group edit (or undo/redo) changed tags: recompute the
-            # Common/Differences view from the current selection. Preserve tag
-            # positions only when the change is an undo/redo history restore, so
-            # a re-added tag returns to its original spot while a freshly added
-            # tag still lands at the end.
-            self._refresh_group_panel(
-                restore_positions=self.image_list_model.is_restoring_history)
+            # Common/Differences view from the current selection. An undo/redo
+            # restores the tag order saved with its history entry, so every tag
+            # returns to where it was; a freshly added tag lands at the end and
+            # a renamed one keeps its position.
+            self._refresh_group_panel_after_change()
             return
+        # Not shown in the grid view, so there's no tag order to save.
+        self.image_list_model.newest_history_item = None
         if self.image_index is None:
             return
         if (first_changed_index.row() <= self.image_index.row()
