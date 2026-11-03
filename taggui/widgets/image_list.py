@@ -1421,6 +1421,8 @@ class ImageListView(ElidedToolTipListView):
 
 
 class ImageList(QDockWidget):
+    image_index_text_changed = Signal(str)
+
     def __init__(self, proxy_image_list_model: ProxyImageListModel,
                  tag_separator: str, image_width: int,
                  get_category_for_tag=None):
@@ -1594,6 +1596,7 @@ class ImageList(QDockWidget):
         if image_count != unfiltered_image_count:
             label_text += f' ({unfiltered_image_count} total)'
         self.image_index_label.setText(label_text)
+        self.image_index_text_changed.emit(label_text)
 
     @Slot()
     def go_to_previous_image(self):

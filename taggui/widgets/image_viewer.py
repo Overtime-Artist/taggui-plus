@@ -411,6 +411,13 @@ class ImageViewer(QWidget):
         self._grid_overlay_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._grid_overlay_label.hide()
+        # Image-count overlay (bottom-right), shown only in focus mode, where
+        # the Images pane and its "Image N / M" label are hidden.
+        self._focus_overlay_label = QLabel(self.scroll_area.viewport())
+        self._focus_overlay_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._focus_overlay_label.hide()
+        self._focus_overlay_enabled = False
         self.refresh_grid_overlay_style()
         self.scroll_area.clicked.connect(lambda: self.clicked.emit())
         self.scroll_area.reset_requested.connect(self.reset_view)
@@ -473,17 +480,49 @@ class ImageViewer(QWidget):
         self._grid_overlay_background_alpha = self._transparency_to_alpha(
             transparency)
         font_size = max(1, self._grid_overlay_font_size)
-        self._grid_overlay_label.setStyleSheet(
-            f'background-color: rgba(0, 0, 0, '
-            f'{self._grid_overlay_background_alpha}); '
-            f'color: rgba(255, 255, 255, 220); '
-            f'padding: 3px 8px; border-radius: 6px; font-size: {font_size}pt;')
+        style = (f'background-color: rgba(0, 0, 0, '
+                 f'{self._grid_overlay_background_alpha}); '
+                 f'color: rgba(255, 255, 255, 220); '
+                 f'padding: 3px 8px; border-radius: 6px; '
+                 f'font-size: {font_size}pt;')
+        self._grid_overlay_label.setStyleSheet(style)
+        self._focus_overlay_label.setStyleSheet(style)
         # Show/hide immediately to reflect a toggled "show overlay" setting.
         self._update_grid_overlay()
+        self._update_focus_overlay()
 
     def _on_viewport_resized(self):
         self._resize_debounce_timer.start()
         self._position_grid_overlay()
+        self._position_focus_overlay()
+
+    def set_focus_overlay_text(self, text: str):
+        self._focus_overlay_label.setText(text)
+        self._update_focus_overlay()
+
+    def set_focus_overlay_enabled(self, enabled: bool):
+        self._focus_overlay_enabled = enabled
+        self._update_focus_overlay()
+
+    def _update_focus_overlay(self):
+        label = self._focus_overlay_label
+        if not self._focus_overlay_enabled or not label.text():
+            label.hide()
+            return
+        label.adjustSize()
+        label.show()
+        label.raise_()
+        self._position_focus_overlay()
+
+    def _position_focus_overlay(self):
+        """Keep the focus mode overlay pinned to the bottom-right."""
+        label = self._focus_overlay_label
+        if not label.isVisible():
+            return
+        margin = 10
+        viewport = self.scroll_area.viewport()
+        label.move(viewport.width() - label.width() - margin,
+                   viewport.height() - label.height() - margin)
 
     def _update_grid_overlay(self):
         """Refresh and show the subtle page / image-count overlay."""

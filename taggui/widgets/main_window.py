@@ -192,6 +192,8 @@ class MainWindow(QMainWindow):
         self._focus_mode_extra_actions = []
         self._focus_mode_pre_size = None
         self._focus_mode_restore_min_size = False
+        # (dock, line edit) to focus once a focus mode exit finishes.
+        self._focus_mode_exit_focus_target = None
         # Guard so the layout tracking below ignores the window-state changes
         # that happen while the app is still starting up and restoring itself.
         self._dock_state_tracking_ready = False
@@ -345,9 +347,7 @@ class MainWindow(QMainWindow):
         self.focus_filter_images_box_shortcut = QShortcut(
             QKeySequence('Alt+F'), self)
         self.focus_filter_images_box_shortcut.activated.connect(
-            self.image_list.raise_)
-        self.focus_filter_images_box_shortcut.activated.connect(
-            self.image_list.filter_line_edit.setFocus)
+            self.focus_image_list_filter)
         self.focus_add_tag_box_shortcut = QShortcut(
             QKeySequence('Alt+A'), self)
         self.focus_add_tag_box_shortcut.activated.connect(
@@ -361,9 +361,7 @@ class MainWindow(QMainWindow):
         self.focus_search_tags_box_shortcut = QShortcut(
             QKeySequence('Alt+S'), self)
         self.focus_search_tags_box_shortcut.activated.connect(
-            self.all_tags_editor.raise_)
-        self.focus_search_tags_box_shortcut.activated.connect(
-            self.all_tags_editor.filter_line_edit.setFocus)
+            self.focus_all_tags_search)
         self.focus_caption_button_shortcut = QShortcut(
             QKeySequence('Alt+C'), self)
         self.focus_caption_button_shortcut.activated.connect(
@@ -622,6 +620,7 @@ class MainWindow(QMainWindow):
         self._focus_mode_saved = (self.saveGeometry(), self.saveState(),
                                   self.windowState())
         self._focus_mode_pre_size = self.size()
+        self._focus_mode_exit_focus_target = None
         # Pause the per-mode (maximized/normal) layout tracking so going full
         # screen neither re-applies the saved maximized layout (which would
         # re-show the hidden panes) nor records the focus layout.
@@ -648,6 +647,9 @@ class MainWindow(QMainWindow):
         self.addActions(self._focus_mode_extra_actions)
         if focus_was_hidden:
             self._focus_image_tags_pane()
+        self.image_viewer.set_focus_overlay_text(
+            self.image_list.image_index_label.text())
+        self.image_viewer.set_focus_overlay_enabled(True)
         self.showFullScreen()
 
     def _focus_image_tags_pane(self):
@@ -657,9 +659,37 @@ class MainWindow(QMainWindow):
         else:
             editor.setFocus()
 
+    def _focus_dock_box(self, dock, line_edit):
+        # These boxes live in panes that focus mode hides, so leave focus
+        # mode first rather than typing into an invisible box. The panes are
+        # only re-shown once the exit finishes, so focus the box then too.
+        if self.is_focus_mode():
+            self.toggle_focus_mode(False)
+            self._focus_mode_exit_focus_target = (dock, line_edit)
+        dock.raise_()
+        line_edit.setFocus()
+
+    def focus_image_list_filter(self):
+        self._focus_dock_box(self.image_list, self.image_list.filter_line_edit)
+
+    def focus_all_tags_search(self):
+        self._focus_dock_box(self.all_tags_editor,
+                             self.all_tags_editor.filter_line_edit)
+
+    def _on_captioning_started(self):
+        # Alt+C focuses the (hidden) Start button, which becomes Cancel once
+        # captioning starts; move focus off it so a stray Enter or Space
+        # can't cancel captioning invisibly.
+        if self.is_focus_mode():
+            focus_widget = QApplication.focusWidget()
+            if (focus_widget is None
+                    or self.auto_captioner.isAncestorOf(focus_widget)):
+                self._focus_image_tags_pane()
+
     def _exit_focus_mode(self):
         geometry, dock_state, window_state = self._focus_mode_saved
         self._focus_mode_saved = None
+        self.image_viewer.set_focus_overlay_enabled(False)
         for action in self._focus_mode_extra_actions:
             self.removeAction(action)
         self._focus_mode_extra_actions = []
@@ -699,6 +729,12 @@ class MainWindow(QMainWindow):
         self.restoreState(dock_state)
         self._suppress_dock_snapshot = False
         self._dock_state_tracking_ready = self._focus_mode_tracking_was_ready
+        target = self._focus_mode_exit_focus_target
+        self._focus_mode_exit_focus_target = None
+        if target is not None:
+            dock, line_edit = target
+            dock.raise_()
+            line_edit.setFocus()
 
     def keyPressEvent(self, event):
         # Only reached when the focused widget didn't use the key, so Esc
@@ -1464,17 +1500,13 @@ class MainWindow(QMainWindow):
         primary shortcuts are constructed in ``__init__``.
         """
         return {
-            'focus_image_list_filter': [
-                self.image_list.raise_,
-                self.image_list.filter_line_edit.setFocus],
+            'focus_image_list_filter': [self.focus_image_list_filter],
             'focus_add_tag_box': [
                 self.image_tags_editor.raise_,
                 self.image_tags_editor.tag_input_box.setFocus],
             'focus_image_tags_list': [
                 self.image_tags_editor.focus_tags_list],
-            'focus_all_tags_search': [
-                self.all_tags_editor.raise_,
-                self.all_tags_editor.filter_line_edit.setFocus],
+            'focus_all_tags_search': [self.focus_all_tags_search],
             'focus_auto_caption_button': [
                 self.auto_captioner.focus_start_cancel_button],
             'go_to_previous_image': [self.image_list.go_to_previous_image],
@@ -2009,6 +2041,8 @@ class MainWindow(QMainWindow):
             self.save_image_index)
         self.image_list_selection_model.currentChanged.connect(
             self.image_list.update_image_index_label)
+        self.image_list.image_index_text_changed.connect(
+            self.image_viewer.set_focus_overlay_text)
         self.image_list_selection_model.currentChanged.connect(
             self.image_viewer.load_image)
         self.image_list_selection_model.currentChanged.connect(
@@ -2736,6 +2770,8 @@ class MainWindow(QMainWindow):
                 self.all_tags_editor.isVisible()))
 
     def connect_auto_captioner_signals(self):
+        self.auto_captioner.captioning_started.connect(
+            self._on_captioning_started)
         self.auto_captioner.captioning_started.connect(
             self.update_undo_and_redo_actions)
         self.auto_captioner.captioning_finished.connect(
