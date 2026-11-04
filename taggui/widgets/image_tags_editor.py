@@ -1684,9 +1684,19 @@ class ImageTagsEditor(QDockWidget):
         """Leave grouped mode and restore the single-image view."""
         if not self._group_mode:
             return
+        # The hidden natural language box still holds the text from before
+        # grouped mode, while the image's prompt may have changed since (e.g.
+        # by auto-captioning). Refresh it so the next image switch doesn't
+        # save that old text over the new prompt.
         self._group_mode = False
         self._group_source_indices = []
         self._group_current_index = None
+        image = (self.image_list_model.data(self.image_index,
+                                            Qt.ItemDataRole.UserRole)
+                 if self.image_index is not None
+                 and self.image_index.isValid() else None)
+        self.natural_language_text_edit.set_clean_plain_text(
+            image.natural_language_prompt if image is not None else '')
         self.tag_input_box.group_mode_active = False
         self.tag_input_box.reset_group_placeholder()
         # Make sure a held peek doesn't linger after leaving grouped mode.
