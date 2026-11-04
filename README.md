@@ -473,7 +473,9 @@ The grouped list behaves like the normal tag list:
 double-click to rename, `Delete` to remove, copy the selected tags, look a tag up
 on a wiki, or assign it to a category. Tags keep a **stable position** as you
 edit, so removing a tag from one image only updates its `k/N` count instead of
-reshuffling the list. Newly added tags go to the end, renamed tags stay in place,
+reshuffling the list. Newly added tags go to the end, renamed tags stay in place
+(renaming a tag to one that's on only some of the images moves that tag into the
+renamed tag's place),
 and undo/redo puts tags back exactly where they were. Positions are remembered
 while you change the selection, as long as the new grid shares at least one
 image with the previous grid (single-image selections in between don't count);
@@ -758,13 +760,15 @@ image runs immediately without this prompt.
 
 Tags the captioner **adds** to an image are flagged with a small **amber dot** in
 the tag list, so you can review what changed at a glance. Each image remembers
-its dots, even after you switch to other images, until you select the tag (or
-close the app). Clicking an already-selected dotted tag also clears its dot. In
+its dots, even after you switch to other images, until the tag is selected (or
+you close the app). That includes the cursor landing on it after an edit, such
+as deleting the tag above it; the captioner's own changes never count. In
 the grid view a tag shows a dot if any selected image has
 it flagged, and selecting it there clears the dot for all of them. Renaming a
 flagged tag keeps the dot; deleting it removes the dot. To start a review pass
-on any images, select them and press `Ctrl`+`U` to flag all their tags;
-`Ctrl`+`Shift`+`U` clears the dots.
+on any images, select them and press `Ctrl`+`U` to flag all their tags (except
+the tags currently selected in the tag list); `Ctrl`+`Shift`+`U` clears the
+dots.
 
 You can keep working while captioning runs, but **Undo/Redo are unavailable**
 until it finishes, and loading another folder asks you to cancel or wait first.
@@ -1011,7 +1015,7 @@ shortcuts`**; the defaults are listed below.
 - Switch between selected images without changing the selection: `Left` /
   `Right`
 - Mark complete / incomplete: `Ctrl`+`K` / `Ctrl`+`Shift`+`K`
-- Add / clear amber "unviewed" dots on every tag of the selected images (see
+- Add / clear amber "unviewed" dots on the tags of the selected images (see
   [Automatic captioning](#automatic-captioning)): `Ctrl`+`U` /
   `Ctrl`+`Shift`+`U`
 - Copy the current image to the clipboard: `Ctrl`+`Shift`+`I`; drag thumbnails

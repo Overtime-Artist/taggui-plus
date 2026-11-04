@@ -1101,14 +1101,20 @@ class ImageListView(ElidedToolTipListView):
             selected_image_indices, is_complete)
 
     def set_selected_images_tags_unviewed(self, unviewed: bool):
-        """Add or remove the amber "unviewed" dot on every tag of the
-        selected images."""
+        """Add (except on the tags selected in the Image Tags pane) or remove
+        the amber "unviewed" dot on every tag of the selected images."""
         images = self.get_selected_images()
         if not images:
             return
         model = self.proxy_image_list_model.sourceModel()
         if unviewed:
-            model.mark_tags_unviewed(images)
+            # The tags selected in the Image Tags pane are being viewed, so
+            # they are left without a dot.
+            skip = set()
+            if self.image_tags_editor is not None:
+                skip = set(self.image_tags_editor.selected_tags())
+            tags = {tag for image in images for tag in image.tags} - skip
+            model.mark_tags_unviewed(images, tags)
         else:
             model.clear_unviewed_tags(images)
 

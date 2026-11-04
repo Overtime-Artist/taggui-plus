@@ -1727,6 +1727,18 @@ class ImageTagsEditor(QDockWidget):
         self.image_list_model.clear_unviewed_tags(self._displayed_images(),
                                                   tags)
 
+    def selected_tags(self) -> list[str]:
+        """The tags selected in the shown tag list (grid or single image)."""
+        if self._group_mode:
+            return self.group_tags_panel.tag_list.selected_tags()
+        return [index.data(Qt.ItemDataRole.DisplayRole)
+                for index in self.image_tags_list.selectedIndexes()]
+
+    def _shown_tags(self) -> set[str]:
+        if self._group_mode:
+            return {tag for tag, _ in self.group_tags_panel._rows_full}
+        return set(self.image_tag_list_model.stringList())
+
     def _refresh_group_panel(self, restore_positions: bool = False,
                              renames: dict[str, list[str]] | None = None,
                              saved_order=None):
@@ -1901,8 +1913,10 @@ class ImageTagsEditor(QDockWidget):
         changed indices.
         """
         # The reload may move the tag cursor by itself (e.g. onto a renamed or
-        # re-added tag). Only the user selecting a tag counts as viewing it, so
-        # keep the unviewed markers through the reload.
+        # re-added tag, or a newly captioned one), which must not count as
+        # viewing that tag, so keep the unviewed markers through the reload.
+        shown_before = self._shown_tags()
+        selected_before = set(self.selected_tags())
         self._keep_unviewed_markers = True
         try:
             self._reload_image_tags_if_changed(first_changed_index,
@@ -1910,6 +1924,13 @@ class ImageTagsEditor(QDockWidget):
         finally:
             self._keep_unviewed_markers = False
         self._sync_unviewed_markers()
+        # But a tag that was already shown and that the cursor moved onto
+        # (e.g. the next tag after deleting the selected one) is now in view
+        # under the cursor, so it counts as viewed.
+        moved_onto = ((set(self.selected_tags()) - selected_before)
+                      & shown_before)
+        if moved_onto:
+            self._on_unviewed_tags_viewed(sorted(moved_onto))
 
     def _reload_image_tags_if_changed(self, first_changed_index: QModelIndex,
                                       last_changed_index: QModelIndex):
