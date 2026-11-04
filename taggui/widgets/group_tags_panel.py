@@ -666,20 +666,27 @@ class GroupTagsPanel(QWidget):
 
     def _apply_renames(self, renames: dict[str, list[str]],
                        present: set[str]) -> set[str]:
-        """Give each newly appeared replacement of a renamed tag the old tag's
-        slot (several replacements are placed together, in order, before the
-        next tag). A replacement that was already shown (the rename merged into
-        it) keeps its own slot. The old tag keeps its slot too, so an undo
-        brings it back in place. Returns the tags given a slot."""
+        """Give each replacement of a renamed tag the old tag's slot (several
+        replacements are placed together, in order, before the next tag). This
+        includes a replacement that was already shown on only some of the
+        images (the rename merged into it): it moves to the old tag's place. A
+        replacement that was already on every image keeps its own slot. The
+        old tag keeps its slot too, so an undo brings it back in place.
+        Returns the tags given a slot."""
         placed: set[str] = set()
+        prev_counts = dict(self._rows_full)
         old_tags = sorted((tag for tag in renames
                            if tag in self._present_prev
                            and tag in self._slot_of),
                           key=lambda tag: self._slot_of[tag])
+        # A target that is itself renamed by this change (e.g. a swap) keeps its
+        # own slot.
         for old_tag in old_tags:
             new_tags = [tag for tag in dict.fromkeys(renames[old_tag])
-                        if tag in present and tag not in self._present_prev
-                        and tag not in placed]
+                        if tag in present and tag not in placed
+                        and (tag not in self._present_prev
+                             or (tag not in renames
+                                 and prev_counts.get(tag, 0) < self._total))]
             if not new_tags:
                 continue
             base = self._slot_of[old_tag]
