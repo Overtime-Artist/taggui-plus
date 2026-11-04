@@ -1998,11 +1998,17 @@ class MainWindow(QMainWindow):
         # Apply the new filter.
         self.proxy_image_list_model.invalidateFilter()
         if filter_ is None:
-            all_tags_list_selection_model = (self.all_tags_editor
-                                             .all_tags_list.selectionModel())
-            all_tags_list_selection_model.clearSelection()
-            # Clear the current index.
-            self.all_tags_editor.all_tags_list.setCurrentIndex(QModelIndex())
+            all_tags_list = self.all_tags_editor.all_tags_list
+            # Clearing the All Tags selection here must not count as the user
+            # deselecting the last tag, which would clear the filter text the
+            # user is typing (an unfinished filter is briefly invalid).
+            all_tags_list.suppress_filter_on_selection_change = True
+            try:
+                all_tags_list.selectionModel().clearSelection()
+                # Clear the current index.
+                all_tags_list.setCurrentIndex(QModelIndex())
+            finally:
+                all_tags_list.suppress_filter_on_selection_change = False
             # Select the previously selected image in the unfiltered image
             # list.
             select_index = self._find_proxy_row_of_image(
