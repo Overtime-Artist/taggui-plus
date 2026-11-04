@@ -258,6 +258,9 @@ class HistoryItem:
     # undoing/redoing it puts every tag back exactly where it was. Set by the
     # Image Tags pane; None when the change was not made in the grid view.
     group_order_state: object = None
+    # Completion flags (path -> is_complete) to restore, for marking images
+    # complete/incomplete. Empty for caption changes.
+    completion: dict[Path, bool] = field(default_factory=dict)
 
 
 MAX_LISTED_WRITE_ERRORS = 10
@@ -1230,12 +1233,15 @@ class ImageListModel(QAbstractListModel):
             image.path: (image.tags.copy(), image.natural_language_prompt)
             for image in self.images
         }
+        self._push_history_item(HistoryItem(action_name, captions,
+                                            should_ask_for_confirmation))
+
+    def _push_history_item(self, history_item: HistoryItem):
         dropped_item = (self.undo_stack[0]
                         if len(self.undo_stack) == self.undo_stack.maxlen
                         else None)
         self._last_undo_push = (dropped_item, self.redo_stack.copy())
-        self.newest_history_item = HistoryItem(action_name, captions,
-                                               should_ask_for_confirmation)
+        self.newest_history_item = history_item
         self.undo_stack.append(self.newest_history_item)
         self.redo_stack.clear()
         self.update_undo_and_redo_actions_requested.emit()
@@ -1389,9 +1395,12 @@ class ImageListModel(QAbstractListModel):
             image.natural_language_prompt = history_natural_language_prompt
             self.write_image_tags_to_disk(image)
             changed_rows.append(row)
+        reverse_completion = self._restore_history_completion(
+            history_item.completion, path_to_row)
         reverse_item = HistoryItem(
             history_item.action_name, reverse_captions,
-            history_item.should_ask_for_confirmation)
+            history_item.should_ask_for_confirmation,
+            completion=reverse_completion)
         destination_stack.append(reverse_item)
         self.forget_history_for_paths(skipped_paths)
         if changed_rows:
@@ -1414,6 +1423,34 @@ class ImageListModel(QAbstractListModel):
                 f'{"was" if skipped_count == 1 else "were"} skipped because '
                 f'{"its caption was" if skipped_count == 1 else "their captions were"} '
                 f'changed outside TagGUI Plus.')
+
+    def _restore_history_completion(self, completion: dict[Path, bool],
+                                    path_to_row: dict[Path, int]
+                                    ) -> dict[Path, bool]:
+        """Apply the completion flags saved in a history item and return the
+        flags they replaced (for the reverse undo/redo step)."""
+        reverse_completion = {}
+        changed_rows = []
+        completion_store = get_completion_store()
+        for path, is_complete in completion.items():
+            row = path_to_row.get(path)
+            if row is None:
+                continue
+            image = self.images[row]
+            reverse_completion[path] = image.is_complete
+            if image.is_complete == is_complete:
+                continue
+            image.is_complete = is_complete
+            completion_store.set_complete(path, is_complete)
+            changed_rows.append(row)
+        if changed_rows:
+            completion_store.save()
+            for row in changed_rows:
+                index = self.index(row, 0)
+                self.dataChanged.emit(index, index,
+                                      [Qt.ItemDataRole.DecorationRole,
+                                       Qt.ItemDataRole.UserRole])
+        return reverse_completion
 
     @Slot()
     def undo(self):
@@ -1896,21 +1933,31 @@ class ImageListModel(QAbstractListModel):
 
     def set_images_complete(self, image_indices: list[QModelIndex],
                             is_complete: bool):
-        """Mark the given images as complete or incomplete and persist the
-        change to the completion store. Emits dataChanged so the completion
-        icon repaints."""
+        """Mark the given images as complete or incomplete, persist the change
+        to the completion store and add it to the undo history. Emits
+        dataChanged so the completion icon repaints."""
         completion_store = get_completion_store()
         changed_rows = []
+        previous_completion = {}
         for image_index in image_indices:
             image: Image = self.data(image_index, Qt.ItemDataRole.UserRole)
-            if image.is_complete == is_complete:
+            if image is None or image.is_complete == is_complete:
                 continue
+            previous_completion[image.path] = image.is_complete
             image.is_complete = is_complete
             completion_store.set_complete(image.path, is_complete)
             changed_rows.append(image_index.row())
         if not changed_rows:
             return
         completion_store.save()
+        image_word = pluralize('Image', len(changed_rows))
+        action_name = (f'Mark {image_word} as Complete' if is_complete
+                       else f'Mark {image_word} as Incomplete')
+        self._push_history_item(HistoryItem(
+            action_name, captions={}, should_ask_for_confirmation=False,
+            completion=previous_completion))
+        # No tags change, so the grid view has no tag order to save with it.
+        self.newest_history_item = None
         for row in changed_rows:
             index = self.index(row, 0)
             self.dataChanged.emit(index, index,

@@ -194,6 +194,8 @@ class MainWindow(QMainWindow):
         self._focus_mode_restore_min_size = False
         # (dock, line edit) to focus once a focus mode exit finishes.
         self._focus_mode_exit_focus_target = None
+        # Widget to refocus once captioning started with Alt+C in focus mode.
+        self._focus_mode_caption_return_widget = None
         # Guard so the layout tracking below ignores the window-state changes
         # that happen while the app is still starting up and restoring itself.
         self._dock_state_tracking_ready = False
@@ -365,7 +367,7 @@ class MainWindow(QMainWindow):
         self.focus_caption_button_shortcut = QShortcut(
             QKeySequence('Alt+C'), self)
         self.focus_caption_button_shortcut.activated.connect(
-            self.auto_captioner.focus_start_cancel_button)
+            self.focus_auto_caption_button)
         self.go_to_previous_image_shortcut = QShortcut(
             QKeySequence('Ctrl+Up'), self)
         self.go_to_previous_image_shortcut.activated.connect(
@@ -621,6 +623,7 @@ class MainWindow(QMainWindow):
                                   self.windowState())
         self._focus_mode_pre_size = self.size()
         self._focus_mode_exit_focus_target = None
+        self._focus_mode_caption_return_widget = None
         # Pause the per-mode (maximized/normal) layout tracking so going full
         # screen neither re-applies the saved maximized layout (which would
         # re-show the hidden panes) nor records the focus layout.
@@ -676,15 +679,41 @@ class MainWindow(QMainWindow):
         self._focus_dock_box(self.all_tags_editor,
                              self.all_tags_editor.filter_line_edit)
 
+    def focus_auto_caption_button(self):
+        # In focus mode, remember where focus was (e.g. a selected tag) so it
+        # can return there once captioning starts.
+        if self.is_focus_mode():
+            focus_widget = QApplication.focusWidget()
+            if (focus_widget is not None
+                    and not self.auto_captioner.isAncestorOf(focus_widget)):
+                self._focus_mode_caption_return_widget = focus_widget
+        self.auto_captioner.focus_start_cancel_button()
+
     def _on_captioning_started(self):
         # Alt+C focuses the (hidden) Start button, which becomes Cancel once
         # captioning starts; move focus off it so a stray Enter or Space
-        # can't cancel captioning invisibly.
+        # can't cancel captioning invisibly. Return it to where it was before
+        # Alt+C, or to the Image Tags pane.
+        return_widget = self._focus_mode_caption_return_widget
+        self._focus_mode_caption_return_widget = None
         if self.is_focus_mode():
             focus_widget = QApplication.focusWidget()
             if (focus_widget is None
                     or self.auto_captioner.isAncestorOf(focus_widget)):
-                self._focus_image_tags_pane()
+                if self._can_return_focus_to(return_widget):
+                    return_widget.setFocus(Qt.FocusReason.OtherFocusReason)
+                else:
+                    self._focus_image_tags_pane()
+
+    def _can_return_focus_to(self, widget) -> bool:
+        if widget is None:
+            return False
+        try:
+            return (widget.window() is self and widget.isVisible()
+                    and widget.isEnabled())
+        except RuntimeError:
+            # The widget has been deleted.
+            return False
 
     def _exit_focus_mode(self):
         geometry, dock_state, window_state = self._focus_mode_saved
@@ -1507,8 +1536,7 @@ class MainWindow(QMainWindow):
             'focus_image_tags_list': [
                 self.image_tags_editor.focus_tags_list],
             'focus_all_tags_search': [self.focus_all_tags_search],
-            'focus_auto_caption_button': [
-                self.auto_captioner.focus_start_cancel_button],
+            'focus_auto_caption_button': [self.focus_auto_caption_button],
             'go_to_previous_image': [self.image_list.go_to_previous_image],
             'go_to_next_image': [self.image_list.go_to_next_image],
             'jump_to_first_untagged_image': [
