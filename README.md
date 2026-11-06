@@ -993,7 +993,7 @@ shortcuts`**; the defaults are listed below.
 | Previous / next image | `Ctrl`+`Up` / `Ctrl`+`Down` |
 | Jump to first untagged / incomplete image | `Ctrl`+`J` / `Ctrl`+`Shift`+`J` |
 | Toggle `Natural language mode` / `Current image only` (mode button) | `Ctrl`+`Space` |
-| Focus mode (also in the `View` menu): full screen showing only the image preview, with an image-count overlay, and the Image Tags pane; `Esc` also exits, and `Alt+F` / `Alt+S` exit before focusing their box; after starting auto-captioning with `Alt+C`, `Enter`, focus returns to where it was (e.g. the selected tag) | `F11` |
+| Focus mode (also in the `View` menu): full screen showing only the image preview, with an image-count overlay, and the Image Tags pane; `Esc` also exits, and `Alt+F` / `Alt+S` exit before focusing their box; after starting auto-captioning with `Alt+C`, `Enter`, focus returns to where it was (e.g. the selected tag); leaving focus mode also keeps focus where it was | `F11` |
 
 ### Focus shortcuts
 
