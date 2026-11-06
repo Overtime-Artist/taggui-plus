@@ -186,6 +186,7 @@ class MainWindow(QMainWindow):
         # entered, or None when focus mode is off. Restored on exit and saved
         # instead of the focus layout if the app is closed in focus mode.
         self._focus_mode_saved = None
+        self._focus_mode_exit_return_widget = None
         self._focus_mode_tracking_was_ready = False
         # Images pane actions also attached to the main window while focus
         # mode hides that pane (Qt ignores shortcuts of hidden widgets).
@@ -718,6 +719,12 @@ class MainWindow(QMainWindow):
     def _exit_focus_mode(self):
         geometry, dock_state, window_state = self._focus_mode_saved
         self._focus_mode_saved = None
+        # Restoring the panel layout drops keyboard focus, so remember where
+        # it was (e.g. a selected tag) and put it back afterwards.
+        focus_widget = QApplication.focusWidget()
+        self._focus_mode_exit_return_widget = (
+            focus_widget if focus_widget is not None
+            and self.isAncestorOf(focus_widget) else None)
         self.image_viewer.set_focus_overlay_enabled(False)
         for action in self._focus_mode_extra_actions:
             self.removeAction(action)
@@ -739,6 +746,7 @@ class MainWindow(QMainWindow):
             self.showNormal()
             self.restoreGeometry(geometry)
         self.restoreState(dock_state)
+        self._return_focus_after_exit()
         # Re-apply the layout once the window has finished resizing back
         # (the resize can squash the panels), then resume layout tracking.
         QTimer.singleShot(
@@ -761,9 +769,20 @@ class MainWindow(QMainWindow):
         target = self._focus_mode_exit_focus_target
         self._focus_mode_exit_focus_target = None
         if target is not None:
+            self._focus_mode_exit_return_widget = None
             dock, line_edit = target
             dock.raise_()
             line_edit.setFocus()
+        elif QApplication.focusWidget() is None:
+            # The second restoreState() above dropped focus again; only put
+            # it back if the user hasn't focused something else meanwhile.
+            self._return_focus_after_exit()
+        self._focus_mode_exit_return_widget = None
+
+    def _return_focus_after_exit(self):
+        widget = getattr(self, '_focus_mode_exit_return_widget', None)
+        if self._can_return_focus_to(widget):
+            widget.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def keyPressEvent(self, event):
         # Only reached when the focused widget didn't use the key, so Esc
