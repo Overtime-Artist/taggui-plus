@@ -1953,6 +1953,20 @@ class ImageTagsEditor(QDockWidget):
         if moved_onto:
             self._on_unviewed_tags_viewed(sorted(moved_onto))
 
+    @staticmethod
+    def _row_of_previous_tag(old_tags: list[str], new_tags: list[str],
+                             previous_row: int) -> int:
+        """The row to keep selected after the tag list changed: the same tag,
+        even if tags were added or removed above it, or else the row that took
+        its place (e.g. the tag was removed or renamed)."""
+        if previous_row < len(old_tags):
+            tag = old_tags[previous_row]
+            rows = [row for row, new_tag in enumerate(new_tags)
+                    if new_tag == tag]
+            if rows:
+                return min(rows, key=lambda row: abs(row - previous_row))
+        return min(previous_row, len(new_tags) - 1)
+
     def _reload_image_tags_if_changed(self, first_changed_index: QModelIndex,
                                       last_changed_index: QModelIndex):
         if self._group_mode:
@@ -2006,7 +2020,8 @@ class ImageTagsEditor(QDockWidget):
                 # into view so the undo/redo's effect is visible.
                 row_to_scroll = added_rows[-1]
             if row_to_select is None and previous_row >= 0:
-                row_to_select = min(previous_row, new_row_count - 1)
+                row_to_select = self._row_of_previous_tag(
+                    old_tags, new_tags, previous_row)
             if row_to_select is not None:
                 self.image_tags_list.select_tag(row_to_select)
                 if had_focus:
