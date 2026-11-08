@@ -1978,9 +1978,15 @@ class ImageTagsEditor(QDockWidget):
             previous_row = self.image_tags_list.currentIndex().row()
             had_focus = self.image_tags_list.hasFocus()
             old_tags = self.image_tag_list_model.stringList()
+            scroll_bar = self.image_tags_list.verticalScrollBar()
+            previous_scroll = scroll_bar.value()
             proxy_image_index = self.proxy_image_list_model.mapFromSource(
                 self.image_index)
             self.load_image_tags(proxy_image_index, save_current_prompt=False)
+            # Reloading the list resets its scroll position. Put it back so
+            # bringing the selected tag into view only scrolls if it is out of
+            # view, and then only as far as needed.
+            scroll_bar.setValue(previous_scroll)
             new_tags = self.image_tag_list_model.stringList()
             new_row_count = len(new_tags)
             if new_row_count == 0:
