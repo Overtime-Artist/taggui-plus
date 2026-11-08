@@ -433,9 +433,20 @@ class TagInputBox(QLineEdit):
                 existing = set(self.image_tag_list_model.stringList())
                 new_implied = [t for t in implied if t not in existing]
                 if new_implied:
+                    # Replacing the list clears the tag selection, so put it
+                    # back on the same tag (the added one, or the user's tag
+                    # if new tags aren't auto-selected) so the arrow keys keep
+                    # working from there.
+                    tags_list = self.image_tags_list
+                    selected_row = (tags_list.currentIndex().row()
+                                    if tags_list is not None else -1)
                     current = self.image_tag_list_model.stringList()
                     self.image_tag_list_model.setStringList(current + new_implied)
                     self.add_new_tags_to_library(new_implied)
+                    if selected_row >= 0:
+                        tags_list.select_tag(selected_row)
+                        if not self._new_tag_auto_select_disabled():
+                            tags_list.scrollToBottom()
             self.flash_added_feedback()
             return
         # Reject a no-op add (every target image already contains every tag)
@@ -1942,6 +1953,20 @@ class ImageTagsEditor(QDockWidget):
         if moved_onto:
             self._on_unviewed_tags_viewed(sorted(moved_onto))
 
+    @staticmethod
+    def _row_of_previous_tag(old_tags: list[str], new_tags: list[str],
+                             previous_row: int) -> int:
+        """The row to keep selected after the tag list changed: the same tag,
+        even if tags were added or removed above it, or else the row that took
+        its place (e.g. the tag was removed or renamed)."""
+        if previous_row < len(old_tags):
+            tag = old_tags[previous_row]
+            rows = [row for row, new_tag in enumerate(new_tags)
+                    if new_tag == tag]
+            if rows:
+                return min(rows, key=lambda row: abs(row - previous_row))
+        return min(previous_row, len(new_tags) - 1)
+
     def _reload_image_tags_if_changed(self, first_changed_index: QModelIndex,
                                       last_changed_index: QModelIndex):
         if self._group_mode:
@@ -1967,9 +1992,15 @@ class ImageTagsEditor(QDockWidget):
             previous_row = self.image_tags_list.currentIndex().row()
             had_focus = self.image_tags_list.hasFocus()
             old_tags = self.image_tag_list_model.stringList()
+            scroll_bar = self.image_tags_list.verticalScrollBar()
+            previous_scroll = scroll_bar.value()
             proxy_image_index = self.proxy_image_list_model.mapFromSource(
                 self.image_index)
             self.load_image_tags(proxy_image_index, save_current_prompt=False)
+            # Reloading the list resets its scroll position. Put it back so
+            # bringing the selected tag into view only scrolls if it is out of
+            # view, and then only as far as needed.
+            scroll_bar.setValue(previous_scroll)
             new_tags = self.image_tag_list_model.stringList()
             new_row_count = len(new_tags)
             if new_row_count == 0:
@@ -1989,7 +2020,8 @@ class ImageTagsEditor(QDockWidget):
                 # into view so the undo/redo's effect is visible.
                 row_to_scroll = added_rows[-1]
             if row_to_select is None and previous_row >= 0:
-                row_to_select = min(previous_row, new_row_count - 1)
+                row_to_select = self._row_of_previous_tag(
+                    old_tags, new_tags, previous_row)
             if row_to_select is not None:
                 self.image_tags_list.select_tag(row_to_select)
                 if had_focus:
