@@ -433,9 +433,20 @@ class TagInputBox(QLineEdit):
                 existing = set(self.image_tag_list_model.stringList())
                 new_implied = [t for t in implied if t not in existing]
                 if new_implied:
+                    # Replacing the list clears the tag selection, so put it
+                    # back on the same tag (the added one, or the user's tag
+                    # if new tags aren't auto-selected) so the arrow keys keep
+                    # working from there.
+                    tags_list = self.image_tags_list
+                    selected_row = (tags_list.currentIndex().row()
+                                    if tags_list is not None else -1)
                     current = self.image_tag_list_model.stringList()
                     self.image_tag_list_model.setStringList(current + new_implied)
                     self.add_new_tags_to_library(new_implied)
+                    if selected_row >= 0:
+                        tags_list.select_tag(selected_row)
+                        if not self._new_tag_auto_select_disabled():
+                            tags_list.scrollToBottom()
             self.flash_added_feedback()
             return
         # Reject a no-op add (every target image already contains every tag)
