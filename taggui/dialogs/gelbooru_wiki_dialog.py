@@ -147,8 +147,6 @@ def normalize_now_viewing_heading(html_fragment: str) -> str:
     return WIKI_VIEW_TITLE_PATTERN.sub(replace_heading, html_fragment)
 
 
-
-
 def strip_tag_type_line(html_fragment: str) -> tuple[str, str]:
     """Remove the "Tag type: X" line from a wiki body; returns
     ``(body, tag type)`` with the type in the colour-key form ('' if absent)."""
@@ -158,6 +156,40 @@ def strip_tag_type_line(html_fragment: str) -> tuple[str, str]:
     tag_type = AUTOCOMPLETE_TAG_TYPES.get(match.group(1).strip().lower(), '')
     return (html_fragment[:match.start()] + html_fragment[match.end():],
             tag_type)
+
+
+WIKI_LINE_BREAK_PATTERN = r'<br\s*/?>'
+WIKI_PARAGRAPH_BREAK_PATTERN = re.compile(
+    rf'(?:\s*{WIKI_LINE_BREAK_PATTERN}\s*){{2,}}', re.IGNORECASE)
+ALIAS_LINE_PATTERN = re.compile(
+    rf'^\s*([^<]+?)\s*(?:{WIKI_LINE_BREAK_PATTERN}\s*)+', re.IGNORECASE)
+NOT_ALIAS_CHARACTERS = set('.!?,;:()"\'。、！？：；（）')
+
+
+def split_alias_line(body_html: str) -> tuple[list[str], str]:
+    """Gelbooru wikis often open with an unmarked line of other names
+    (e.g. "女の子 少女 girl"). Returns ``(names, remaining body)``; the names
+    are only taken when the line is plain text with no sentence punctuation
+    and at least one non-ASCII character, so a short English description is
+    never mistaken for aliases."""
+    match = ALIAS_LINE_PATTERN.match(body_html)
+    if match is None:
+        return [], body_html
+    line = html.unescape(match.group(1)).strip()
+    if (not line or line.isascii()
+            or any(character in NOT_ALIAS_CHARACTERS for character in line)):
+        return [], body_html
+    return line.split(), body_html[match.end():]
+
+
+def paragraphs_from_line_breaks(body_html: str) -> str:
+    """Turn Gelbooru's ``<br /><br />`` paragraph gaps into paragraphs with
+    the same spacing as the Danbooru wiki."""
+    paragraphs = [part.strip() for part in
+                  WIKI_PARAGRAPH_BREAK_PATTERN.split(body_html) if part.strip()]
+    return ''.join(
+        f'<p style="margin: 0 0 {"0" if index == len(paragraphs) - 1 else "0.9em"} 0;">'
+        f'{paragraph}</p>' for index, paragraph in enumerate(paragraphs))
 
 
 def gelbooru_link_target(url_text: str):
@@ -846,10 +878,14 @@ class GelbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         body_html = re.sub(r'(?:<br\s*/?>\s*|&nbsp;\s*)+$', '', body_html.strip(),
                            flags=re.IGNORECASE)
         body_html = self._color_body_tag_links(body_html)
+        other_names, body_html = split_alias_line(body_html)
+        other_names_html = self._build_chips_html(other_names, self._is_dark())
         return (
             f'<h1 style="font-size: 1.5em; color: {title_color}; '
             f'margin: 0 0 4px 0;">{html.escape(title.replace("_", " "))}</h1>'
-            f'<div style="line-height: 1.4;">{body_html}</div>'
+            f'{other_names_html}'
+            f'<div style="line-height: 1.2; margin-top: 4px;">'
+            f'{paragraphs_from_line_breaks(body_html)}</div>'
             f'{self._build_wiki_posts_html()}')
 
     def _build_wiki_posts_html(self) -> str:

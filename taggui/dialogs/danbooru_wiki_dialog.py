@@ -5,11 +5,9 @@ from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlencode
 
-from PySide6.QtCore import (QBuffer, QByteArray, QIODevice,
-                            QThread, Qt, QTimer, QUrl, Signal, Slot)
-from PySide6.QtGui import (QColor, QDesktopServices, QFontMetrics,
-                           QPainter, QPainterPath, QPixmap,
-                           QStandardItem, QStandardItemModel)
+from PySide6.QtCore import QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import (QDesktopServices, QStandardItem,
+                           QStandardItemModel)
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel,
                                QCompleter, QLineEdit, QPushButton, QTextBrowser,
                                QVBoxLayout)
@@ -1138,74 +1136,8 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         internal_url = f'{WIKI_INTERNAL_LINK_PREFIX}{quote(normalized)}'
         return f'<a href="{internal_url}">{html.escape(label)}</a>'
 
-    def _render_chip_data_url(self, text: str, is_dark: bool) -> tuple:
-        """Render a single synonym chip (rounded rectangle + text) to a PNG
-        data URL. QTextBrowser ignores padding/border-radius on inline HTML,
-        so we draw the chip as an image to get true rounded corners. Returns
-        (data_url, logical_width, logical_height)."""
-        scale = max(1.0, self.devicePixelRatioF())
-        font = self.content_browser.font()
-        metrics = QFontMetrics(font)
-        padding_x = 8
-        padding_y = 3
-        text_width = metrics.horizontalAdvance(text)
-        text_height = metrics.height()
-        logical_width = text_width + padding_x * 2
-        logical_height = text_height + padding_y * 2
-
-        pixmap = QPixmap(round(logical_width * scale), round(logical_height * scale))
-        pixmap.setDevicePixelRatio(scale)
-        pixmap.fill(Qt.GlobalColor.transparent)
-
-        background = QColor('#3a3f4b' if is_dark else '#eef1f5')
-        text_color = QColor('#d7dae0' if is_dark else '#333333')
-
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setFont(font)
-        path = QPainterPath()
-        path.addRoundedRect(0.5, 0.5, logical_width - 1.0,
-                            logical_height - 1.0, 5.0, 5.0)
-        painter.fillPath(path, background)
-        painter.setPen(text_color)
-        painter.drawText(0, 0, logical_width, logical_height,
-                         int(Qt.AlignmentFlag.AlignCenter), text)
-        painter.end()
-
-        byte_array = QByteArray()
-        buffer = QBuffer(byte_array)
-        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-        pixmap.save(buffer, 'PNG')
-        buffer.close()
-        encoded = bytes(byte_array.toBase64()).decode('ascii')
-        return (f'data:image/png;base64,{encoded}',
-                logical_width, logical_height)
-
     def _build_other_names_html(self, is_dark: bool) -> str:
-        names = [str(name).strip() for name in (self._stored_other_names or [])
-                 if str(name).strip()]
-        if not names:
-            return ''
-        # All chips share the same height (same font), so compute a tight,
-        # pixel-based line-height: just the chip height plus a small gap so that
-        # wrapped rows sit as close together as the inline gap between chips.
-        metrics = QFontMetrics(self.content_browser.font())
-        chip_pixel_height = metrics.height() + 6
-        row_gap = 5
-        line_height = chip_pixel_height + row_gap
-        chips = []
-        for name in names:
-            label = name.replace('_', ' ')
-            data_url, chip_width, chip_height = self._render_chip_data_url(
-                label, is_dark)
-            # Let the browser copy this chip image as its text.
-            self.content_browser.register_image_text(data_url, label)
-            chips.append(
-                f'<img src="{data_url}" width="{chip_width}" '
-                f'height="{chip_height}" '
-                f'style="vertical-align: middle;">')
-        return (f'<div style="margin: 2px 0 3px 0; line-height: {line_height}px;">'
-                f'{"&nbsp;".join(chips)}</div>')
+        return self._build_chips_html(self._stored_other_names, is_dark)
 
     def _build_deprecated_note_html(self, is_dark: bool) -> str:
         """The small "This tag is deprecated..." footnote, mirroring the notice
