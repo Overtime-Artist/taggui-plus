@@ -475,6 +475,11 @@ class GroupTagsPanel(QWidget):
         # top (mirrors the normal Image Tags list). One-shot: set right before
         # an edit is requested, consumed by the next refresh.
         self._pending_anchor: int | None = None
+        # One-shot, set with ``_pending_anchor`` by add/remove actions that
+        # usually keep the selected tags (grid cell menu, panel add/remove
+        # menu): reselect those tags by name, falling back to the anchor row
+        # only when none of them is left.
+        self._pending_keep_selection = False
         # Stable display order for the tag list. Every tag seen is assigned a
         # permanent slot number the first time it appears; the list is always
         # shown sorted by that slot. Slots are never pruned, so a tag that
@@ -577,7 +582,8 @@ class GroupTagsPanel(QWidget):
         # model reset below, mirroring the normal Image Tags list. Panel edits
         # (delete/rename/add) instead restore the cursor by row via the pending
         # anchor, so skip name-based preservation for those.
-        preserve = same_selection and self._pending_anchor is None
+        preserve = same_selection and (self._pending_anchor is None
+                                       or self._pending_keep_selection)
         prev_tags = self.tag_list.selected_tags() if preserve else []
         # Assign / keep permanent slots (see _slot_of docs in __init__).
         if not same_selection:
@@ -717,6 +723,7 @@ class GroupTagsPanel(QWidget):
             wanted = self._pending_select_tags
             self._pending_select_tags = []
             self._pending_anchor = None
+            self._pending_keep_selection = False
             self._reselect_tags(self.tag_list, displayed_tags, wanted)
             self.partial_focus_changed.emit(self._selected_difference_tags())
             return
@@ -725,8 +732,10 @@ class GroupTagsPanel(QWidget):
         # (consistent with the normal Image Tags list).
         self._restore_anchor(self.tag_list, self._model, self._pending_anchor)
         self._pending_anchor = None
+        self._pending_keep_selection = False
         # For external edits (or a filter toggle), reselect the previously
-        # selected tags by name so the user's selection is maintained.
+        # selected tags by name so the user's selection is maintained. This
+        # replaces the anchor row restored above if any of them is left.
         if prev_tags:
             self._reselect_tags(self.tag_list, displayed_tags, prev_tags)
         # Honor "Do not auto-select newly added tags" on undo/redo: don't move
@@ -943,10 +952,12 @@ class GroupTagsPanel(QWidget):
         """Stash the tag list's cursor row so it survives the next refresh.
 
         Used before a grid cell context-menu add/remove so the Image Tags pane
-        keeps its position after the edit's model reset.
+        keeps its selected tags (or, if none is left, its position) after the
+        edit's model reset.
         """
         if self.tag_list.selected_tags():
             self.remember_anchor_for_add(self.tag_list)
+            self._pending_keep_selection = True
 
     def selected_tag_for_wiki(self) -> str:
         """The single tag the wiki shortcut should look up from this panel.
@@ -1089,8 +1100,10 @@ class GroupTagsPanel(QWidget):
         if chosen in category_actions:
             self._assign_category(category_tags, category_actions[chosen])
             return
-        # Preserve the cursor position across the refresh the edit triggers.
+        # Preserve the selected tags (or the cursor position, if none is left)
+        # across the refresh the edit triggers.
         self._pending_anchor = self._anchor_row(self.tag_list)
+        self._pending_keep_selection = True
         if chosen == add_all_action:
             self.add_to_all_requested.emit(tags)
         elif chosen == add_current_action:
@@ -1101,3 +1114,4 @@ class GroupTagsPanel(QWidget):
             self.remove_from_current_requested.emit(tags)
         # Clear if the edit was a no-op (no refresh consumed the anchor).
         self._pending_anchor = None
+        self._pending_keep_selection = False
