@@ -525,6 +525,20 @@ class TagLibraryDialog(QDialog):
         self.gelbooru_wiki_action.triggered.connect(self._request_gelbooru_wiki)
         self.addAction(self.gelbooru_wiki_action)
 
+    def keyPressEvent(self, event):
+        # The buttons are not auto-default (so Enter in a text box never
+        # presses one), which means a focused button ignores Enter. Press it
+        # here instead, only when the button itself has keyboard focus.
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            focused = self.focusWidget()
+            if (isinstance(focused, QPushButton) and focused.isEnabled()
+                    and focused.isVisible()):
+                if not event.isAutoRepeat():
+                    focused.click()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def set_autocomplete_enabled(self, enabled: bool):
         """Follow the "Show tag autocomplete suggestions" setting."""
         for line_edit in (self.new_canonical_input, self.implication_tag_input,
