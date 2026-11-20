@@ -97,6 +97,15 @@ SPOILER_PATTERN = re.compile(r'\[spoiler\](.*?)\[/spoiler\]',
 # is shielded from the other inline formatting patterns (see
 # apply_inline_formatting_tags).
 CODE_PATTERN = re.compile(r'\[code\](.*?)\[/code\]', re.IGNORECASE | re.DOTALL)
+# DText translation notes used inline, e.g. a thumbnail caption
+# "[[tag]] [tn]| note[/tn]" (a [tn] that starts a line is a block note).
+INLINE_TN_PATTERN = re.compile(r'\[tn\](.*?)\[/tn\]', re.IGNORECASE | re.DOTALL)
+# DText tables: [table] [thead]/[tbody] [tr] [th]/[td] ... [/table].
+TABLE_ROW_PATTERN = re.compile(r'\[tr\](.*?)\[/tr\]', re.IGNORECASE | re.DOTALL)
+TABLE_CELL_PATTERN = re.compile(
+    r'\[(th|td)((?:\s+[^\]]*)?)\](.*?)\[/\1\]', re.IGNORECASE | re.DOTALL)
+TABLE_CELL_ATTRIBUTE_PATTERN = re.compile(
+    r'(colspan|rowspan|align)\s*=\s*"?([A-Za-z0-9]+)"?', re.IGNORECASE)
 # Anchor style attribute inside a spoiler, so links are hidden by the black bar
 # too (Qt would otherwise draw them in the visible link colour).
 SPOILER_ANCHOR_STYLE_PATTERN = re.compile(r'(<a\b[^>]*?)\s+style="[^"]*"',
@@ -1897,6 +1906,12 @@ class DanbooruWikiDialog(BaseWikiDialog):
                 formatted_text
             )
         formatted_text = self.apply_spoiler_tags(formatted_text)
+        formatted_text = INLINE_TN_PATTERN.sub(
+            lambda match: (
+                f'<span style="font-size: 0.85em; '
+                f'color: {self._muted_note_color()};">'
+                f'{match.group(1).strip()}</span>'),
+            formatted_text)
         for index, rendered in enumerate(code_placeholders):
             formatted_text = formatted_text.replace(
                 f'\x00CODE{index}\x00', rendered)
@@ -1952,6 +1967,47 @@ class DanbooruWikiDialog(BaseWikiDialog):
             'padding: 0 0 0 10px;">'
             f'{inner_html}</td></tr></table>'
         )
+
+    def _build_table_html(self, table_dtext: str) -> str:
+        """Render a DText [table] like Danbooru: bold headers over a strong
+        rule, thin lines between rows and alternate rows shaded. Qt rich text
+        draws per-cell borders reliably, so the rules are cell borders."""
+        rows_html = []
+        body_row_index = 0
+        for row_match in TABLE_ROW_PATTERN.finditer(table_dtext):
+            cells = list(TABLE_CELL_PATTERN.finditer(row_match.group(1)))
+            if not cells:
+                continue
+            is_header = all(cell.group(1).casefold() == 'th' for cell in cells)
+            if is_header:
+                cell_style = ('border-bottom: 2px solid palette(text); '
+                              'padding: 3px 24px 3px 6px; font-weight: bold; '
+                              'text-align: left;')
+            else:
+                shade = ('background-color: palette(alternate-base); '
+                         if body_row_index % 2 else '')
+                cell_style = (f'{shade}border-bottom: 1px solid palette(mid); '
+                              'padding: 3px 24px 3px 6px;')
+                body_row_index += 1
+            cells_html = []
+            for cell in cells:
+                tag = 'th' if cell.group(1).casefold() == 'th' else 'td'
+                attributes = ''
+                for name, value in TABLE_CELL_ATTRIBUTE_PATTERN.findall(
+                        cell.group(2) or ''):
+                    attributes += (f' {name.lower()}='
+                                   f'"{html.escape(value, quote=True)}"')
+                content = ' '.join(
+                    part.strip() for part in cell.group(3).splitlines()
+                    if part.strip())
+                cells_html.append(
+                    f'<{tag}{attributes} style="{cell_style}">'
+                    f'{self.linkify_inline_text(content)}</{tag}>')
+            rows_html.append(f'<tr>{"".join(cells_html)}</tr>')
+        if not rows_html:
+            return ''
+        return ('<table cellspacing="0" style="border-collapse: collapse; '
+                f'margin: 4px 0 16px 0;">{"".join(rows_html)}</table>')
 
     def build_post_thumbnail_html(self, post_id: str) -> str:
         post_data = self.post_details_by_id.get(post_id)
@@ -2070,6 +2126,23 @@ class DanbooruWikiDialog(BaseWikiDialog):
             # A stray closing tag with no matching opener: drop it silently
             # rather than printing the literal marker.
             if casefolded_line == '[/quote]':
+                continue
+
+            # DText tables: everything from [table] to [/table], usually one
+            # tag per line, rendered as a real table.
+            if casefolded_line.startswith('[table]'):
+                flush_thumbnails()
+                while html_lines and html_lines[-1] == '<br>':
+                    html_lines.pop()
+                scan_index = index
+                while (scan_index < len(lines) - 1 and '[/table]'
+                       not in lines[scan_index].casefold()):
+                    scan_index += 1
+                skip_until = scan_index + 1
+                html_lines.append(self._build_table_html(
+                    '\n'.join(lines[index:scan_index + 1])))
+                continue
+            if casefolded_line == '[/table]':
                 continue
 
             # DText translation notes: [tn]...[/tn]. Danbooru renders these as a
