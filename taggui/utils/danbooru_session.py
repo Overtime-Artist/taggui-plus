@@ -818,7 +818,7 @@ def _mark_auth_rejected(auth_header: str, danbooru_message: str):
         _api_key_problem = (
             f'Danbooru rejected your API key{detail}, so TagGUI Plus is '
             f'browsing without it. Check the user name and API key in '
-            f'Settings > Danbooru Account.')
+            f'Settings > Danbooru Wiki.')
     _log('the saved API key was rejected; continuing without it')
 
 

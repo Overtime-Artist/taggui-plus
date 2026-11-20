@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication,
 from models.tag_library_model import TagLibraryModel
 from utils.image import Image
 from utils.settings import DEFAULT_SETTINGS, get_settings, get_tag_separator
+from utils.wiki_access import DANBOORU, GELBOORU, is_wiki_enabled
 
 # Custom roles used by the tag model to carry the per-tag count and the total
 # number of selected images through to the delegate.
@@ -1078,6 +1079,8 @@ class GroupTagsPanel(QWidget):
             menu.addSeparator()
             view_danbooru_action = menu.addAction('View Danbooru Wiki')
             view_gelbooru_action = menu.addAction('View Gelbooru Wiki')
+            view_danbooru_action.setVisible(is_wiki_enabled(DANBOORU))
+            view_gelbooru_action.setVisible(is_wiki_enabled(GELBOORU))
             menu.addSeparator()
             category_actions, clear_action = self._add_category_actions(
                 menu, category_tags)

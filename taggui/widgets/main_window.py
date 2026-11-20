@@ -49,6 +49,7 @@ from utils.settings_export_import import (import_settings, load_settings_from_fi
                                           save_settings_to_file)
 from utils.shortcut_remover import ShortcutRemover
 from utils.utils import get_resource_path, pluralize
+from utils.wiki_access import DANBOORU, GELBOORU, is_wiki_enabled
 from widgets.all_tags_editor import AllTagsEditor
 from widgets.auto_captioner import AutoCaptioner
 from widgets.image_list import ImageList
@@ -307,6 +308,7 @@ class MainWindow(QMainWindow):
         self.open_danbooru_wiki_action = QAction('Danbooru Wiki...', parent=self)
         self.open_gelbooru_wiki_action = QAction('Gelbooru Wiki...', parent=self)
         self.create_menus()
+        self.apply_wiki_availability()
         self.app.installEventFilter(self)
 
         self.image_list_selection_model = (self.image_list.list_view
@@ -1261,6 +1263,8 @@ class MainWindow(QMainWindow):
         settings_dialog.autocomplete_changed.connect(self.refresh_autocomplete)
         settings_dialog.remove_app_data_requested.connect(
             self.quit_after_removing_app_data)
+        settings_dialog.wiki_availability_changed.connect(
+            self.apply_wiki_availability)
         # Settings that trigger a directory/model scan are applied once on
         # close (by diffing) rather than on every keystroke.
         old_file_formats = self.settings.value(
@@ -1655,6 +1659,15 @@ class MainWindow(QMainWindow):
         dialog.set_wiki_shortcuts(
             self.open_danbooru_wiki_action.shortcut(),
             self.open_gelbooru_wiki_action.shortcut())
+        dialog.set_wikis_enabled(is_wiki_enabled(DANBOORU),
+                                 is_wiki_enabled(GELBOORU))
+
+    @Slot()
+    def apply_wiki_availability(self):
+        """Show the wiki menu items and shortcuts only for enabled wikis."""
+        self.open_danbooru_wiki_action.setVisible(is_wiki_enabled(DANBOORU))
+        self.open_gelbooru_wiki_action.setVisible(is_wiki_enabled(GELBOORU))
+        self._apply_tag_library_dialog_shortcuts()
 
     @Slot()
     def show_keyboard_shortcuts_dialog(self, parent: QWidget | None = None):
@@ -1863,6 +1876,9 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def show_danbooru_wiki_dialog(self, tag: str = ''):
+        # Extra (secondary) shortcuts can still fire while the wiki is off.
+        if not is_wiki_enabled(DANBOORU):
+            return
         in_group_mode = self.image_tags_editor.is_group_mode()
         danbooru_wiki_dialog = DanbooruWikiDialog(
             self, tag if tag.strip() else '',
@@ -1885,6 +1901,8 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def show_gelbooru_wiki_dialog(self, tag: str = ''):
+        if not is_wiki_enabled(GELBOORU):
+            return
         in_group_mode = self.image_tags_editor.is_group_mode()
         gelbooru_wiki_dialog = GelbooruWikiDialog(
             self, tag if tag.strip() else '',

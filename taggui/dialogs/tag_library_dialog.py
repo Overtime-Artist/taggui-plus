@@ -25,6 +25,7 @@ from utils.settings import get_tag_separator, get_settings, DEFAULT_SETTINGS
 from utils.settings_widgets import FocusedScrollComboBox
 from utils.utils import get_confirmation_dialog_reply, list_with_and, pluralize
 from utils.tag_filter import TagFilterLineEdit
+from utils.wiki_access import DANBOORU, GELBOORU, is_wiki_enabled
 from widgets.tag_library_categories_editor import CategoryDialog
 from widgets.image_tags_editor import (CompleterModel, CompleterPopupList,
                                        TagCompleter)
@@ -530,6 +531,8 @@ class TagLibraryTableView(QTableView):
         menu.addSeparator()
         danbooru_action = menu.addAction('View Danbooru Wiki')
         gelbooru_action = menu.addAction('View Gelbooru Wiki')
+        danbooru_action.setVisible(is_wiki_enabled(DANBOORU))
+        gelbooru_action.setVisible(is_wiki_enabled(GELBOORU))
         menu.addSeparator()
         rename_action = menu.addAction('Rename Tag...')
 
@@ -712,6 +715,12 @@ class TagLibraryDialog(QDialog):
         window so these honor any custom shortcuts configured by the user."""
         self.danbooru_wiki_action.setShortcut(danbooru_shortcut)
         self.gelbooru_wiki_action.setShortcut(gelbooru_shortcut)
+
+    def set_wikis_enabled(self, danbooru_enabled: bool,
+                          gelbooru_enabled: bool):
+        """Follow the "Enable ... Wiki" settings for the wiki shortcuts."""
+        self.danbooru_wiki_action.setEnabled(danbooru_enabled)
+        self.gelbooru_wiki_action.setEnabled(gelbooru_enabled)
 
     def _selected_tag_for_wiki(self) -> str:
         """Return the tag the wiki keyboard shortcut should auto-search.

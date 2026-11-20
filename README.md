@@ -633,6 +633,14 @@ learn what a tag means and see related tags, then add it to your Tag Library, to
 the selected images, or — in the [grid view](#tagging-variant-images) — to just
 the current image.
 
+**Both wikis are off by default.** They show content from third-party sites,
+which may include NSFW material. To turn one on, open **`Settings` →
+`Danbooru Wiki`** (or **`Gelbooru Wiki`**), tick **Enable Danbooru Wiki** (or
+**Enable Gelbooru Wiki**), and choose **Enable** in the warning that appears.
+While a wiki is off, its menu items, right-click entries and shortcut are hidden.
+This switch is not included in settings exports, so importing settings never
+turns a wiki on.
+
 The **Danbooru Wiki** in particular does more than a plain tag lookup:
 
 - **Wiki lookup:** read a tag's description and see its related and aliased
@@ -664,7 +672,7 @@ prefixes:
   download.
 - Typing anything without a prefix does a normal wiki lookup for that tag.
 
-**Signing in to Danbooru (optional):** in **`Settings` → `Danbooru Account`**,
+**Signing in to Danbooru (optional):** in **`Settings` → `Danbooru Wiki`**,
 enter your Danbooru user name and an API key (create one at
 [danbooru.donmai.us/api_keys](https://danbooru.donmai.us/api_keys)), then press
 **Save and Test**. The wiki then uses your account's limits. For safety:
@@ -690,7 +698,7 @@ doesn't have them):
 - Post pages offer the same **View full size** and **Download original**
   buttons.
 
-**Gelbooru account (optional):** in **`Settings` → `Gelbooru Account`**, enter
+**Gelbooru account (optional):** in **`Settings` → `Gelbooru Wiki`**, enter
 your numeric user ID and API key — the easiest way is to copy the whole API
 access line from your
 [Gelbooru account options page](https://gelbooru.com/index.php?page=account&s=options)

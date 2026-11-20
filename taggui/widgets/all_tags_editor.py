@@ -18,6 +18,7 @@ from utils.settings_widgets import FocusedScrollSettingsComboBox
 from utils.tag_filter import TagFilterLineEdit
 from utils.text_edit_item_delegate import TextEditItemDelegate
 from utils.utils import get_confirmation_dialog_reply, list_with_and, pluralize
+from utils.wiki_access import DANBOORU, GELBOORU, is_wiki_enabled
 
 
 class FilterLineEdit(TagFilterLineEdit):
@@ -174,6 +175,8 @@ class AllTagsList(ElidedToolTipListView):
         context_menu.addSeparator()
         view_wiki_action = context_menu.addAction('View Danbooru Wiki')
         view_gelbooru_wiki_action = context_menu.addAction('View Gelbooru Wiki')
+        view_wiki_action.setVisible(is_wiki_enabled(DANBOORU))
+        view_gelbooru_wiki_action.setVisible(is_wiki_enabled(GELBOORU))
 
         context_menu.addSeparator()
 

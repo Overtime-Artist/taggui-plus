@@ -30,6 +30,10 @@ from utils.settings_widgets import (SettingsBigCheckBox, SettingsComboBox,
                                     FocusedScrollSettingsComboBox,
                                     FocusedScrollSettingsSpinBox)
 from utils.thumbnail_cache import clear_cache, get_cache_size_bytes
+from utils.big_widgets import BigCheckBox
+from utils.wiki_access import (DANBOORU, GELBOORU, WIKI_SITE_NAMES,
+                               confirm_enable_wiki, is_wiki_enabled,
+                               set_wiki_enabled)
 
 
 class _DanbooruKeyCheckThread(QThread):
@@ -162,6 +166,7 @@ class SettingsDialog(QDialog):
     tag_separator_changed = Signal()
     autocomplete_changed = Signal()
     remove_app_data_requested = Signal()
+    wiki_availability_changed = Signal()
 
     def __init__(self, parent, tag_library_model: TagLibraryModel,
                  dialog_font: QFont | None = None):
@@ -713,11 +718,12 @@ class SettingsDialog(QDialog):
         grid_layout.addWidget(self.auto_apply_implications_combo_box, row, 1,
                             Qt.AlignmentFlag.AlignLeft)
 
-        # Danbooru Account
-        self._build_danbooru_account_section(add_section('Danbooru Account'))
+        # Danbooru Wiki (on/off + account)
+        self.wiki_enable_check_boxes = {}
+        self._build_danbooru_account_section(add_section('Danbooru Wiki'))
 
-        # Gelbooru Account
-        self._build_gelbooru_account_section(add_section('Gelbooru Account'))
+        # Gelbooru Wiki (on/off + account)
+        self._build_gelbooru_account_section(add_section('Gelbooru Wiki'))
 
         # External Tools
         grid_layout = add_section('External Tools')
@@ -811,12 +817,36 @@ class SettingsDialog(QDialog):
         self.warning_label.setText(self.restart_warning)
         self.warning_label.show()
 
+    def _add_wiki_enable_row(self, grid_layout, site: str) -> int:
+        """Add the "Enable ... Wiki" toggle as row 0; returns the next row.
+        Turning it on asks for confirmation (third-party / NSFW content)."""
+        check_box = BigCheckBox()
+        check_box.setChecked(is_wiki_enabled(site))
+        check_box.toggled.connect(
+            lambda checked: self._on_wiki_enable_toggled(site, check_box,
+                                                         checked))
+        self.wiki_enable_check_boxes[site] = check_box
+        grid_layout.addWidget(QLabel(f'Enable {WIKI_SITE_NAMES[site]} Wiki'),
+                              0, 0, Qt.AlignmentFlag.AlignRight
+                              | Qt.AlignmentFlag.AlignTop)
+        grid_layout.addWidget(check_box, 0, 1, Qt.AlignmentFlag.AlignLeft)
+        return 1
+
+    def _on_wiki_enable_toggled(self, site: str, check_box, checked: bool):
+        if checked and not confirm_enable_wiki(self, site):
+            check_box.blockSignals(True)
+            check_box.setChecked(False)
+            check_box.blockSignals(False)
+            return
+        set_wiki_enabled(site, checked)
+        self.wiki_availability_changed.emit()
+
     def _build_danbooru_account_section(self, grid_layout):
         """User name + API key, kept in the OS password store (never in
         QSettings). The saved key is never shown again or put back into the
         field."""
         self._danbooru_check_thread = None
-        row = 0
+        row = self._add_wiki_enable_row(grid_layout, DANBOORU)
         self.danbooru_login_line_edit = QLineEdit()
         self.danbooru_login_line_edit.setPlaceholderText('Your Danbooru user name')
         self.danbooru_api_key_line_edit = QLineEdit()
@@ -962,7 +992,7 @@ class SettingsDialog(QDialog):
         Pasting Gelbooru's whole "&api_key=...&user_id=..." text into the
         key field fills in both."""
         self._gelbooru_check_thread = None
-        row = 0
+        row = self._add_wiki_enable_row(grid_layout, GELBOORU)
         self.gelbooru_user_id_line_edit = QLineEdit()
         self.gelbooru_user_id_line_edit.setPlaceholderText(
             'Your Gelbooru user ID (a number)')
@@ -1129,7 +1159,8 @@ class SettingsDialog(QDialog):
                           self.autocomplete_tags_check_box,
                           self.disable_new_tag_auto_select_check_box,
                           self.ask_before_removing_tag_library_tags_check_box,
-                          self.ask_before_assigning_new_tag_category_check_box):
+                          self.ask_before_assigning_new_tag_category_check_box,
+                          *self.wiki_enable_check_boxes.values()):
             check_box.style().unpolish(check_box)
             check_box.style().polish(check_box)
             check_box.update()

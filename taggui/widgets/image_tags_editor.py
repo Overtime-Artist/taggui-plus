@@ -20,6 +20,7 @@ from utils.settings import DEFAULT_SETTINGS, get_settings, get_tag_separator
 from utils.settings_widgets import FocusedScrollComboBox, SettingsComboBox
 from utils.text_edit_item_delegate import TextEditItemDelegate
 from utils.utils import get_confirmation_dialog_reply
+from utils.wiki_access import DANBOORU, GELBOORU, is_wiki_enabled
 from widgets.image_list import ImageList
 from widgets.group_tags_panel import GroupTagsPanel
 
@@ -814,6 +815,8 @@ class ImageTagsList(ElidedToolTipListView):
         context_menu.addSeparator()
         view_wiki_action = context_menu.addAction('View Danbooru Wiki')
         view_gelbooru_wiki_action = context_menu.addAction('View Gelbooru Wiki')
+        view_wiki_action.setVisible(is_wiki_enabled(DANBOORU))
+        view_gelbooru_wiki_action.setVisible(is_wiki_enabled(GELBOORU))
         context_menu.addSeparator()
         assign_menu = context_menu.addMenu('Assign Category')
         category_actions = {}

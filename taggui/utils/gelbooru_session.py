@@ -2,7 +2,7 @@
 
 Gelbooru's data API (``index.php?page=dapi``) only answers requests that carry
 an account's ``api_key`` and ``user_id``. When the user has saved them in
-Settings > Gelbooru Account they are added to API requests here, and only to
+Settings > Gelbooru Wiki they are added to API requests here, and only to
 ``https://gelbooru.com/index.php?page=dapi`` URLs: image hosts and web pages
 never see them. Without a key (or if Gelbooru rejects it) the wiki reads the
 public web pages instead.
@@ -107,7 +107,7 @@ def _mark_key_rejected(user_id: str, api_key: str):
         _api_key_problem = (
             'Gelbooru rejected your API key, so TagGUI Plus is reading the '
             'Gelbooru web pages instead. Check the user ID and API key in '
-            'Settings > Gelbooru Account.')
+            'Settings > Gelbooru Wiki.')
 
 
 def api_key_problem() -> str:

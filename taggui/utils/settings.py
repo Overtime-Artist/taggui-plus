@@ -127,6 +127,10 @@ DEFAULT_SETTINGS = {
     'variant_grid_overlay_show': True,
     'variant_grid_overlay_font_size': 10,
     'variant_grid_overlay_transparency': 55,
+    # The Danbooru/Gelbooru wikis show third-party (often NSFW) content, so
+    # they stay off until the user enables them in Settings.
+    'danbooru_wiki_enabled': False,
+    'gelbooru_wiki_enabled': False,
 }
 
 
