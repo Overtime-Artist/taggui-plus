@@ -10,12 +10,16 @@ OFF by default and clearly warned, because the Hugging Face cache is shared with
 other tools.
 """
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFrame,
                                QLabel, QMessageBox, QPushButton, QVBoxLayout)
 
 from utils import app_data
+from utils.validation_set import (find_never_pick_files,
+                                  remove_never_pick_files)
 
 
 class RemoveAppDataDialog(QDialog):
@@ -26,7 +30,8 @@ class RemoveAppDataDialog(QDialog):
     immediately.
     """
 
-    def __init__(self, parent=None, dialog_font: QFont | None = None):
+    def __init__(self, parent=None, dialog_font: QFont | None = None,
+                 loaded_directory: Path | None = None):
         super().__init__(parent)
         if dialog_font is not None:
             self.setFont(dialog_font)
@@ -102,6 +107,21 @@ class RemoveAppDataDialog(QDialog):
                 'deletes it from this computer; to revoke the key itself, '
                 'delete it on the website too (e.g. '
                 'danbooru.donmai.us/api_keys).'))
+
+        # --- Never-pick marks in the loaded folder (only if there are any) ---
+        self.never_pick_check_box = None
+        self._never_pick_files = (find_never_pick_files(loaded_directory)
+                                  if loaded_directory is not None else [])
+        if self._never_pick_files:
+            count = len(self._never_pick_files)
+            self.never_pick_check_box = QCheckBox(
+                f'Validation set "never pick" marks in the loaded folder '
+                f'\u2013 {count} hidden {"file" if count == 1 else "files"}')
+            self.never_pick_check_box.setChecked(False)
+            layout.addWidget(self.never_pick_check_box)
+            layout.addWidget(self._hint(
+                f'{loaded_directory} and its subfolders. These are kept next '
+                f'to your images; load another folder to clear its marks.'))
 
         layout.addWidget(self._separator())
 
@@ -207,9 +227,11 @@ class RemoveAppDataDialog(QDialog):
         remove_hf = self.hf_check_box.isChecked()
         remove_logins = (self.logins_check_box is not None
                          and self.logins_check_box.isChecked())
+        remove_never_pick = (self.never_pick_check_box is not None
+                             and self.never_pick_check_box.isChecked())
 
         if not any((remove_caches, remove_settings, remove_models_dir,
-                    remove_hf, remove_logins)):
+                    remove_hf, remove_logins, remove_never_pick)):
             QMessageBox.information(
                 self, 'Nothing selected',
                 'Select at least one item to remove, or press Cancel.')
@@ -223,6 +245,9 @@ class RemoveAppDataDialog(QDialog):
             selected_lines.append('\u2022 App settings')
         if remove_logins:
             selected_lines.append('\u2022 Saved website logins (API keys)')
+        if remove_never_pick:
+            selected_lines.append(
+                '\u2022 Validation set "never pick" marks in the loaded folder')
         if remove_models_dir:
             selected_lines.append(
                 f'\u2022 Models directory ({self._models_dir})')
@@ -246,6 +271,9 @@ class RemoveAppDataDialog(QDialog):
             failures.append('caches')
         if remove_logins and not app_data.remove_saved_logins():
             failures.append('saved website logins')
+        if remove_never_pick and remove_never_pick_files(
+                self._never_pick_files):
+            failures.append('"never pick" marks files')
         if remove_models_dir and self._models_dir is not None:
             if not app_data.remove_directory(self._models_dir):
                 failures.append('models directory')

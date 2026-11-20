@@ -1275,7 +1275,9 @@ class SettingsDialog(QDialog):
         """Show the Remove app data dialog. If the user confirms and data is
         deleted, ask the main window to quit terminally so nothing is rewritten
         during shutdown."""
-        dialog = RemoveAppDataDialog(parent=self, dialog_font=self.font())
+        dialog = RemoveAppDataDialog(
+            parent=self, dialog_font=self.font(),
+            loaded_directory=getattr(self.parent(), 'directory_path', None))
         parent = self.parent()
         if hasattr(parent, 'apply_dialog_title_bar_theme'):
             parent.apply_dialog_title_bar_theme(dialog)

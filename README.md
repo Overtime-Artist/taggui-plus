@@ -205,6 +205,11 @@ want it gone, delete only the model files inside it by hand. Settings backups
 made by **Reset to Defaults** live in the cache folder, so removing the caches
 also removes those backups.
 
+Validation set "never pick" marks are saved in hidden `.taggui_validation.json`
+files next to your images, not with the app. If the loaded folder (or any of
+its subfolders) has any, the tool shows an extra, unticked option to delete
+them. Load each dataset folder in turn to clear its marks.
+
 You can also clear just the thumbnail cache from
 **`Settings` → `Clear Thumbnail Cache`**.
 
@@ -222,6 +227,7 @@ You can also clear just the thumbnail cache from
 | Danbooru wiki browser profile (Cloudflare/login cookies and a small cache) | `%APPDATA%\taggui\taggui\QtWebEngine\taggui-danbooru` and `%LOCALAPPDATA%\taggui\taggui\cache\QtWebEngine\taggui-danbooru` | A `QtWebEngine/taggui-danbooru` folder under `~/Library/Application Support/taggui` and under `~/Library/Caches/taggui` | A `QtWebEngine/taggui-danbooru` folder under `~/.local/share/taggui` and under `~/.cache/taggui` |
 | Saved Danbooru API key (only if you added one) | Windows Credential Manager, generic credential `TagGUI Plus` | Keychain, service `TagGUI Plus` | Secret Service keyring, service `TagGUI Plus` |
 | Downloaded captioning models (often several GB) | Your configured models directory, or the Hugging Face cache `%USERPROFILE%\.cache\huggingface` (or wherever `HF_HUB_CACHE` / `HF_HOME` points) | Your models directory, or `~/.cache/huggingface` | Your models directory, or `~/.cache/huggingface` |
+| Validation set "never pick" marks | Hidden `.taggui_validation.json` in each image folder that has marks | Same | Same |
 
 </details>
 
@@ -657,7 +663,9 @@ green outline, images already set aside a dashed blue one. Review the picks and:
 - **Never Pick** / **Allow** — permanently keep the selected images out of
   every validation set (for example your best training images). The marks are
   saved in a hidden `.taggui_validation.json` file in the image's folder, so
-  they travel with the dataset.
+  they travel with the dataset. To clear them all, set Show to "Never pick",
+  select everything and click **Allow**, or use the
+  "never pick" option in **Settings → Remove App Data…**.
 - **Re-roll** — pick a fresh random set.
 - **Return to Folder** — move the selected images already set aside (and their
   captions) back out of the validation subfolder into the folder it is in.

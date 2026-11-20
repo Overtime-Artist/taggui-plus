@@ -120,6 +120,28 @@ def _set_hidden(path: Path, hidden: bool):
         pass
 
 
+def find_never_pick_files(root: Path) -> list[Path]:
+    """Every never-pick marks file in `root` and its subfolders."""
+    wanted = NEVER_PICK_FILE_NAME.casefold()
+    found = []
+    for folder, _subfolders, file_names in os.walk(root):
+        found.extend(Path(folder) / name for name in file_names
+                     if name.casefold() == wanted)
+    return found
+
+
+def remove_never_pick_files(paths) -> list[Path]:
+    """Delete marks files. Returns the ones that couldn't be deleted."""
+    failed = []
+    for path in paths:
+        try:
+            _set_hidden(path, False)
+            path.unlink(missing_ok=True)
+        except OSError:
+            failed.append(path)
+    return failed
+
+
 class NeverPickStore:
     """The "never pick for validation" marks, read from and written to a
     hidden file in each image's folder (file names, relative to it)."""
