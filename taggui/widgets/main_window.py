@@ -2529,17 +2529,39 @@ class MainWindow(QMainWindow):
                 'Select one or more images in the Images pane first, then try '
                 'again.')
             return
-        is_new_library_tag = not self.tag_library_model.has_tag(tag)
-        # Add the tag to the Tag Library first so the automatic tag-tracking
+        self._add_wiki_tag_to_images(tag, selected_image_indices,
+                                     prompt_parent)
+
+    def _add_wiki_tag_to_images(self, tag: str, image_indices: list,
+                                prompt_parent=None):
+        """Add a wiki tag, plus the tags it implies (following the
+        ``auto_apply_implications`` setting like the other add paths), to the
+        given images as one undo step."""
+        tags_to_add = [tag]
+        apply_mode = get_settings().value(
+            'auto_apply_implications',
+            defaultValue=DEFAULT_SETTINGS['auto_apply_implications'])
+        if isinstance(apply_mode, bool):
+            apply_mode = 'Single image only' if apply_mode else 'Off'
+        allowed = (('Single image only', 'All selected images')
+                   if len(image_indices) == 1 else ('All selected images',))
+        if apply_mode in allowed:
+            tags_to_add += [implied for implied
+                            in self.tag_library_model.get_implied_tags([tag])
+                            if implied != tag]
+        new_library_tags = [tag_to_add for tag_to_add in tags_to_add
+                            if not self.tag_library_model.has_tag(tag_to_add)]
+        # Add the tags to the Tag Library first so the automatic tag-tracking
         # machinery does not also queue its own (main-window-parented) category
         # prompt; we show a dialog-parented prompt below instead.
-        if is_new_library_tag:
-            self.tag_library_model.add_tags([tag])
-        self.image_list_model.add_tags([tag], selected_image_indices)
+        if new_library_tags:
+            self.tag_library_model.add_tags(new_library_tags)
+        self.image_list_model.add_tags(tags_to_add, image_indices)
         self.image_tags_editor.clear_add_tag_box_if_matches(tag)
         self.image_tags_editor.select_last_tag_or_flash()
-        if is_new_library_tag:
-            self.prompt_category_for_new_library_tags([tag], prompt_parent)
+        if new_library_tags:
+            self.prompt_category_for_new_library_tags(new_library_tags,
+                                                      prompt_parent)
 
     def wiki_selected_images_have_tag(self, tag: str):
         """Report whether the currently selected images already contain the
@@ -2577,17 +2599,7 @@ class MainWindow(QMainWindow):
                 prompt_parent or self, 'No Current Image',
                 'There is no current image to add the tag to.')
             return
-        is_new_library_tag = not self.tag_library_model.has_tag(tag)
-        # Add to the Tag Library first so the automatic tag-tracking machinery
-        # does not also queue its own (main-window-parented) category prompt;
-        # a dialog-parented prompt is shown below instead.
-        if is_new_library_tag:
-            self.tag_library_model.add_tags([tag])
-        self.image_list_model.add_tags([tag], [current_index])
-        self.image_tags_editor.clear_add_tag_box_if_matches(tag)
-        self.image_tags_editor.select_last_tag_or_flash()
-        if is_new_library_tag:
-            self.prompt_category_for_new_library_tags([tag], prompt_parent)
+        self._add_wiki_tag_to_images(tag, [current_index], prompt_parent)
 
     def wiki_current_image_has_tag(self, tag: str):
         """Report whether the current grouped-view image already has the wiki
