@@ -231,6 +231,9 @@ class ValidationSetDialog(QDialog):
         folder_row.setSpacing(10)
         folder_row.addWidget(QLabel('Folder:'))
         self.folder_combo_box = FocusedScrollComboBox()
+        # Fusion would grow the list to the screen height before scrolling.
+        self.folder_combo_box.setStyleSheet('combobox-popup: 0;')
+        self.folder_combo_box.setMaxVisibleItems(15)
         self.folder_combo_box.setSizePolicy(QSizePolicy.Policy.Expanding,
                                             QSizePolicy.Policy.Fixed)
         folder_row.addWidget(self.folder_combo_box, 1)
