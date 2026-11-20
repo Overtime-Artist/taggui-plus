@@ -1880,7 +1880,8 @@ class MainWindow(QMainWindow):
             directory_path=self.directory_path,
             current_image_path=(current_image.path
                                 if current_image is not None else None),
-            reload_callback=self.reload_directory)
+            reload_callback=self.reload_directory,
+            refresh_callback=self.refresh_changed_image_files)
         dialog.exec()
 
     @Slot()

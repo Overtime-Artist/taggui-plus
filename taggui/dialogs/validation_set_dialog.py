@@ -6,8 +6,8 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
-from PySide6.QtCore import (QAbstractListModel, QModelIndex, QRect, QSize, Qt,
-                            QUrl, Slot)
+from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QRect,
+                            QSize, Qt, QTimer, QUrl, Slot)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                                QDialog, QGridLayout, QGroupBox, QHBoxLayout,
@@ -168,18 +168,28 @@ class _ThumbnailDelegate(QStyledItemDelegate):
 class ValidationSetDialog(QDialog):
     def __init__(self, parent, image_list_model: ImageListModel,
                  directory_path: Path, current_image_path: Path | None,
-                 reload_callback):
+                 reload_callback, refresh_callback=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.image_list_model = image_list_model
         self.directory_path = Path(directory_path)
         self.reload_callback = reload_callback
+        # Rescans the folder for changes made outside the app.
+        self.refresh_callback = refresh_callback
         self.settings = get_settings()
         self.never_pick = NeverPickStore()
         self.rng = random.Random()
         self._cache = DuplicateCache()
         self._cache.load()
         self._scanner: DuplicateScanner | None = None
+        self._outside_change_note = ''
+        self._structure_timer = QTimer(self)
+        self._structure_timer.setSingleShot(True)
+        self._structure_timer.timeout.connect(self._on_images_added_or_removed)
+        self._tags_timer = QTimer(self)
+        self._tags_timer.setSingleShot(True)
+        self._tags_timer.setInterval(150)
+        self._tags_timer.timeout.connect(self._update_status)
         self._progress_dialog: QProgressDialog | None = None
         # The images in scope: the candidates, then those already set aside.
         self.items: list = []
@@ -365,6 +375,9 @@ class ValidationSetDialog(QDialog):
         self.variant_combo_box.currentTextChanged.connect(
             self._on_variant_matching_changed)
         image_list_model.dataChanged.connect(self._on_model_data_changed)
+        image_list_model.rowsInserted.connect(self._structure_timer.start)
+        image_list_model.rowsRemoved.connect(self._structure_timer.start)
+        image_list_model.modelReset.connect(self._structure_timer.start)
         self._scope_changed()
 
     # ------------------------------------------------------------------
@@ -456,6 +469,7 @@ class ValidationSetDialog(QDialog):
     def _scope_changed(self):
         """Gather the images of the chosen folder: the candidates and the
         ones already in its validation subfolder."""
+        self._outside_change_note = ''
         self._units = None
         self._dropped_items.clear()
         self._clear_picks()
@@ -520,8 +534,36 @@ class ValidationSetDialog(QDialog):
 
     @Slot(QModelIndex, QModelIndex)
     def _on_model_data_changed(self, *_args):
-        # Thumbnails load in the background in the main image list.
+        # Thumbnails load in the background in the main image list; captions
+        # can also be changed outside the app.
         self.list_view.viewport().update()
+        self._tags_timer.start()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.ActivationChange
+                and self.isActiveWindow()):
+            # The main window only rescans when it is activated, which
+            # doesn't happen while this dialog is open.
+            self.never_pick.forget()
+            if callable(self.refresh_callback):
+                self.refresh_callback()
+            self._update_status()
+            self.list_view.viewport().update()
+
+    @Slot()
+    def _on_images_added_or_removed(self):
+        """Images were added, removed, renamed or moved outside the app (or
+        by the main window): start over with the current folder contents."""
+        had_picks = bool(self._picked_items)
+        if self._scanner is not None:
+            self._scanner.cancel()
+        self._populate_folders(None)
+        self._scope_changed()
+        self._outside_change_note = (
+            'The folder changed outside the app, so the picks were cleared.'
+            if had_picks else '')
+        self._update_status()
 
     @Slot(QModelIndex)
     def _open_image(self, index: QModelIndex):
@@ -544,6 +586,7 @@ class ValidationSetDialog(QDialog):
 
     @Slot()
     def pick(self):
+        self._outside_change_note = ''
         if self._candidate_count == 0:
             return
         threshold = VARIANT_MATCHING_LEVELS.get(
@@ -764,8 +807,14 @@ class ValidationSetDialog(QDialog):
         try:
             self.image_list_model.dataChanged.disconnect(
                 self._on_model_data_changed)
+            for signal in (self.image_list_model.rowsInserted,
+                           self.image_list_model.rowsRemoved,
+                           self.image_list_model.modelReset):
+                signal.disconnect(self._structure_timer.start)
         except (RuntimeError, TypeError):
             pass
+        self._structure_timer.stop()
+        self._tags_timer.stop()
         super().done(result)
 
     # ------------------------------------------------------------------
@@ -788,6 +837,8 @@ class ValidationSetDialog(QDialog):
         name = self.folder_name
         total = len(self.items)
         candidates = self._candidate_count
+        for image in self.items[:candidates]:
+            self.never_pick.is_marked(image.path)
         existing = total - candidates
         target = self._target()
         percentage = self.percentage_spin_box.value()
@@ -815,6 +866,11 @@ class ValidationSetDialog(QDialog):
                      'without images marked "never pick" or dropped.')
         if self._units is None:
             self.pick_button.setText('Pick Images')
+        if self._outside_change_note:
+            text += '\n' + self._outside_change_note
+        for file_path in self.never_pick.unreadable.values():
+            text += (f'\nCouldn\'t read {file_path}, so its "never pick" '
+                     f'marks are ignored. Fix or delete it.')
         self.status_label.setText(text)
         self._update_coverage()
         self._update_buttons()

@@ -127,19 +127,33 @@ class NeverPickStore:
     def __init__(self):
         # Folder key -> {file name key: file name}.
         self._folders: dict[str, dict[str, str]] = {}
+        # Folder key -> marks file that exists but couldn't be read. Its
+        # marks are ignored, and it is never overwritten.
+        self.unreadable: dict[str, Path] = {}
+
+    def forget(self):
+        """Drop the cached marks, so files edited outside the app are read
+        again."""
+        self._folders.clear()
+        self.unreadable.clear()
 
     def _names(self, folder: Path) -> dict[str, str]:
         key = get_path_key(folder)
         if key not in self._folders:
             names = {}
+            file_path = folder / NEVER_PICK_FILE_NAME
             try:
-                data = json.loads((folder / NEVER_PICK_FILE_NAME).read_text(
-                    encoding='utf-8'))
+                data = json.loads(file_path.read_text(encoding='utf-8'))
+                if not isinstance(data, dict):
+                    raise ValueError('not a JSON object')
                 for name in data.get('never_pick', []):
                     if isinstance(name, str):
                         names[os.path.normcase(name)] = name
-            except (OSError, ValueError, AttributeError):
+            except FileNotFoundError:
                 pass
+            except (OSError, ValueError, TypeError):
+                names = {}
+                self.unreadable[key] = file_path
             self._folders[key] = names
         return self._folders[key]
 
@@ -149,7 +163,14 @@ class NeverPickStore:
 
     def set_marked(self, image_paths, marked: bool):
         """Mark or unmark images and save every affected folder's file.
-        Raises OSError if a file can't be written."""
+        Raises OSError if a file can't be read or written."""
+        image_paths = list(image_paths)
+        for path in image_paths:
+            self._names(path.parent)
+            file_path = self.unreadable.get(get_path_key(path.parent))
+            if file_path is not None:
+                raise OSError(f'{file_path} could not be read, so it was left '
+                              f'unchanged. Fix or delete it, then try again.')
         changed_folders = {}
         for path in image_paths:
             names = self._names(path.parent)
