@@ -1,7 +1,7 @@
-"""Full-size viewer for a Danbooru post's original image.
+"""Full-size viewer for a Danbooru or Gelbooru post's original image.
 
 Built on the main ImageViewer (zoom with the mouse wheel or + / -, drag to
-pan, double-click to fit). The window opens straight away showing Danbooru's
+pan, double-click to fit). The window opens straight away showing the site's
 smaller sample image, then switches to the original once it has downloaded.
 """
 from pathlib import Path
@@ -37,11 +37,12 @@ class _SingleImageModel(QAbstractListModel):
         return None
 
 
-class DanbooruImageViewerDialog(QDialog):
+class BooruImageViewerDialog(QDialog):
     download_requested = Signal(dict)
 
-    def __init__(self, parent):
+    def __init__(self, parent, site_name: str = 'Danbooru'):
         super().__init__(parent)
+        self.site_name = site_name
         self.post = {}
         self.showing_original = False
         self._was_maximized = False
@@ -100,7 +101,8 @@ class DanbooruImageViewerDialog(QDialog):
         """Show ``post``, using its sample image until the original arrives."""
         self.post = dict(post)
         self.showing_original = False
-        self.setWindowTitle(f'Danbooru Post #{post.get("id")} \u2014 Original')
+        self.setWindowTitle(
+            f'{self.site_name} Post #{post.get("id")} \u2014 Original')
         if sample_path is not None:
             self.model.record = _ImageRecord(sample_path, self._dimensions())
             self.viewer.load_image(self.model.index(0))

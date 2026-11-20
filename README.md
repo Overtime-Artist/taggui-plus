@@ -679,6 +679,27 @@ enter your Danbooru user name and an API key (create one at
 - **Remove** in Settings (or **Remove app data**) deletes it from this computer.
   To revoke the key completely, also delete it on the Danbooru API keys page.
 
+The **Gelbooru Wiki** works the same way, apart from tag groups (Gelbooru
+doesn't have them):
+
+- Tags are **coloured by type** (artist, character, copyright, metadata, …) in
+  the wiki, post pages and autocomplete, and a wiki page shows example posts.
+- **Post search** uses the same `posts:` prefix, e.g. `posts: dog, cat`.
+  Gelbooru has no limit on how many tags you can combine. Looking up a tag
+  that has no wiki page shows its posts instead.
+- Post pages offer the same **View full size** and **Download original**
+  buttons.
+
+**Gelbooru account (optional):** in **`Settings` → `Gelbooru Account`**, enter
+your numeric user ID and API key — the easiest way is to copy the whole API
+access line from your
+[Gelbooru account options page](https://gelbooru.com/index.php?page=account&s=options)
+(it looks like `&api_key=…&user_id=…`) and paste it into the API key box, which
+fills in both — then press **Save and Test**. With a key, TagGUI Plus uses
+Gelbooru's API, which is faster and more reliable; without one it reads the
+normal web pages. The key is stored and removed in the same safe way as the
+Danbooru key above, and is only sent to `gelbooru.com` over HTTPS.
+
 > [!NOTE]
 > You can add **any legitimate Danbooru tag** to your Tag Library or images, even
 > one that doesn't have a wiki page yet. Tags that aren't real Danbooru tags

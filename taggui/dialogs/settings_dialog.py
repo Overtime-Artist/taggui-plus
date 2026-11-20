@@ -15,6 +15,11 @@ from utils import credentials
 from utils.danbooru_session import (DANBOORU_CREDENTIALS_SITE,
                                     initialize_on_main_thread,
                                     reset_api_key_state, verify_api_key)
+from utils.gelbooru_session import (
+    GELBOORU_ACCOUNT_OPTIONS_URL, GELBOORU_CREDENTIALS_SITE,
+    parse_api_key_text as parse_gelbooru_api_key_text,
+    reset_api_key_state as reset_gelbooru_api_key_state,
+    verify_api_key as verify_gelbooru_api_key)
 from utils.enums import ThemeMode
 from utils.settings_export_import import (EXPORT_CATEGORIES,
                                           backup_all_settings)
@@ -34,6 +39,18 @@ class _DanbooruKeyCheckThread(QThread):
     def run(self):
         try:
             ok, message = verify_api_key()
+        except Exception as exception:
+            ok, message = None, f'Couldn\'t check the key: {exception}'
+        self.checked.emit(ok, message)
+
+
+class _GelbooruKeyCheckThread(QThread):
+    """Checks the saved Gelbooru API key off the GUI thread."""
+    checked = Signal(object, str)
+
+    def run(self):
+        try:
+            ok, message = verify_gelbooru_api_key()
         except Exception as exception:
             ok, message = None, f'Couldn\'t check the key: {exception}'
         self.checked.emit(ok, message)
@@ -699,6 +716,9 @@ class SettingsDialog(QDialog):
         # Danbooru Account
         self._build_danbooru_account_section(add_section('Danbooru Account'))
 
+        # Gelbooru Account
+        self._build_gelbooru_account_section(add_section('Gelbooru Account'))
+
         # External Tools
         grid_layout = add_section('External Tools')
         row = 0
@@ -937,11 +957,170 @@ class SettingsDialog(QDialog):
             self._refresh_danbooru_account_state(
                 'The API key could not be removed from the password store.')
 
-    def done(self, result):
-        thread = self._danbooru_check_thread
+    def _build_gelbooru_account_section(self, grid_layout):
+        """User ID + API key, kept in the OS password store like Danbooru's.
+        Pasting Gelbooru's whole "&api_key=...&user_id=..." text into the
+        key field fills in both."""
+        self._gelbooru_check_thread = None
+        row = 0
+        self.gelbooru_user_id_line_edit = QLineEdit()
+        self.gelbooru_user_id_line_edit.setPlaceholderText(
+            'Your Gelbooru user ID (a number)')
+        self.gelbooru_api_key_line_edit = QLineEdit()
+        self.gelbooru_api_key_line_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gelbooru_api_key_line_edit.setInputMethodHints(
+            Qt.InputMethodHint.ImhHiddenText
+            | Qt.InputMethodHint.ImhSensitiveData
+            | Qt.InputMethodHint.ImhNoPredictiveText)
+        self.gelbooru_api_key_line_edit.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.NoContextMenu)
+        self.gelbooru_api_key_line_edit.textChanged.connect(
+            self._split_pasted_gelbooru_key)
+        grid_layout.addWidget(QLabel('User ID'), row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid_layout.addWidget(self.gelbooru_user_id_line_edit, row, 1)
+        row += 1
+        grid_layout.addWidget(QLabel('API key'), row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid_layout.addWidget(self.gelbooru_api_key_line_edit, row, 1)
+        row += 1
+
+        self.gelbooru_save_button = QPushButton('Save and Test')
+        self.gelbooru_save_button.setAutoDefault(False)
+        self.gelbooru_save_button.clicked.connect(self._save_gelbooru_account)
+        self.gelbooru_remove_button = QPushButton('Remove')
+        self.gelbooru_remove_button.setAutoDefault(False)
+        self.gelbooru_remove_button.clicked.connect(
+            self._remove_gelbooru_account)
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.gelbooru_save_button)
+        buttons_layout.addWidget(self.gelbooru_remove_button)
+        buttons_layout.addStretch()
+        grid_layout.addLayout(buttons_layout, row, 1)
+        row += 1
+
+        self.gelbooru_account_status_label = QLabel()
+        self.gelbooru_account_status_label.setWordWrap(True)
+        grid_layout.addWidget(self.gelbooru_account_status_label, row, 1)
+        row += 1
+
+        help_label = QLabel(
+            'Optional. Without a key the Gelbooru wiki reads the Gelbooru '
+            'web pages; with one it uses the faster Gelbooru API. Find your '
+            'key under "API Access Credentials" on '
+            f'<a href="{GELBOORU_ACCOUNT_OPTIONS_URL}">your Gelbooru account '
+            'options</a> and paste the whole line (it fills in both fields). '
+            'The key is only sent to gelbooru.com over HTTPS.')
+        help_label.setWordWrap(True)
+        help_label.setOpenExternalLinks(True)
+        help_label.setTextFormat(Qt.TextFormat.RichText)
+        help_font = QFont()
+        help_font.setPointSize(9)
+        help_label.setFont(help_font)
+        grid_layout.addWidget(help_label, row, 1)
+
+        self._refresh_gelbooru_account_state()
+
+    @Slot(str)
+    def _split_pasted_gelbooru_key(self, text: str):
+        if 'api_key=' not in text:
+            return
+        user_id, api_key = parse_gelbooru_api_key_text(text)
+        if user_id:
+            self.gelbooru_user_id_line_edit.setText(user_id)
+        self.gelbooru_api_key_line_edit.setText(api_key)
+
+    def _refresh_gelbooru_account_state(self, status: str = ''):
+        available = credentials.is_store_available()
+        saved = (credentials.get_site_credentials(GELBOORU_CREDENTIALS_SITE)
+                 if available else None)
+        checking = self._gelbooru_check_thread is not None
+        for widget in (self.gelbooru_user_id_line_edit,
+                       self.gelbooru_api_key_line_edit):
+            widget.setEnabled(available and not checking)
+        self.gelbooru_save_button.setEnabled(available and not checking)
+        self.gelbooru_remove_button.setEnabled(bool(saved) and not checking)
+        if saved:
+            self.gelbooru_user_id_line_edit.setText(saved[0])
+            self.gelbooru_api_key_line_edit.setPlaceholderText(
+                'Saved (hidden). Enter a new key to replace it.')
+        else:
+            self.gelbooru_api_key_line_edit.setPlaceholderText(
+                'Paste your API key')
+        if not status:
+            if not available:
+                status = ('No secure password store is available on this '
+                          'computer, so an API key can\'t be saved.')
+            elif saved:
+                status = f'An API key is saved in {credentials.store_name()}.'
+            else:
+                status = 'Not signed in.'
+        self.gelbooru_account_status_label.setText(status)
+
+    @Slot()
+    def _save_gelbooru_account(self):
+        user_id = self.gelbooru_user_id_line_edit.text().strip()
+        api_key = self.gelbooru_api_key_line_edit.text().strip()
+        saved = credentials.get_site_credentials(GELBOORU_CREDENTIALS_SITE)
+        if not api_key and saved:
+            api_key = saved[1]
+        if not user_id or not api_key:
+            self._refresh_gelbooru_account_state(
+                'Enter both your user ID and API key.')
+            return
+        if not user_id.isdigit():
+            self._refresh_gelbooru_account_state(
+                'The user ID is a number (shown with your API key on the '
+                'account options page), not your user name.')
+            return
+        try:
+            credentials.set_site_credentials(
+                GELBOORU_CREDENTIALS_SITE, user_id, api_key)
+        except Exception as exception:
+            self._refresh_gelbooru_account_state(
+                f'The API key could not be saved: {exception}')
+            return
+        self.gelbooru_api_key_line_edit.clear()
+        reset_gelbooru_api_key_state()
+        thread = _GelbooruKeyCheckThread()
+        thread.checked.connect(self._on_gelbooru_key_checked)
+        self._gelbooru_check_thread = thread
+        self._refresh_gelbooru_account_state('Saved. Checking with Gelbooru\u2026')
+        thread.start()
+
+    @Slot(object, str)
+    def _on_gelbooru_key_checked(self, ok, message):
+        thread = self._gelbooru_check_thread
+        self._gelbooru_check_thread = None
         if thread is not None:
-            self._danbooru_check_thread = None
             park_running_threads([thread])
+        if ok is True:
+            message = f'\u2714 {message}'
+        elif ok is False:
+            message = f'\u2716 {message}'
+        self._refresh_gelbooru_account_state(message)
+
+    @Slot()
+    def _remove_gelbooru_account(self):
+        removed = credentials.delete_site_credentials(GELBOORU_CREDENTIALS_SITE)
+        reset_gelbooru_api_key_state()
+        self.gelbooru_api_key_line_edit.clear()
+        if removed:
+            self.gelbooru_user_id_line_edit.clear()
+            self._refresh_gelbooru_account_state(
+                'Removed from this computer. To fully revoke it, use "Generate '
+                'New Key" on your Gelbooru account options page.')
+        else:
+            self._refresh_gelbooru_account_state(
+                'The API key could not be removed from the password store.')
+
+    def done(self, result):
+        threads = [self._danbooru_check_thread, self._gelbooru_check_thread]
+        self._danbooru_check_thread = None
+        self._gelbooru_check_thread = None
+        threads = [thread for thread in threads if thread is not None]
+        if threads:
+            park_running_threads(threads)
         super().done(result)
 
     @Slot()

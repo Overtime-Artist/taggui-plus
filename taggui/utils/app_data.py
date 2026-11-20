@@ -26,6 +26,7 @@ from PySide6.QtCore import QStandardPaths
 from utils import credentials
 from utils.danbooru_session import (DANBOORU_CREDENTIALS_SITE,
                                     DANBOORU_PROFILE_NAME)
+from utils.gelbooru_session import GELBOORU_CREDENTIALS_SITE
 from utils.scan_cache import _get_cache_dir
 from utils.settings import DEFAULT_SETTINGS, get_settings
 
@@ -267,7 +268,8 @@ def remove_settings() -> bool:
 
 
 # Sites whose logins (API keys) can be saved in the OS password store.
-SAVED_LOGIN_SITES = {DANBOORU_CREDENTIALS_SITE: 'Danbooru'}
+SAVED_LOGIN_SITES = {DANBOORU_CREDENTIALS_SITE: 'Danbooru',
+                     GELBOORU_CREDENTIALS_SITE: 'Gelbooru'}
 
 
 def get_saved_login_site_names() -> list[str]:
