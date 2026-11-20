@@ -655,6 +655,8 @@ class MainWindow(QMainWindow):
             self._focus_image_tags_pane()
         self.image_viewer.set_focus_overlay_text(
             self.image_list.image_index_label.text())
+        self._update_focus_navigation_buttons()
+        self._update_focus_caption_button()
         self.image_viewer.set_focus_overlay_enabled(True)
         self.showFullScreen()
 
@@ -707,6 +709,59 @@ class MainWindow(QMainWindow):
                     return_widget.setFocus(Qt.FocusReason.OtherFocusReason)
                 else:
                     self._focus_image_tags_pane()
+
+    @Slot()
+    def _update_focus_navigation_buttons(self, *args):
+        row = self.image_list_selection_model.currentIndex().row()
+        last_row = self.proxy_image_list_model.rowCount() - 1
+        self.image_viewer.set_focus_navigation_enabled(
+            0 < row, 0 <= row < last_row)
+
+    @Slot()
+    def _update_focus_caption_button(self):
+        """Mirror the Auto-Captioner's Start/Cancel button in the focus mode
+        control bar, which is the only way to see it there."""
+        captioner = self.auto_captioner
+        button = captioner.start_cancel_button
+        if not captioner.is_captioning:
+            self.image_viewer.set_focus_caption_state(
+                'Auto-Caption', 'Start auto-captioning the selected images',
+                button.isEnabled())
+            return
+        if not button.isEnabled():
+            self.image_viewer.set_focus_caption_state(
+                'Canceling\u2026', 'Canceling auto-captioning', False)
+            return
+        text = 'Cancel Captioning'
+        progress_bar = captioner.progress_bar
+        if (not progress_bar.isHidden()
+                and progress_bar.value() >= progress_bar.minimum()):
+            text += f' ({progress_bar.value()}/{progress_bar.maximum()})'
+        self.image_viewer.set_focus_caption_state(
+            text, 'Cancel auto-captioning', True)
+
+    @Slot()
+    def _report_focus_mode_caption_error(self):
+        """In focus mode the Auto-Captioner console is hidden, so show a
+        failed run's last console lines in a message box."""
+        captioner = self.auto_captioner
+        thread = captioner.captioning_thread
+        if (not self.is_focus_mode() or thread is None
+                or not thread.is_error or thread.is_canceled
+                # The finish alert already reported it, with the log.
+                or getattr(captioner, '_show_alert_when_finished', False)):
+            return
+        console_lines = captioner.console_text_edit.toPlainText().splitlines()
+        message_box = QMessageBox(self)
+        message_box.setIcon(QMessageBox.Icon.Critical)
+        message_box.setWindowTitle('Auto-Captioning Error')
+        message_box.setText('An error occurred during auto-captioning.')
+        message_box.setInformativeText(
+            'The full log is in the Auto-Captioner console, which is shown '
+            'after leaving focus mode (F11).')
+        if console_lines:
+            message_box.setDetailedText('\n'.join(console_lines[-15:]))
+        message_box.exec()
 
     def _can_return_focus_to(self, widget) -> bool:
         if widget is None:
@@ -2114,6 +2169,12 @@ class MainWindow(QMainWindow):
             self.image_list.update_image_index_label)
         self.image_list.image_index_text_changed.connect(
             self.image_viewer.set_focus_overlay_text)
+        self.image_list.image_index_text_changed.connect(
+            self._update_focus_navigation_buttons)
+        self.image_viewer.focus_previous_image_requested.connect(
+            self.image_list.go_to_previous_image)
+        self.image_viewer.focus_next_image_requested.connect(
+            self.image_list.go_to_next_image)
         self.image_list_selection_model.currentChanged.connect(
             self.image_viewer.load_image)
         self.image_list_selection_model.currentChanged.connect(
@@ -2853,6 +2914,13 @@ class MainWindow(QMainWindow):
                 self.all_tags_editor.isVisible()))
 
     def connect_auto_captioner_signals(self):
+        self.image_viewer.focus_caption_requested.connect(
+            self.auto_captioner.start_or_cancel_captioning)
+        self.auto_captioner.caption_button_state_changed.connect(
+            self._update_focus_caption_button)
+        self.auto_captioner.captioning_finished.connect(
+            self._report_focus_mode_caption_error)
+        self._update_focus_caption_button()
         self.auto_captioner.captioning_started.connect(
             self._on_captioning_started)
         self.auto_captioner.captioning_started.connect(

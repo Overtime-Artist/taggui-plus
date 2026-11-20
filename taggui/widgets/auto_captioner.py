@@ -607,6 +607,9 @@ def restore_stdout_and_stderr():
 class AutoCaptioner(QDockWidget):
     captioning_started = Signal()
     captioning_finished = Signal()
+    # Emitted whenever the Start/Cancel button's text or enabled state, or the
+    # progress, changes (used by the focus mode caption button).
+    caption_button_state_changed = Signal()
     caption_generated = Signal(QModelIndex, str, list, str)
 
     def __init__(self, image_list_model: ImageListModel,
@@ -647,6 +650,8 @@ class AutoCaptioner(QDockWidget):
         self.progress_bar = QProgressBar()
         self.progress_bar.setFormat('%v / %m images captioned (%p%)')
         self.progress_bar.hide()
+        self.progress_bar.valueChanged.connect(
+            lambda _: self.caption_button_state_changed.emit())
         self.console_text_edit = QPlainTextEdit()
         set_text_edit_height(self.console_text_edit, 4)
         self.console_text_edit.setReadOnly(True)
@@ -707,11 +712,13 @@ class AutoCaptioner(QDockWidget):
         # Keep the docked button and its floating copy in sync.
         self.start_cancel_button.setText(text)
         self.floating_start_cancel_button.setText(text)
+        self.caption_button_state_changed.emit()
 
     def set_start_cancel_button_enabled(self, enabled: bool):
         # Keep the docked button and its floating copy in sync.
         self.start_cancel_button.setEnabled(enabled)
         self.floating_start_cancel_button.setEnabled(enabled)
+        self.caption_button_state_changed.emit()
 
     @Slot()
     def focus_start_cancel_button(self):
@@ -842,6 +849,12 @@ class AutoCaptioner(QDockWidget):
         alert = QMessageBox()
         alert.setIcon(icon)
         alert.setText(text)
+        if self.captioning_thread.is_error:
+            # The console may be hidden (e.g. in focus mode), so include its
+            # last lines.
+            console_lines = self.console_text_edit.toPlainText().splitlines()
+            if console_lines:
+                alert.setDetailedText('\n'.join(console_lines[-15:]))
         alert.exec()
 
     @Slot(str)
@@ -971,6 +984,7 @@ class AutoCaptioner(QDockWidget):
             self.progress_bar.setRange(0, selected_image_count)
             self.progress_bar.setValue(0)
             self.progress_bar.show()
+            self.caption_button_state_changed.emit()
         tag_separator = get_tag_separator()
         models_directory_path = self.settings.value(
             'models_directory_path',

@@ -356,6 +356,11 @@ class ImageViewer(QWidget):
     # Emitted on a right click over the single-image preview (not the grid),
     # carrying the global screen position where a context menu should appear.
     image_context_menu_requested = Signal(QPoint)
+    # Clicks on the focus mode control bar (bottom-right): previous / next
+    # image and start or cancel auto-captioning.
+    focus_previous_image_requested = Signal()
+    focus_next_image_requested = Signal()
+    focus_caption_requested = Signal()
 
     def __init__(self, proxy_image_list_model: ProxyImageListModel):
         super().__init__()
@@ -407,7 +412,7 @@ class ImageViewer(QWidget):
         # page buttons. The buttons stay even if the page/count text is turned
         # off in Settings, so mouse users can always change page.
         self._grid_overlay = QFrame(self.scroll_area.viewport())
-        self._grid_overlay.setObjectName('gridOverlay')
+        self._grid_overlay.setObjectName('overlayBar')
         # Clicks and wheel turns on the overlay must not reach the viewport,
         # where they would select a cell, start a pan or zoom.
         self._grid_overlay.setAttribute(
@@ -415,11 +420,11 @@ class ImageViewer(QWidget):
         overlay_layout = QHBoxLayout(self._grid_overlay)
         overlay_layout.setContentsMargins(0, 0, 0, 0)
         overlay_layout.setSpacing(0)
-        self._grid_previous_page_button = self._make_page_button(
-            '\u25c0', 'Previous page', -1)
+        self._grid_previous_page_button = self._make_overlay_button(
+            '\u25c0', 'Previous page', lambda: self.go_to_grid_page(-1))
         self._grid_overlay_label = QLabel()
-        self._grid_next_page_button = self._make_page_button(
-            '\u25b6', 'Next page', 1)
+        self._grid_next_page_button = self._make_overlay_button(
+            '\u25b6', 'Next page', lambda: self.go_to_grid_page(1))
         overlay_layout.addWidget(self._grid_previous_page_button)
         overlay_layout.addWidget(self._grid_overlay_label)
         overlay_layout.addWidget(self._grid_next_page_button)
@@ -431,12 +436,36 @@ class ImageViewer(QWidget):
             DEFAULT_SETTINGS['variant_grid_overlay_transparency'])
         self._grid_overlay_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        # Image-count overlay (bottom-right), shown only in focus mode, where
-        # the Images pane and its "Image N / M" label are hidden.
-        self._focus_overlay_label = QLabel(self.scroll_area.viewport())
+        # Control bar (bottom-right), shown only in focus mode, where the
+        # Images and Auto-Captioner panes are hidden: previous / next image
+        # buttons around the "Image N / M" label, and an auto-caption button.
+        self._focus_overlay = QFrame(self.scroll_area.viewport())
+        self._focus_overlay.setObjectName('overlayBar')
+        self._focus_overlay.setAttribute(
+            Qt.WidgetAttribute.WA_NoMousePropagation)
+        focus_layout = QHBoxLayout(self._focus_overlay)
+        focus_layout.setContentsMargins(0, 0, 0, 0)
+        focus_layout.setSpacing(0)
+        self._focus_previous_image_button = self._make_overlay_button(
+            '\u25c0', 'Previous image',
+            self.focus_previous_image_requested.emit)
+        self._focus_overlay_label = QLabel()
         self._focus_overlay_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._focus_overlay_label.hide()
+        self._focus_next_image_button = self._make_overlay_button(
+            '\u25b6', 'Next image', self.focus_next_image_requested.emit)
+        separator = QFrame()
+        separator.setObjectName('overlaySeparator')
+        separator.setFixedWidth(1)
+        self._focus_caption_button = self._make_overlay_button(
+            'Auto-Caption', 'Start auto-captioning the selected images',
+            self.focus_caption_requested.emit)
+        for widget in (self._focus_previous_image_button,
+                       self._focus_overlay_label,
+                       self._focus_next_image_button, separator,
+                       self._focus_caption_button):
+            focus_layout.addWidget(widget)
+        self._focus_overlay.hide()
         self._focus_overlay_enabled = False
         self.refresh_grid_overlay_style()
         self.scroll_area.clicked.connect(lambda: self.clicked.emit())
@@ -505,8 +534,10 @@ class ImageViewer(QWidget):
                       f'border-radius: 6px;')
         text = (f'color: rgba(255, 255, 255, 220); '
                 f'font-size: {font_size}pt;')
-        self._grid_overlay.setStyleSheet(
-            f'QFrame#gridOverlay {{ {background} }}'
+        style = (
+            f'QFrame#overlayBar {{ {background} }}'
+            f'QFrame#overlaySeparator {{ background-color: '
+            f'rgba(255, 255, 255, 60); margin: 5px 0; }}'
             f'QLabel {{ background: transparent; {text} padding: 3px 8px; }}'
             f'QToolButton {{ background: transparent; border: none; '
             f'border-radius: 6px; {text} padding: 3px 8px; }}'
@@ -515,8 +546,8 @@ class ImageViewer(QWidget):
             f'QToolButton:pressed {{ background-color: '
             f'rgba(255, 255, 255, 90); }}'
             f'QToolButton:disabled {{ color: rgba(255, 255, 255, 70); }}')
-        self._focus_overlay_label.setStyleSheet(
-            f'{background} {text} padding: 3px 8px;')
+        self._grid_overlay.setStyleSheet(style)
+        self._focus_overlay.setStyleSheet(style)
         # Show/hide immediately to reflect a toggled "show overlay" setting.
         self._update_grid_overlay()
         self._update_focus_overlay()
@@ -534,35 +565,54 @@ class ImageViewer(QWidget):
         self._focus_overlay_enabled = enabled
         self._update_focus_overlay()
 
+    def set_focus_navigation_enabled(self, has_previous: bool,
+                                     has_next: bool):
+        self._focus_previous_image_button.setEnabled(has_previous)
+        self._focus_next_image_button.setEnabled(has_next)
+
+    def set_focus_caption_state(self, text: str, tool_tip: str,
+                                enabled: bool):
+        button = self._focus_caption_button
+        button.setText(text)
+        button.setToolTip(tool_tip)
+        button.setEnabled(enabled)
+        self._update_focus_overlay()
+
     def _update_focus_overlay(self):
-        label = self._focus_overlay_label
-        if not self._focus_overlay_enabled or not label.text():
-            label.hide()
+        overlay = self._focus_overlay
+        if not self._focus_overlay_enabled:
+            overlay.hide()
             return
-        label.adjustSize()
-        label.show()
-        label.raise_()
+        has_image = bool(self._focus_overlay_label.text())
+        self._focus_overlay_label.setVisible(has_image)
+        self._focus_previous_image_button.setVisible(has_image)
+        self._focus_next_image_button.setVisible(has_image)
+        overlay.adjustSize()
+        overlay.show()
+        overlay.raise_()
         self._position_focus_overlay()
 
     def _position_focus_overlay(self):
-        """Keep the focus mode overlay pinned to the bottom-right."""
-        label = self._focus_overlay_label
-        if not label.isVisible():
+        """Keep the focus mode control bar pinned to the bottom-right."""
+        overlay = self._focus_overlay
+        if not overlay.isVisible():
             return
         margin = 10
         viewport = self.scroll_area.viewport()
-        label.move(viewport.width() - label.width() - margin,
-                   viewport.height() - label.height() - margin)
+        # Never let the left edge (the ◀ button) slide off a narrow viewport.
+        overlay.move(max(margin, viewport.width() - overlay.width() - margin),
+                     viewport.height() - overlay.height() - margin)
 
-    def _make_page_button(self, text: str, tool_tip: str,
-                          step: int) -> QToolButton:
+    @staticmethod
+    def _make_overlay_button(text: str, tool_tip: str,
+                             slot) -> QToolButton:
         button = QToolButton()
         button.setText(text)
         button.setToolTip(tool_tip)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         # Clicking must not take keyboard focus from where the user was.
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        button.clicked.connect(lambda: self.go_to_grid_page(step))
+        button.clicked.connect(lambda: slot())
         return button
 
     def _grid_page_info(self) -> tuple[int, int, int]:
