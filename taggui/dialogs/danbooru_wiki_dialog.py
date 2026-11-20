@@ -744,8 +744,16 @@ class DanbooruPostsSearchThread(QThread):
         try:
             with danbooru_urlopen(posts_url, timeout=10) as response:
                 if response.status != 200:
+                    # Danbooru explains rejected searches (e.g. "You cannot
+                    # search for more than 2 tags at a time") in a JSON body.
+                    message = ''
+                    try:
+                        message = str(json.loads(response.read().decode(
+                            'utf-8', errors='replace')).get('message') or '')
+                    except Exception:
+                        pass
                     self.posts_failed.emit(
-                        self.request_key,
+                        self.request_key, message or
                         f'Danbooru returned status {response.status}.')
                     return
                 payload = response.read().decode('utf-8', errors='replace')
@@ -1357,13 +1365,25 @@ class DanbooruWikiDialog(BaseWikiDialog):
             if popup is not None:
                 popup.hide()
             self.stop_all_autocomplete_threads()
-            tag = self.normalize_tag(
-                self.extract_tag_name_from_search_text(remainder))
-            if not tag:
+            # Commas separate tags ("posts: dog, cat"); spaces within a tag
+            # become underscores as usual.
+            tags = []
+            for part in remainder.split(','):
+                tag = self.normalize_tag(
+                    self.extract_tag_name_from_search_text(part))
+                if tag and tag not in tags:
+                    tags.append(tag)
+            if not tags:
                 return
-            self.load_posts_search(tag, 1, add_to_history=True)
+            self.load_posts_search(' '.join(tags), 1, add_to_history=True)
             return
         super().search_tag()
+
+    @staticmethod
+    def _posts_display_tags(tags: str) -> str:
+        """Readable form of a posts search, e.g. "dog cat_ears" ->
+        "dog, cat ears"."""
+        return ', '.join(tag.replace('_', ' ') for tag in str(tags).split())
 
     @Slot(str, str)
     def show_not_found(self, request_key: str, normalized_tag: str):
@@ -1522,10 +1542,13 @@ class DanbooruWikiDialog(BaseWikiDialog):
             self.tag_history.append({'type': 'posts', 'tags': tags,
                                      'page': page})
             self.history_index = len(self.tag_history) - 1
-        display_tags = tags.replace('_', ' ')
+        display_tags = self._posts_display_tags(tags)
         self.current_request_key = f'posts:{tags}:{page}'
         self.setWindowTitle(f'Danbooru Posts: {display_tags} (page {page})')
-        self.set_search_text_silently(display_tags)
+        # A multi-tag search keeps its "posts:" prefix in the box so pressing
+        # Enter again repeats the same search rather than a wiki lookup.
+        self.set_search_text_silently(
+            f'posts: {display_tags}' if ' ' in tags else display_tags)
         self._active_composer = None
         self.show_loading()
         self._set_browser_html('')
@@ -1588,7 +1611,7 @@ class DanbooruWikiDialog(BaseWikiDialog):
         category_color = self._category_id_to_color(state.get('category'))
         if category_color:
             heading_color = category_color
-        display_tags = tags.replace('_', ' ')
+        display_tags = self._posts_display_tags(tags)
         # Record the ordered ids so a post opened from this grid can offer
         # prev/next and a link back to this search page.
         self._grid_context = {
