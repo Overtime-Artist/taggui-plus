@@ -658,6 +658,10 @@ prefixes:
   `posts:no humans`. Separate several tags with commas to find posts that have
   all of them, e.g. `posts: dog, cat`. Danbooru limits how many tags you can
   search at once; signing in (below) raises that limit.
+- On a post's page, **View full size** (or clicking the image) opens the
+  original image in a zoomable window, and **Download original** saves it
+  (the save dialog starts in the folder you last used). Videos offer only the
+  download.
 - Typing anything without a prefix does a normal wiki lookup for that tag.
 
 **Signing in to Danbooru (optional):** in **`Settings` → `Danbooru Account`**,

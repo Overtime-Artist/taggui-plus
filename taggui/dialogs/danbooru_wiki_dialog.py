@@ -1,20 +1,25 @@
 import html
 import json
 import re
-from base64 import b64encode
+import shutil
+import tempfile
+from base64 import b64decode, b64encode
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlencode
 
-from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QThread, Qt,
-                            QTimer, QUrl, Signal, Slot)
-from PySide6.QtGui import (QColor, QDesktopServices, QFontMetrics, QPainter,
-                           QPainterPath, QPixmap, QStandardItem,
-                           QStandardItemModel)
-from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel,
+from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QStandardPaths,
+                            QThread, Qt, QTimer, QUrl, Signal, Slot)
+from PySide6.QtGui import (QColor, QDesktopServices, QFontMetrics,
+                           QImageReader, QPainter, QPainterPath, QPixmap,
+                           QStandardItem, QStandardItemModel)
+from PySide6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel,
                                QCompleter, QLineEdit, QPushButton, QTextBrowser,
                                QVBoxLayout)
 
+from dialogs.danbooru_image_viewer import DanbooruImageViewerDialog
 from models.tag_library_model import TagLibraryModel
+from utils.settings import get_settings
 from utils.danbooru_session import (api_key_problem, cancel_pending_fetches,
                                     danbooru_urlopen,
                                     initialize_on_main_thread)
@@ -35,6 +40,11 @@ WIKI_INTERNAL_LINK_PREFIX_LEGACY = 'taggui-wiki://'
 # routed by handle_anchor_clicked just like the wiki links above.
 POST_INTERNAL_LINK_PREFIX = 'taggui-post:'
 POSTS_INTERNAL_LINK_PREFIX = 'taggui-posts:'
+# A post's original (full-size) file: ``taggui-original:action=view&id=<n>``
+# opens it in the full-size viewer, ``action=download`` saves it to disk.
+ORIGINAL_INTERNAL_LINK_PREFIX = 'taggui-original:'
+# Remembers the folder the last original was saved to.
+DOWNLOAD_DIRECTORY_SETTING = 'danbooru_download_directory'
 HEADING_WITH_ANCHOR_PATTERN = re.compile(
     r'^h([1-6])(?:#([A-Za-z0-9_-]+))?\.\s*(.*)$', re.IGNORECASE
 )
@@ -817,6 +827,54 @@ class DanbooruPostViewThread(QThread):
         self.post_ready.emit(self.request_key, post)
 
 
+class DanbooruOriginalFetchThread(QThread):
+    """Downloads a post's original file into ``destination``."""
+    original_ready = Signal(str, str)
+    original_failed = Signal(str, str)
+
+    def __init__(self, post_id: str, file_url: str, destination: Path):
+        super().__init__()
+        self.post_id = str(post_id)
+        self.file_url = file_url
+        self.destination = destination
+
+    def run(self):
+        try:
+            # Originals can be 100 MB, hence the long timeout.
+            with danbooru_urlopen(self.file_url, timeout=300) as response:
+                if response.status != 200:
+                    raise OSError(f'Danbooru returned status {response.status}.')
+                file_bytes = response.read()
+            if self.isInterruptionRequested():
+                return
+            if not file_bytes:
+                raise OSError('Danbooru returned an empty file.')
+            self.destination.write_bytes(file_bytes)
+        except Exception as exception:
+            self.original_failed.emit(self.post_id,
+                                      str(exception) or 'Download failed.')
+            return
+        self.original_ready.emit(self.post_id, str(self.destination))
+
+
+def original_file_extension(post: dict) -> str:
+    extension = str(post.get('file_ext') or '').lower()
+    if not extension:
+        extension = Path(urlparse(str(post.get('file_url') or '')).path
+                         ).suffix.lstrip('.').lower()
+    return re.sub(r'[^a-z0-9]', '', extension)
+
+
+def original_is_viewable(post: dict) -> bool:
+    """Whether the original is a still image this app can display."""
+    extension = original_file_extension(post)
+    if not extension or extension in ('mp4', 'webm', 'zip', 'swf'):
+        return False
+    formats = {bytes(name).decode().lower()
+               for name in QImageReader.supportedImageFormats()}
+    return extension in formats
+
+
 class DanbooruTagAutocompleteThread(QThread):
     suggestions_ready = Signal(str, list)
     tag_group_titles_cache = None
@@ -1047,6 +1105,14 @@ class DanbooruWikiDialog(BaseWikiDialog):
         # added to the Tag Library / images, so a typo like "heart on cheeks"
         # -- which has no wiki page AND no posts -- stays non-addable.
         self._valid_posts_tags: set[str] = set()
+        # Originals downloaded this session ({post id: file path}) live in a
+        # temporary folder removed when the dialog closes.
+        self._originals_directory: Path | None = None
+        self._original_paths: dict[str, Path] = {}
+        # {post id: (thread, [(on_ready, on_failed), ...])} for downloads
+        # still running, so a second request for the same post shares one.
+        self._original_fetches: dict[str, tuple] = {}
+        self._image_viewer = None
         self._torn_down = False
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -1075,9 +1141,18 @@ class DanbooruWikiDialog(BaseWikiDialog):
         self.stop_all_fetch_threads()
         self.stop_all_autocomplete_threads(wait=True)
         self.stop_all_posts_threads()
+        park_running_threads([thread for thread, _callbacks
+                              in self._original_fetches.values()])
+        self._original_fetches.clear()
+        if self._image_viewer is not None:
+            self._image_viewer.close()
+            self._image_viewer = None
         # Then release any worker blocked on an in-flight browser page fetch so
         # the parked threads wind down promptly.
         cancel_pending_fetches()
+        if self._originals_directory is not None:
+            shutil.rmtree(self._originals_directory, ignore_errors=True)
+            self._originals_directory = None
 
     def done(self, result):
         self._teardown()
@@ -1708,6 +1783,183 @@ class DanbooruWikiDialog(BaseWikiDialog):
         self.hide_loading()
         self.update_add_to_library_button_state()
 
+    # --- Original (full-size) files -----------------------------------------
+
+    def _post_for_original_link(self, post_id: str):
+        post = self._stored_post or {}
+        if str(post.get('id')) != str(post_id) or not post.get('file_url'):
+            return None
+        return post
+
+    def _request_original(self, post: dict, on_ready, on_failed):
+        """Call ``on_ready(post_id, path)`` once the post's original is on
+        disk (straight away if it already is), or ``on_failed(post_id,
+        message)``."""
+        post_id = str(post.get('id'))
+        path = self._original_paths.get(post_id)
+        if path is not None and path.is_file():
+            on_ready(post_id, str(path))
+            return
+        if post_id in self._original_fetches:
+            self._original_fetches[post_id][1].append((on_ready, on_failed))
+            return
+        try:
+            if self._originals_directory is None:
+                self._originals_directory = Path(
+                    tempfile.mkdtemp(prefix='taggui-danbooru-'))
+        except OSError as exception:
+            on_failed(post_id, str(exception))
+            return
+        extension = original_file_extension(post) or 'bin'
+        destination = self._originals_directory / f'{post_id}.{extension}'
+        thread = DanbooruOriginalFetchThread(
+            post_id, str(post.get('file_url')), destination)
+        self._original_fetches[post_id] = (thread, [(on_ready, on_failed)])
+        thread.original_ready.connect(self._on_original_ready)
+        thread.original_failed.connect(self._on_original_failed)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    @Slot(str, str)
+    def _on_original_ready(self, post_id: str, path_text: str):
+        _thread, callbacks = self._original_fetches.pop(post_id, (None, []))
+        if self._torn_down:
+            return
+        self._original_paths[post_id] = Path(path_text)
+        self._prune_original_files()
+        for on_ready, _on_failed in callbacks:
+            on_ready(post_id, path_text)
+
+    @Slot(str, str)
+    def _on_original_failed(self, post_id: str, message: str):
+        _thread, callbacks = self._original_fetches.pop(post_id, (None, []))
+        if self._torn_down:
+            return
+        for _on_ready, on_failed in callbacks:
+            on_failed(post_id, message)
+
+    def _prune_original_files(self, keep: int = 3):
+        """Originals can be huge, so only the most recent few stay on disk."""
+        viewer_post_id = (str(self._image_viewer.post.get('id'))
+                          if self._image_viewer is not None else None)
+        for post_id in list(self._original_paths):
+            if len(self._original_paths) <= keep:
+                break
+            if post_id == viewer_post_id:
+                continue
+            path = self._original_paths.pop(post_id)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _write_sample_file(self, post: dict) -> Path | None:
+        """Save the sample image already shown on the post page, so the
+        viewer can show it while the original downloads."""
+        match = re.match(r'data:image/([a-z0-9.+-]+);base64,(.*)$',
+                         str(post.get('_taggui_image_data_url') or ''),
+                         re.IGNORECASE | re.DOTALL)
+        if not match or self._originals_directory is None:
+            return None
+        extension = re.sub(r'[^a-z0-9]', '', match.group(1).lower())
+        path = (self._originals_directory
+                / f'sample_{post.get("id")}.{extension or "img"}')
+        try:
+            path.write_bytes(b64decode(match.group(2)))
+        except (OSError, ValueError):
+            return None
+        return path
+
+    def view_original(self, post: dict):
+        if self._image_viewer is None:
+            viewer = DanbooruImageViewerDialog(self)
+            viewer.download_requested.connect(
+                lambda requested_post: self.download_original(
+                    requested_post, self._image_viewer))
+            viewer.finished.connect(self._on_image_viewer_closed)
+            self._image_viewer = viewer
+        viewer = self._image_viewer
+        post_id = str(post.get('id'))
+        cached_path = self._original_paths.get(post_id)
+        if cached_path is not None and cached_path.is_file():
+            viewer.show_post(post, None)
+        else:
+            if self._originals_directory is None:
+                try:
+                    self._originals_directory = Path(
+                        tempfile.mkdtemp(prefix='taggui-danbooru-'))
+                except OSError:
+                    pass
+            viewer.show_post(post, self._write_sample_file(post))
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
+        self._request_original(post, self._on_viewer_original_ready,
+                               self._on_viewer_original_failed)
+
+    def _on_viewer_original_ready(self, post_id: str, path_text: str):
+        if self._image_viewer is not None:
+            self._image_viewer.show_original(post_id, Path(path_text))
+
+    def _on_viewer_original_failed(self, post_id: str, message: str):
+        if self._image_viewer is not None:
+            self._image_viewer.show_original_failed(post_id, message)
+
+    @Slot()
+    def _on_image_viewer_closed(self):
+        viewer = self.sender()
+        if viewer is self._image_viewer:
+            self._image_viewer = None
+        if viewer is not None:
+            viewer.deleteLater()
+        if not self._torn_down:
+            self.activateWindow()
+            self.content_browser.setFocus()
+
+    def download_original(self, post: dict, dialog_parent=None):
+        post_id = str(post.get('id'))
+        if not post.get('file_url'):
+            return
+        settings = get_settings()
+        directory = settings.value(DOWNLOAD_DIRECTORY_SETTING, '', type=str)
+        if not directory or not Path(directory).is_dir():
+            directory = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DownloadLocation)
+        extension = original_file_extension(post) or 'bin'
+        suggested_path = str(Path(directory) / f'danbooru_{post_id}.{extension}')
+        file_path, _ = QFileDialog.getSaveFileName(
+            dialog_parent or self, 'Download Original Image', suggested_path,
+            f'{extension.upper()} files (*.{extension});;All files (*)')
+        if not file_path:
+            return
+        target = Path(file_path)
+        settings.setValue(DOWNLOAD_DIRECTORY_SETTING, str(target.parent))
+        self._set_download_status(
+            post_id, f'Downloading the original of post #{post_id}\u2026')
+
+        def save(ready_post_id: str, path_text: str):
+            try:
+                shutil.copyfile(path_text, target)
+            except OSError as exception:
+                self._set_download_status(
+                    ready_post_id, f"Couldn't save {target.name}: {exception}")
+                return
+            self._set_download_status(ready_post_id, f'Saved {target}')
+
+        def fail(failed_post_id: str, message: str):
+            self._set_download_status(
+                failed_post_id,
+                f"Couldn't download post #{failed_post_id}: {message}")
+
+        self._request_original(post, save, fail)
+
+    def _set_download_status(self, post_id: str, message: str):
+        self.show_status_message(message)
+        viewer = self._image_viewer
+        if (viewer is not None and str(viewer.post.get('id')) == post_id
+                and viewer.showing_original):
+            viewer.set_status(message)
+
     def _compose_post_html(self) -> str:
         post = self._stored_post or {}
         if not post:
@@ -1722,9 +1974,30 @@ class DanbooruWikiDialog(BaseWikiDialog):
         nav_html = self._build_post_nav_html(
             post_id, query, neighbors, page, is_dark)
         image_html = self._build_post_image_html(post)
+        original_html = self._build_post_original_html(post, is_dark)
         info_html = self._build_post_info_html(post, is_dark)
         tags_html = self._build_post_tags_html(post, is_dark)
-        return nav_html + image_html + info_html + tags_html
+        return nav_html + image_html + original_html + info_html + tags_html
+
+    def _build_post_original_html(self, post: dict, is_dark: bool) -> str:
+        if not post.get('file_url'):
+            # Restricted posts don't reveal their file.
+            return ''
+        link_color = '#6baef6' if is_dark else '#0066cc'
+        post_id = str(post.get('id'))
+        links = []
+        actions = ['download']
+        if original_is_viewable(post):
+            actions.insert(0, 'view')
+        for action in actions:
+            url = ORIGINAL_INTERNAL_LINK_PREFIX + urlencode(
+                {'action': action, 'id': post_id})
+            label = ('View full size' if action == 'view'
+                     else 'Download original')
+            links.append(f'<a href="{html.escape(url, quote=True)}" '
+                         f'style="color: {link_color};">{label}</a>')
+        return ('<p style="margin: 4px 0;">'
+                + ' &nbsp;|&nbsp; '.join(links) + '</p>')
 
     def _build_post_nav_html(self, post_id: str, query: str, neighbors: list,
                              page: int, is_dark: bool) -> str:
@@ -1787,8 +2060,14 @@ class DanbooruWikiDialog(BaseWikiDialog):
             size_attr = f'width="{display_width}"'
         else:
             size_attr = 'style="max-width: 100%;"'
-        return ('<p style="margin: 4px 0;"><img src="'
-                f'{html.escape(data_url, quote=True)}" {size_attr}></p>')
+        image_html = (f'<img src="{html.escape(data_url, quote=True)}" '
+                      f'{size_attr}>')
+        if post.get('file_url') and original_is_viewable(post):
+            view_url = ORIGINAL_INTERNAL_LINK_PREFIX + urlencode(
+                {'action': 'view', 'id': str(post.get('id'))})
+            image_html = (f'<a href="{html.escape(view_url, quote=True)}">'
+                          f'{image_html}</a>')
+        return f'<p style="margin: 4px 0;">{image_html}</p>'
 
     def _build_post_info_html(self, post: dict, is_dark: bool) -> str:
         note_color = '#9aa0aa' if is_dark else '#555555'
@@ -2507,7 +2786,8 @@ class DanbooruWikiDialog(BaseWikiDialog):
         if url_text.startswith(WIKI_INTERNAL_LINK_PREFIX):
             return False
         if (url_text.startswith(POST_INTERNAL_LINK_PREFIX)
-                or url_text.startswith(POSTS_INTERNAL_LINK_PREFIX)):
+                or url_text.startswith(POSTS_INTERNAL_LINK_PREFIX)
+                or url_text.startswith(ORIGINAL_INTERNAL_LINK_PREFIX)):
             return False
         # The deprecation-notice help page is opened in the external browser
         # rather than navigated to inside the dialog.
@@ -2565,6 +2845,16 @@ class DanbooruWikiDialog(BaseWikiDialog):
             if search_tags:
                 self.load_posts_search(search_tags, search_page,
                                        add_to_history=True)
+            return
+        if url_text.startswith(ORIGINAL_INTERNAL_LINK_PREFIX):
+            params = parse_qs(url_text[len(ORIGINAL_INTERNAL_LINK_PREFIX):])
+            post = self._post_for_original_link(
+                (params.get('id') or [''])[0])
+            if post is not None:
+                if (params.get('action') or [''])[0] == 'view':
+                    self.view_original(post)
+                else:
+                    self.download_original(post)
             return
 
         decoded_url_text = unquote(url_text)
