@@ -220,6 +220,7 @@ You can also clear just the thumbnail cache from
 | Scan caches (`dimension_cache.json`, `caption_cache.json`, `completion_cache.json`) | `%LOCALAPPDATA%\taggui` | `~/Library/Caches/taggui` | `~/.cache/taggui` |
 | Settings backups made by Reset to Defaults (`settings-backup-*.json`) | `%LOCALAPPDATA%\taggui` | `~/Library/Caches/taggui` | `~/.cache/taggui` |
 | Danbooru wiki browser profile (Cloudflare/login cookies and a small cache) | `%APPDATA%\taggui\taggui\QtWebEngine\taggui-danbooru` and `%LOCALAPPDATA%\taggui\taggui\cache\QtWebEngine\taggui-danbooru` | A `QtWebEngine/taggui-danbooru` folder under `~/Library/Application Support/taggui` and under `~/Library/Caches/taggui` | A `QtWebEngine/taggui-danbooru` folder under `~/.local/share/taggui` and under `~/.cache/taggui` |
+| Saved Danbooru API key (only if you added one) | Windows Credential Manager, generic credential `TagGUI Plus` | Keychain, service `TagGUI Plus` | Secret Service keyring, service `TagGUI Plus` |
 | Downloaded captioning models (often several GB) | Your configured models directory, or the Hugging Face cache `%USERPROFILE%\.cache\huggingface` (or wherever `HF_HUB_CACHE` / `HF_HOME` points) | Your models directory, or `~/.cache/huggingface` | Your models directory, or `~/.cache/huggingface` |
 
 </details>
@@ -654,8 +655,25 @@ prefixes:
   search bar with no prefix), which lists every tag group in its table of
   contents.
 - To search **posts** for a tag, type `posts:` followed by the tag — for example
-  `posts:no humans`.
+  `posts:no humans`. Separate several tags with commas to find posts that have
+  all of them, e.g. `posts: dog, cat`. Danbooru limits how many tags you can
+  search at once; signing in (below) raises that limit.
 - Typing anything without a prefix does a normal wiki lookup for that tag.
+
+**Signing in to Danbooru (optional):** in **`Settings` → `Danbooru Account`**,
+enter your Danbooru user name and an API key (create one at
+[danbooru.donmai.us/api_keys](https://danbooru.donmai.us/api_keys)), then press
+**Save and Test**. The wiki then uses your account's limits. For safety:
+
+- Give the key only read permissions (`posts`, `wiki_pages`, `tags`,
+  `tag_aliases`, `tag_implications`, `media_assets`, `autocomplete` and
+  `users:profile`), or leave the permissions empty to allow everything.
+- The key is kept in your system password store (Windows Credential Manager,
+  macOS Keychain, or the Secret Service keyring on Linux), never in TagGUI's
+  settings or settings exports, and is only sent to `danbooru.donmai.us` over
+  HTTPS. It is never shown again after saving.
+- **Remove** in Settings (or **Remove app data**) deletes it from this computer.
+  To revoke the key completely, also delete it on the Danbooru API keys page.
 
 > [!NOTE]
 > You can add **any legitimate Danbooru tag** to your Tag Library or images, even

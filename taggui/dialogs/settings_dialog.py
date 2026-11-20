@@ -1,6 +1,6 @@
 import sys
 
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QGridLayout, QLabel,
                                QLineEdit, QMessageBox, QPushButton, QScrollArea,
@@ -10,6 +10,11 @@ from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QGridLayout, 
 from models.tag_library_model import TagLibraryModel
 from auto_captioning.models_list import MODELS
 from dialogs.remove_app_data_dialog import RemoveAppDataDialog
+from dialogs.wiki_dialog_base import park_running_threads
+from utils import credentials
+from utils.danbooru_session import (DANBOORU_CREDENTIALS_SITE,
+                                    initialize_on_main_thread,
+                                    reset_api_key_state, verify_api_key)
 from utils.enums import ThemeMode
 from utils.settings_export_import import (EXPORT_CATEGORIES,
                                           backup_all_settings)
@@ -20,6 +25,18 @@ from utils.settings_widgets import (SettingsBigCheckBox, SettingsComboBox,
                                     FocusedScrollSettingsComboBox,
                                     FocusedScrollSettingsSpinBox)
 from utils.thumbnail_cache import clear_cache, get_cache_size_bytes
+
+
+class _DanbooruKeyCheckThread(QThread):
+    """Checks the saved Danbooru API key off the GUI thread."""
+    checked = Signal(object, str)
+
+    def run(self):
+        try:
+            ok, message = verify_api_key()
+        except Exception as exception:
+            ok, message = None, f'Couldn\'t check the key: {exception}'
+        self.checked.emit(ok, message)
 
 
 class IsolatedScrollArea(QScrollArea):
@@ -679,6 +696,9 @@ class SettingsDialog(QDialog):
         grid_layout.addWidget(self.auto_apply_implications_combo_box, row, 1,
                             Qt.AlignmentFlag.AlignLeft)
 
+        # Danbooru Account
+        self._build_danbooru_account_section(add_section('Danbooru Account'))
+
         # External Tools
         grid_layout = add_section('External Tools')
         row = 0
@@ -770,6 +790,159 @@ class SettingsDialog(QDialog):
     def show_restart_warning(self):
         self.warning_label.setText(self.restart_warning)
         self.warning_label.show()
+
+    def _build_danbooru_account_section(self, grid_layout):
+        """User name + API key, kept in the OS password store (never in
+        QSettings). The saved key is never shown again or put back into the
+        field."""
+        self._danbooru_check_thread = None
+        row = 0
+        self.danbooru_login_line_edit = QLineEdit()
+        self.danbooru_login_line_edit.setPlaceholderText('Your Danbooru user name')
+        self.danbooru_api_key_line_edit = QLineEdit()
+        self.danbooru_api_key_line_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.danbooru_api_key_line_edit.setInputMethodHints(
+            Qt.InputMethodHint.ImhHiddenText
+            | Qt.InputMethodHint.ImhSensitiveData
+            | Qt.InputMethodHint.ImhNoPredictiveText)
+        self.danbooru_api_key_line_edit.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.NoContextMenu)
+        grid_layout.addWidget(QLabel('User name'), row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid_layout.addWidget(self.danbooru_login_line_edit, row, 1)
+        row += 1
+        grid_layout.addWidget(QLabel('API key'), row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid_layout.addWidget(self.danbooru_api_key_line_edit, row, 1)
+        row += 1
+
+        self.danbooru_save_button = QPushButton('Save and Test')
+        self.danbooru_save_button.setAutoDefault(False)
+        self.danbooru_save_button.clicked.connect(self._save_danbooru_account)
+        self.danbooru_remove_button = QPushButton('Remove')
+        self.danbooru_remove_button.setAutoDefault(False)
+        self.danbooru_remove_button.clicked.connect(
+            self._remove_danbooru_account)
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.danbooru_save_button)
+        buttons_layout.addWidget(self.danbooru_remove_button)
+        buttons_layout.addStretch()
+        grid_layout.addLayout(buttons_layout, row, 1)
+        row += 1
+
+        self.danbooru_account_status_label = QLabel()
+        self.danbooru_account_status_label.setWordWrap(True)
+        grid_layout.addWidget(self.danbooru_account_status_label, row, 1)
+        row += 1
+
+        help_label = QLabel(
+            'Optional. Signing in lets the Danbooru wiki use your account\'s '
+            'limits (e.g. searching more tags at once). Create a key at '
+            '<a href="https://danbooru.donmai.us/api_keys">'
+            'danbooru.donmai.us/api_keys</a>. For safety, give it only read '
+            'permissions (posts, wiki pages, tags, tag aliases, tag '
+            'implications, media assets, autocomplete and users:profile). '
+            'The key is only sent to danbooru.donmai.us over HTTPS.')
+        help_label.setWordWrap(True)
+        help_label.setOpenExternalLinks(True)
+        help_label.setTextFormat(Qt.TextFormat.RichText)
+        help_font = QFont()
+        help_font.setPointSize(9)
+        help_label.setFont(help_font)
+        grid_layout.addWidget(help_label, row, 1)
+
+        self._refresh_danbooru_account_state()
+
+    def _refresh_danbooru_account_state(self, status: str = ''):
+        available = credentials.is_store_available()
+        saved = (credentials.get_site_credentials(DANBOORU_CREDENTIALS_SITE)
+                 if available else None)
+        checking = self._danbooru_check_thread is not None
+        for widget in (self.danbooru_login_line_edit,
+                       self.danbooru_api_key_line_edit):
+            widget.setEnabled(available and not checking)
+        self.danbooru_save_button.setEnabled(available and not checking)
+        self.danbooru_remove_button.setEnabled(bool(saved) and not checking)
+        if saved:
+            self.danbooru_login_line_edit.setText(saved[0])
+            self.danbooru_api_key_line_edit.setPlaceholderText(
+                'Saved (hidden). Enter a new key to replace it.')
+        else:
+            self.danbooru_api_key_line_edit.setPlaceholderText(
+                'Paste your API key')
+        if not status:
+            if not available:
+                status = ('No secure password store is available on this '
+                          'computer, so an API key can\'t be saved.')
+                if sys.platform.startswith('linux'):
+                    status += (' Install and unlock a keyring service such '
+                               'as GNOME Keyring or KWallet.')
+            elif saved:
+                status = f'An API key is saved in {credentials.store_name()}.'
+            else:
+                status = 'Not signed in.'
+        self.danbooru_account_status_label.setText(status)
+
+    @Slot()
+    def _save_danbooru_account(self):
+        login = self.danbooru_login_line_edit.text().strip()
+        api_key = self.danbooru_api_key_line_edit.text().strip()
+        saved = credentials.get_site_credentials(DANBOORU_CREDENTIALS_SITE)
+        if not api_key and saved:
+            api_key = saved[1]
+        if not login or not api_key:
+            self._refresh_danbooru_account_state(
+                'Enter both your user name and API key.')
+            return
+        try:
+            credentials.set_site_credentials(
+                DANBOORU_CREDENTIALS_SITE, login, api_key)
+        except Exception as exception:
+            self._refresh_danbooru_account_state(
+                f'The API key could not be saved: {exception}')
+            return
+        self.danbooru_api_key_line_edit.clear()
+        reset_api_key_state()
+        initialize_on_main_thread()
+        thread = _DanbooruKeyCheckThread()
+        thread.checked.connect(self._on_danbooru_key_checked)
+        self._danbooru_check_thread = thread
+        self._refresh_danbooru_account_state('Saved. Checking with Danbooru\u2026')
+        thread.start()
+
+    @Slot(object, str)
+    def _on_danbooru_key_checked(self, ok, message):
+        thread = self._danbooru_check_thread
+        self._danbooru_check_thread = None
+        if thread is not None:
+            # Keeps it alive until run() has fully returned.
+            park_running_threads([thread])
+        if ok is True:
+            message = f'\u2714 {message}'
+        elif ok is False:
+            message = f'\u2716 {message}'
+        self._refresh_danbooru_account_state(message)
+
+    @Slot()
+    def _remove_danbooru_account(self):
+        removed = credentials.delete_site_credentials(DANBOORU_CREDENTIALS_SITE)
+        reset_api_key_state()
+        self.danbooru_api_key_line_edit.clear()
+        if removed:
+            self.danbooru_login_line_edit.clear()
+            self._refresh_danbooru_account_state(
+                'Removed from this computer. To fully revoke it, delete the '
+                'key on danbooru.donmai.us/api_keys.')
+        else:
+            self._refresh_danbooru_account_state(
+                'The API key could not be removed from the password store.')
+
+    def done(self, result):
+        thread = self._danbooru_check_thread
+        if thread is not None:
+            self._danbooru_check_thread = None
+            park_running_threads([thread])
+        super().done(result)
 
     @Slot()
     def refresh_theme_sensitive_controls(self):

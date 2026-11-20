@@ -1,9 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import copy_metadata
 
 datas = [('clip-vit-base-patch32', 'clip-vit-base-patch32'),
          ('images/icon.ico', 'images')]
+datas += copy_metadata('keyring')
 hiddenimports = [
     'timm.models.layers',
+    # keyring finds its OS backends through package metadata at runtime.
+    'keyring.backends.Windows',
+    'keyring.backends.macOS',
+    'keyring.backends.SecretService',
+    'keyring.backends.kwallet',
 ]
 
 block_cipher = None

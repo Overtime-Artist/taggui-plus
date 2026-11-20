@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel,
                                QVBoxLayout)
 
 from models.tag_library_model import TagLibraryModel
-from utils.danbooru_session import (cancel_pending_fetches, danbooru_urlopen,
+from utils.danbooru_session import (api_key_problem, cancel_pending_fetches,
+                                    danbooru_urlopen,
                                     initialize_on_main_thread)
 from dialogs.wiki_dialog_base import (AUTOCOMPLETE_ANY_SUFFIX_PATTERN, AUTOCOMPLETE_COUNT_SUFFIX_PATTERN,
                                      BaseWikiDialog, TAG_GROUP_NORMALIZED_PREFIX,
@@ -988,6 +989,17 @@ class DanbooruWikiDialog(BaseWikiDialog):
     EMPTY_TAG_MESSAGE = ('Enter a tag name in the search box to view wiki '
                          'pages from Danbooru.')
     AUTOCOMPLETE_THREAD_CLASS = DanbooruTagAutocompleteThread
+
+    def hide_loading(self):
+        """Keep a warning visible while the saved API key isn't working."""
+        problem = api_key_problem()
+        if not problem:
+            self.status_label.setToolTip('')
+            super().hide_loading()
+            return
+        self.show_status_message(
+            'Your Danbooru API key isn\'t fully working (hover for details).')
+        self.status_label.setToolTip(f'<p>{html.escape(problem)}</p>')
 
     def __init__(self, parent, tag: str,
                  tag_library_model: TagLibraryModel | None = None,
