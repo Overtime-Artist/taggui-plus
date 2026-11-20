@@ -566,9 +566,13 @@ class ImageViewer(QWidget):
         self._update_focus_overlay()
 
     def set_focus_navigation_enabled(self, has_previous: bool,
-                                     has_next: bool):
+                                     has_next: bool,
+                                     previous_tool_tip: str = 'Previous image',
+                                     next_tool_tip: str = 'Next image'):
         self._focus_previous_image_button.setEnabled(has_previous)
         self._focus_next_image_button.setEnabled(has_next)
+        self._focus_previous_image_button.setToolTip(previous_tool_tip)
+        self._focus_next_image_button.setToolTip(next_tool_tip)
 
     def set_focus_caption_state(self, text: str, tool_tip: str,
                                 enabled: bool):

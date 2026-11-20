@@ -710,9 +710,34 @@ class MainWindow(QMainWindow):
                 else:
                     self._focus_image_tags_pane()
 
+    def _selected_rows_for_focus_navigation(self) -> list[int]:
+        """Selected rows when ◀ / ▶ should stay inside a multi-selection."""
+        rows = sorted(index.row() for index
+                      in self.image_list.list_view.selectedIndexes())
+        return rows if len(rows) >= 2 else []
+
+    def _step_focus_image(self, direction: int):
+        """◀ / ▶ in the focus mode bar. Like the arrow keys, they move the
+        current image within a multi-image selection (the grid) rather than
+        discarding it; otherwise they go to the previous / next image."""
+        if self._selected_rows_for_focus_navigation():
+            self.image_list.list_view.switch_between_selected_images(direction)
+        elif direction < 0:
+            self.image_list.go_to_previous_image()
+        else:
+            self.image_list.go_to_next_image()
+        self._update_focus_navigation_buttons()
+
     @Slot()
     def _update_focus_navigation_buttons(self, *args):
         row = self.image_list_selection_model.currentIndex().row()
+        selected_rows = self._selected_rows_for_focus_navigation()
+        if selected_rows and row in selected_rows:
+            position = selected_rows.index(row)
+            self.image_viewer.set_focus_navigation_enabled(
+                position > 0, position < len(selected_rows) - 1,
+                'Previous selected image', 'Next selected image')
+            return
         last_row = self.proxy_image_list_model.rowCount() - 1
         self.image_viewer.set_focus_navigation_enabled(
             0 < row, 0 <= row < last_row)
@@ -2171,10 +2196,12 @@ class MainWindow(QMainWindow):
             self.image_viewer.set_focus_overlay_text)
         self.image_list.image_index_text_changed.connect(
             self._update_focus_navigation_buttons)
+        self.image_list_selection_model.selectionChanged.connect(
+            self._update_focus_navigation_buttons)
         self.image_viewer.focus_previous_image_requested.connect(
-            self.image_list.go_to_previous_image)
+            lambda: self._step_focus_image(-1))
         self.image_viewer.focus_next_image_requested.connect(
-            self.image_list.go_to_next_image)
+            lambda: self._step_focus_image(1))
         self.image_list_selection_model.currentChanged.connect(
             self.image_viewer.load_image)
         self.image_list_selection_model.currentChanged.connect(

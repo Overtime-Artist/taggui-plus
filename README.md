@@ -1047,7 +1047,7 @@ shortcuts`**; the defaults are listed below.
 | Previous / next image | `Ctrl`+`Up` / `Ctrl`+`Down` |
 | Jump to first untagged / incomplete image | `Ctrl`+`J` / `Ctrl`+`Shift`+`J` |
 | Toggle `Natural language mode` / `Current image only` (mode button) | `Ctrl`+`Space` |
-| Focus mode (also in the `View` menu): full screen showing only the image preview, with a bottom-right control bar (? / ? previous / next image, the image count, and an `Auto-Caption` button that turns into `Cancel Captioning` with progress while a run is going; captioning errors pop up because the console is hidden), and the Image Tags pane; `Esc` also exits, and `Alt+F` / `Alt+S` exit before focusing their box; after starting auto-captioning with `Alt+C`, `Enter`, focus returns to where it was (e.g. the selected tag); leaving focus mode also keeps focus where it was | `F11` |
+| Focus mode (also in the `View` menu): full screen showing only the image preview, with a bottom-right control bar (◀ / ▶ previous / next image — within a multi-image selection they move through the selected images like `Left` / `Right`, turning grid pages as needed, without losing the selection — the image count, and an `Auto-Caption` button that turns into `Cancel Captioning` with progress while a run is going; captioning errors pop up because the console is hidden), and the Image Tags pane; `Esc` also exits, and `Alt+F` / `Alt+S` exit before focusing their box; after starting auto-captioning with `Alt+C`, `Enter`, focus returns to where it was (e.g. the selected tag); leaving focus mode also keeps focus where it was | `F11` |
 
 ### Focus shortcuts
 
