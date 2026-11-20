@@ -53,6 +53,21 @@ def is_in_validation_folder(path: Path, root: Path, folder_name: str) -> bool:
     return any(part.casefold() == wanted for part in parts)
 
 
+def return_destination(path: Path, root: Path, folder_name: str) -> Path:
+    """The folder an image set aside in a validation folder below `root`
+    goes back to: the one holding its outermost folder called
+    `folder_name` (any case)."""
+    try:
+        parts = path.relative_to(root).parts[:-1]
+    except ValueError:
+        return path.parent
+    wanted = folder_name.casefold()
+    for index, part in enumerate(parts):
+        if part.casefold() == wanted:
+            return root.joinpath(*parts[:index])
+    return path.parent
+
+
 def is_within(path: Path, folder: Path, include_subfolders: bool) -> bool:
     """Whether the image `path` is directly in `folder` (or, with
     `include_subfolders`, anywhere below it)."""

@@ -659,10 +659,12 @@ green outline, images already set aside a dashed blue one. Review the picks and:
   saved in a hidden `.taggui_validation.json` file in the image's folder, so
   they travel with the dataset.
 - **Re-roll** — pick a fresh random set.
+- **Return to Folder** — move the selected images already set aside (and their
+  captions) back out of the validation subfolder into the folder it is in.
 
-Double-click a thumbnail to open the image. **Move** asks for confirmation,
-moves the picked images and captions (completion marks move with them), and
-reloads the folder.
+Double-click a thumbnail to open the image. **Move** and **Return to Folder**
+ask for confirmation, move the images and captions (completion marks move with
+them), and reload the folder.
 
 ### Danbooru / Gelbooru Wiki
 

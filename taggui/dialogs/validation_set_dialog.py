@@ -32,7 +32,8 @@ from utils.validation_set import (DEFAULT_FOLDER_NAME,
                                   DEFAULT_VARIANT_MATCHING, NeverPickStore,
                                   VARIANT_MATCHING_LEVELS, build_units,
                                   is_in_validation_folder, is_within,
-                                  pick_units, source_folders, tag_coverage,
+                                  pick_units, return_destination,
+                                  source_folders, tag_coverage,
                                   target_count)
 from widgets.image_list import transfer_images
 
@@ -214,21 +215,26 @@ class ValidationSetDialog(QDialog):
         layout.addWidget(description)
 
         settings_box = QGroupBox('Settings')
-        grid = QGridLayout(settings_box)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        grid.addWidget(QLabel('Folder:'), 0, 0)
+        settings_layout = QVBoxLayout(settings_box)
+        settings_layout.setSpacing(8)
         folder_row = QHBoxLayout()
+        folder_row.setSpacing(10)
+        folder_row.addWidget(QLabel('Folder:'))
         self.folder_combo_box = FocusedScrollComboBox()
         self.folder_combo_box.setSizePolicy(QSizePolicy.Policy.Expanding,
                                             QSizePolicy.Policy.Fixed)
         folder_row.addWidget(self.folder_combo_box, 1)
+        folder_row.addSpacing(16)
         self.include_subfolders_check_box = SettingsBigCheckBox(
             key='validation_set_include_subfolders',
             default=DEFAULT_SETTINGS['validation_set_include_subfolders'],
             text='Include subfolders')
         folder_row.addWidget(self.include_subfolders_check_box)
-        grid.addLayout(folder_row, 0, 1, 1, 4)
+        settings_layout.addLayout(folder_row)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        settings_layout.addLayout(grid)
 
         grid.addWidget(QLabel('Validation share:'), 1, 0)
         self.percentage_spin_box = FocusedScrollSettingsSpinBox(
@@ -336,6 +342,9 @@ class ValidationSetDialog(QDialog):
         self.drop_button = QPushButton('Drop Pick')
         self.drop_button.clicked.connect(self.drop_picks)
         review_row.addWidget(self.drop_button)
+        self.return_button = QPushButton('Return to Folder')
+        self.return_button.clicked.connect(self.return_existing)
+        review_row.addWidget(self.return_button)
         review_row.addStretch()
         self.move_button = QPushButton()
         self.move_button.clicked.connect(self.move_picks)
@@ -708,6 +717,46 @@ class ValidationSetDialog(QDialog):
         if callable(self.reload_callback):
             self.reload_callback()
 
+    @Slot()
+    def return_existing(self):
+        """Move the selected images already set aside (with their captions)
+        back to the folder their validation subfolder is in."""
+        folder = self._source_folder()
+        items = [item for item in self._selected_items()
+                 if item >= self._candidate_count]
+        if folder is None or not items or self._folder_name_error():
+            return
+        destinations: dict[str, tuple[Path, list[Path]]] = {}
+        for item in sorted(items):
+            path = self.items[item].path
+            destination = return_destination(path, folder, self.folder_name)
+            destinations.setdefault(get_path_key(destination),
+                                    (destination, []))[1].append(path)
+        count = len(items)
+        if len(destinations) == 1:
+            target = f'{next(iter(destinations.values()))[0]}'
+        else:
+            target = 'the folders their validation subfolders are in'
+        reply = QMessageBox.question(
+            self, 'Create Validation Set',
+            f'Move {count} {pluralize("image", count)} and '
+            f'{"its caption" if count == 1 else "their captions"} back '
+            f'into {target}?')
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        all_paths = [image.path for image in self.image_list_model.images]
+        transferred = False
+        for destination, paths in destinations.values():
+            if transfer_images(self, paths, destination, is_move=True,
+                               all_image_paths=all_paths,
+                               description='selected'):
+                transferred = True
+        if not transferred:
+            return
+        self.accept()
+        if callable(self.reload_callback):
+            self.reload_callback()
+
     def done(self, result: int):
         if self._scanner is not None:
             self._scanner.cancel()
@@ -829,6 +878,9 @@ class ValidationSetDialog(QDialog):
             any(self.is_never_pick(item) for item in candidates))
         self.drop_button.setEnabled(
             any(item in self._picked_items for item in selected))
+        self.return_button.setEnabled(
+            not self._folder_name_error()
+            and any(item >= self._candidate_count for item in selected))
         self.pick_button.setEnabled(
             self._scanner is None and self._candidate_count > 0
             and not self._folder_name_error())
