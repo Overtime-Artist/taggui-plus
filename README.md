@@ -449,6 +449,9 @@ When you **select two or more images** (with the feature enabled in
   across all of them at once. The **current** image has a **blue outline**; use
   `Left` / `Right` to move the current image through the selection without
   changing what is selected.
+  If the selection has more images than fit on one page, the label at the
+  bottom-left of the preview shows the page (for example **Page 2/3**), with
+  **◀** / **▶** buttons to jump to the previous or next page.
 - **Grouped Image Tags pane** — the pane shows a single combined tag list, but
   each tag now carries a **`k/N` badge** for how many of the selected images
   have it:
@@ -491,7 +494,7 @@ scope matches what you're looking at.
 > You can turn this off (and always keep the single-image view) with
 > **`Settings` → Images pane → `Group tags & show grid when multiple images are
 > selected`**. The **`Max grid cells for multi-image preview`** setting caps how
-> many images are drawn in the grid at once, for performance.
+> many images are drawn in the grid at once (one page), for performance.
 
 ## The tools
 
