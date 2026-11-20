@@ -57,8 +57,8 @@ captioning.
 - **Completion tracking** — mark images as done to keep your place, with an
   optional check icon on finished thumbnails.
 - **Integrated token counter** for estimating caption length.
-- **Directory analytics**, **duplicate image detection**, and **booru wiki
-  lookups** built in.
+- **Directory analytics**, **duplicate image detection**, **tag-balanced
+  validation sets**, and **booru wiki lookups** built in.
 - **Import / export settings** and full **keyboard-shortcut customization**.
 
 ## Installation
@@ -626,6 +626,43 @@ as non-image files.
 <p align='center'>
   <img src='images/TagGUI_Directory_Analytics.png' alt='TagGUI Plus Directory Analytics'>
 </p>
+
+### Create Validation Set
+
+**`Tools` → `Create Validation Set…`** (available once a folder is loaded).
+Sets aside a share of a folder's images as a **validation set** for LoRA or
+fine-tuning, and moves them (with their caption files) into a subfolder.
+
+- **Folder** — the folder to take images from, listed with its image count. It
+  starts on the folder of the current image. Tick **Include subfolders** to
+  also use the images in its subfolders.
+- **Validation share** — the percentage to set aside (rounded up, so 10% of 41
+  images is 5). Images already in the validation subfolder count toward it, so
+  running the tool again only tops the set up.
+- **Subfolder name** — where the picks go, inside the chosen folder
+  (`Validation_Set` by default). Folders with this name are never used as a
+  source.
+- **Keep variants together** — near-identical variants of an image are picked
+  (or skipped) together, so no near-copy ends up on both sides of the split.
+  **Off** still keeps byte-identical copies together.
+
+Click **Pick Images**. Images are chosen so that each tag appears in the
+validation set about as often as in the whole folder, and the line below shows
+how many of the tags that are common enough to expect in a set this size are
+covered, and which are missed. Picks have a green outline, images already set
+aside a dashed blue one. Review the picks and:
+
+- **Drop Pick** — leave the selected picks out; replacements are picked
+  automatically.
+- **Never Pick** / **Allow** — permanently keep the selected images out of
+  every validation set (for example your best training images). The marks are
+  saved in a hidden `.taggui_validation.json` file in the image's folder, so
+  they travel with the dataset.
+- **Re-roll** — pick a fresh random set.
+
+Double-click a thumbnail to open the image. **Move** asks for confirmation,
+moves the picked images and captions (completion marks move with them), and
+reloads the folder.
 
 ### Danbooru / Gelbooru Wiki
 

@@ -26,6 +26,7 @@ from dialogs.directory_analytics_dialog import DirectoryAnalyticsDialog
 from dialogs.export_settings_dialog import ExportSettingsDialog
 from dialogs.find_and_replace_dialog import FindAndReplaceDialog
 from dialogs.find_duplicates_dialog import FindDuplicatesDialog
+from dialogs.validation_set_dialog import ValidationSetDialog
 from dialogs.gelbooru_wiki_dialog import GelbooruWikiDialog
 from dialogs.import_settings_preview_dialog import ImportSettingsPreviewDialog
 from dialogs.keyboard_shortcuts_dialog import (KeyboardShortcutsDialog,
@@ -1121,6 +1122,7 @@ class MainWindow(QMainWindow):
             self._close_directory_analytics_dialog()
         self.directory_path = new_directory_path
         self.directory_analytics_action.setEnabled(True)
+        self.validation_set_action.setEnabled(True)
         if save_path_to_settings:
             self.settings.setValue('directory_path', str(self.directory_path))
         self.setWindowTitle(path.name)
@@ -1139,6 +1141,7 @@ class MainWindow(QMainWindow):
             self._directory_state_before_load)
         self.directory_path = previous_path
         self.directory_analytics_action.setEnabled(previous_path is not None)
+        self.validation_set_action.setEnabled(previous_path is not None)
         self.setWindowTitle(previous_title)
         if was_saved:
             # Never save an empty path: on the next launch `Path('')` would
@@ -1551,6 +1554,7 @@ class MainWindow(QMainWindow):
             ('open_gelbooru_wiki', 'Gelbooru Wiki...', 'Ctrl+G'),
             ('find_duplicates', 'Find Duplicates...', ''),
             ('directory_analytics', 'Directory Analytics...', ''),
+            ('create_validation_set', 'Create Validation Set...', ''),
             ('tag_library', 'Tag Library...', 'Ctrl+L'),
             ('select_all_images', 'Select All Images', 'Ctrl+A'),
             ('mark_complete', 'Mark as Complete', 'Ctrl+K'),
@@ -1602,6 +1606,7 @@ class MainWindow(QMainWindow):
             'open_gelbooru_wiki': self.open_gelbooru_wiki_action,
             'find_duplicates': self.find_duplicates_action,
             'directory_analytics': self.directory_analytics_action,
+            'create_validation_set': self.validation_set_action,
             'tag_library': self.tag_library_action,
             'go_to_previous_image': self.go_to_previous_image_shortcut,
             'go_to_next_image': self.go_to_next_image_shortcut,
@@ -1866,6 +1871,19 @@ class MainWindow(QMainWindow):
         find_duplicates_dialog.exec()
 
     @Slot()
+    def show_validation_set_dialog(self):
+        if self.directory_path is None:
+            return
+        current_image = self.image_list.list_view.get_current_image()
+        dialog = ValidationSetDialog(
+            parent=self, image_list_model=self.image_list_model,
+            directory_path=self.directory_path,
+            current_image_path=(current_image.path
+                                if current_image is not None else None),
+            reload_callback=self.reload_directory)
+        dialog.exec()
+
+    @Slot()
     def show_directory_analytics_dialog(self):
         # Modeless, so the user can keep working while it is open; reuse an
         # open one rather than stacking several.
@@ -2095,6 +2113,12 @@ class MainWindow(QMainWindow):
         self.directory_analytics_action.setEnabled(
             self.directory_path is not None)
         tools_menu.addAction(self.directory_analytics_action)
+        self.validation_set_action = QAction('Create Validation Set...',
+                                             parent=self)
+        self.validation_set_action.triggered.connect(
+            self.show_validation_set_dialog)
+        self.validation_set_action.setEnabled(self.directory_path is not None)
+        tools_menu.addAction(self.validation_set_action)
         tools_menu.addSeparator()
         self.tag_library_action = QAction('Tag Library...', parent=self)
         self.tag_library_action.triggered.connect(self.show_tag_library_dialog)
