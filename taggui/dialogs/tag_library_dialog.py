@@ -4,15 +4,17 @@ from uuid import uuid4
 
 import openpyxl
 from openpyxl.styles import Font
-from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QPoint, Qt,
-                            QTimer, Signal, Slot)
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtCore import (QAbstractTableModel, QCoreApplication, QModelIndex,
+                            QPoint, QRect, Qt, QTimer, Signal, Slot)
+from PySide6.QtGui import (QAction, QColor, QInputMethodEvent, QKeySequence,
+                           QPalette, QTextCharFormat)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                                 QDialog, QFileDialog,
                                 QHeaderView, QHBoxLayout, QLabel, QLineEdit,
                                 QListWidget, QListWidgetItem, QMenu, QMessageBox,
                                 QTableWidget, QTableWidgetItem,
-                                QPushButton, QStyledItemDelegate, QTabWidget,
+                                QPushButton, QStyle, QStyledItemDelegate,
+                                QStyleOptionViewItem, QTabWidget,
                                 QTableView, QVBoxLayout, QWidget)
 
 from models.tag_library_model import TagLibraryModel
@@ -70,7 +72,148 @@ class LibraryTagCompleter(TagCompleter):
         return self._split_last(widget.text())[0] + completion
 
 
-class LibraryTagLineEdit(QLineEdit):
+def _tag_category_color(tag_library_model: TagLibraryModel,
+                        tag: str) -> QColor | None:
+    category = tag_library_model.get_category_for_tag(tag)
+    if not category:
+        return None
+    color = QColor(category['color'])
+    return color if color.isValid() else None
+
+
+def _tag_segments(text: str, multiple: bool) -> list[tuple[int, str]]:
+    """(start, tag) for each tag in `text`, skipping surrounding spaces.
+
+    With `multiple=True` the text is a comma-separated list of tags."""
+    pieces = text.split(',') if multiple else [text]
+    segments = []
+    position = 0
+    for piece in pieces:
+        tag = piece.strip()
+        if tag:
+            segments.append(
+                (position + len(piece) - len(piece.lstrip()), tag))
+        position += len(piece) + 1
+    return segments
+
+
+class TagColorLineEdit(QLineEdit):
+    """Line edit that colors each typed tag with its category color.
+
+    Only the text formatting changes (via an input method event), not the
+    palette, so uncategorized text and the placeholder keep the theme's
+    colors."""
+
+    def __init__(self, tag_library_model: TagLibraryModel,
+                 multiple: bool = False, parent=None):
+        super().__init__(parent)
+        self._color_library_model = tag_library_model
+        self._color_multiple = multiple
+        self._composing = False
+        self.textChanged.connect(self._update_tag_colors)
+        tag_library_model.modelReset.connect(self._update_tag_colors)
+        tag_library_model.categories_changed.connect(self._update_tag_colors)
+
+    def inputMethodEvent(self, event):
+        # Recoloring sends an input method event with an empty preedit, which
+        # would cancel an in-progress IME composition, so skip it meanwhile.
+        self._composing = bool(event.preeditString())
+        super().inputMethodEvent(event)
+
+    def _update_tag_colors(self):
+        if self._composing or self.isReadOnly():
+            return
+        cursor = self.cursorPosition()
+        attributes = []
+        for start, tag in _tag_segments(self.text(), self._color_multiple):
+            color = _tag_category_color(self._color_library_model, tag)
+            if color is None:
+                continue
+            text_format = QTextCharFormat()
+            text_format.setForeground(color)
+            # Input method attribute positions are relative to the cursor.
+            attributes.append(QInputMethodEvent.Attribute(
+                QInputMethodEvent.AttributeType.TextFormat,
+                start - cursor, len(tag), text_format))
+        QCoreApplication.sendEvent(self, QInputMethodEvent('', attributes))
+
+
+class TagColorItemDelegate(QStyledItemDelegate):
+    """Draws a cell's comma-separated tags, each in its category color.
+
+    Selected rows use the highlighted text color, as the style does for the
+    other tag tables."""
+
+    def __init__(self, tag_library_model: TagLibraryModel, parent=None):
+        super().__init__(parent)
+        self._tag_library_model = tag_library_model
+
+    def paint(self, painter, option: QStyleOptionViewItem,
+              index: QModelIndex):
+        option = QStyleOptionViewItem(option)
+        self.initStyleOption(option, index)
+        text = option.text
+        style = (option.widget.style() if option.widget
+                 else QApplication.style())
+        text_margin = style.pixelMetric(
+            QStyle.PixelMetric.PM_FocusFrameHMargin, option,
+            option.widget) + 1
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, option,
+            option.widget).adjusted(text_margin, 0, -text_margin, 0)
+        option.text = ''
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option,
+                          painter, option.widget)
+        if not text:
+            return
+        color_group = (QPalette.ColorGroup.Normal
+                       if option.state & QStyle.StateFlag.State_Enabled
+                       else QPalette.ColorGroup.Disabled)
+        if (color_group == QPalette.ColorGroup.Normal
+                and not option.state & QStyle.StateFlag.State_Active):
+            color_group = QPalette.ColorGroup.Inactive
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        default_color = option.palette.color(
+            color_group, QPalette.ColorRole.HighlightedText if selected
+            else QPalette.ColorRole.Text)
+        # Split into runs of (text, color): tags get their category color,
+        # separators and uncategorized tags the default color.
+        runs = []
+        position = 0
+        for start, tag in _tag_segments(text, multiple=True):
+            if start > position:
+                runs.append((text[position:start], default_color))
+            color = None if selected else _tag_category_color(
+                self._tag_library_model, tag)
+            runs.append((tag, color or default_color))
+            position = start + len(tag)
+        if position < len(text):
+            runs.append((text[position:], default_color))
+        painter.save()
+        painter.setFont(option.font)
+        painter.setClipRect(text_rect)
+        metrics = option.fontMetrics
+        flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        x = text_rect.left()
+        right = text_rect.right() + 1
+        for run_text, color in runs:
+            available = right - x
+            if available <= 0:
+                break
+            width = metrics.horizontalAdvance(run_text)
+            if width > available:
+                run_text = metrics.elidedText(
+                    run_text, Qt.TextElideMode.ElideRight, available)
+            painter.setPen(color)
+            painter.drawText(QRect(x, text_rect.top(), available,
+                                   text_rect.height()), flags, run_text)
+            if width > available:
+                break
+            x += width
+        painter.restore()
+
+
+class LibraryTagLineEdit(TagColorLineEdit):
     """Line edit with optional Tag Library autocomplete.
 
     Pressing Enter on a highlighted suggestion only fills the field. Qt sends
@@ -80,7 +223,7 @@ class LibraryTagLineEdit(QLineEdit):
 
     def __init__(self, tag_library_model: TagLibraryModel,
                  multiple: bool = False, parent=None):
-        super().__init__(parent)
+        super().__init__(tag_library_model, multiple, parent)
         self._tag_library_model = tag_library_model
         self._multiple = multiple
         self._completer = None
@@ -488,6 +631,17 @@ class TagLibraryDialog(QDialog):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addWidget(tabs)
 
+        # Color the tags in the alias, implication and profile tables with
+        # their category colors, repainting when the colors or tags change.
+        self._tag_color_tables = (self.aliases_table, self.implications_table,
+                                  self.profile_mappings_table)
+        for table in self._tag_color_tables:
+            table.setItemDelegate(
+                TagColorItemDelegate(self.tag_library_model, table))
+        self.tag_library_model.modelReset.connect(
+            self._repaint_tag_color_tables)
+        self.tag_library_model.categories_changed.connect(
+            self._repaint_tag_color_tables)
         self.tag_library_model.modelReset.connect(self._update_tag_count)
         self.proxy_model.modelReset.connect(self._update_tag_count)
         self.proxy_model.rowsInserted.connect(self._update_tag_count)
@@ -524,6 +678,11 @@ class TagLibraryDialog(QDialog):
             Qt.ShortcutContext.WindowShortcut)
         self.gelbooru_wiki_action.triggered.connect(self._request_gelbooru_wiki)
         self.addAction(self.gelbooru_wiki_action)
+
+    @Slot()
+    def _repaint_tag_color_tables(self):
+        for table in self._tag_color_tables:
+            table.viewport().update()
 
     def keyPressEvent(self, event):
         # The buttons are not auto-default (so Enter in a text box never
@@ -582,7 +741,7 @@ class TagLibraryDialog(QDialog):
         tab = QWidget()
 
         # Add tag row
-        self.add_tag_input = QLineEdit()
+        self.add_tag_input = TagColorLineEdit(self.tag_library_model)
         self.add_tag_input.setPlaceholderText('Add Tag')
         self.add_tag_input.setTextMargins(8, 0, 8, 0)
         self.add_tag_input.setClearButtonEnabled(True)
@@ -847,7 +1006,8 @@ class TagLibraryDialog(QDialog):
     def _build_aliases_tab(self) -> QWidget:
         tab = QWidget()
 
-        self.new_alias_input = QLineEdit()
+        self.new_alias_input = TagColorLineEdit(self.tag_library_model,
+                                                multiple=True)
         self.new_alias_input.setPlaceholderText('Aliases')
         self.new_alias_input.setTextMargins(8, 0, 8, 0)
         arrow_label = QLabel('→')
