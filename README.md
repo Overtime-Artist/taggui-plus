@@ -649,8 +649,8 @@ fine-tuning, and moves them (with their caption files) into a subfolder.
 Click **Pick Images**. Images are chosen so that each tag appears in the
 validation set about as often as in the whole folder, and the line below shows
 how many of the tags that are common enough to expect in a set this size are
-covered, and which are missed. Picks have a green outline, images already set
-aside a dashed blue one. Review the picks and:
+covered. Click **Missed Tags** to list the ones that are missed. Picks have a
+green outline, images already set aside a dashed blue one. Review the picks and:
 
 - **Drop Pick** — leave the selected picks out; replacements are picked
   automatically.

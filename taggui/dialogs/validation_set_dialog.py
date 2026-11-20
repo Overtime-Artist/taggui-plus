@@ -10,8 +10,9 @@ from PySide6.QtCore import (QAbstractListModel, QModelIndex, QRect, QSize, Qt,
                             QUrl, Slot)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
-                               QDialog, QGridLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QListView, QMessageBox,
+                               QDialog, QGridLayout, QGroupBox, QHBoxLayout,
+                               QLabel, QLineEdit, QListView, QMessageBox,
+                               QPlainTextEdit,
                                QProgressDialog, QPushButton, QSizePolicy,
                                QStyle, QStyledItemDelegate, QVBoxLayout)
 
@@ -37,7 +38,6 @@ from widgets.image_list import transfer_images
 
 _CELL_SIZE = 150
 _TEXT_HEIGHT = 18
-_MAX_MISSED_TAGS_SHOWN = 20
 
 SHOW_PICKS = 'Picks'
 SHOW_ALL = 'All images'
@@ -193,6 +193,7 @@ class ValidationSetDialog(QDialog):
         self._picked_items: set[int] = set()
         # Picks dropped by the user, kept out until the scope changes.
         self._dropped_items: set[int] = set()
+        self._missed_tags_text = ''
 
         self.setWindowTitle('Create Validation Set')
         screen = QApplication.primaryScreen()
@@ -207,17 +208,15 @@ class ValidationSetDialog(QDialog):
         layout.setSpacing(10)
 
         description = QLabel(
-            'Picks a share of a folder\'s images to hold out of training as a '
-            'validation set, choosing them so each tag is represented about '
-            'as often as in the whole folder. Variants of the same image stay '
-            'together. Review the picks, then move them (with their '
-            'captions) into a subfolder. Double-click a thumbnail to open '
-            'the image.')
+            'Hold out a tag-balanced share of a folder\'s images (with their '
+            'captions) for validation. Double-click a thumbnail to open it.')
         description.setWordWrap(True)
         layout.addWidget(description)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
+        settings_box = QGroupBox('Settings')
+        grid = QGridLayout(settings_box)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
         grid.addWidget(QLabel('Folder:'), 0, 0)
         folder_row = QHBoxLayout()
         self.folder_combo_box = FocusedScrollComboBox()
@@ -229,7 +228,7 @@ class ValidationSetDialog(QDialog):
             default=DEFAULT_SETTINGS['validation_set_include_subfolders'],
             text='Include subfolders')
         folder_row.addWidget(self.include_subfolders_check_box)
-        grid.addLayout(folder_row, 0, 1, 1, 5)
+        grid.addLayout(folder_row, 0, 1, 1, 4)
 
         grid.addWidget(QLabel('Validation share:'), 1, 0)
         self.percentage_spin_box = FocusedScrollSettingsSpinBox(
@@ -237,14 +236,17 @@ class ValidationSetDialog(QDialog):
             default=DEFAULT_SETTINGS['validation_set_percentage'],
             minimum=1, maximum=50)
         self.percentage_spin_box.setSuffix('%')
-        grid.addWidget(self.percentage_spin_box, 1, 1)
-        grid.addWidget(QLabel('Subfolder name:'), 1, 2)
+        self.percentage_spin_box.setMinimumWidth(80)
+        grid.addWidget(self.percentage_spin_box, 1, 1,
+                       Qt.AlignmentFlag.AlignLeft)
+        grid.addWidget(QLabel('Subfolder name:'), 2, 0)
         self.folder_name_edit = QLineEdit(self.settings.value(
             'validation_set_folder_name',
             DEFAULT_SETTINGS['validation_set_folder_name'], type=str)
             or DEFAULT_FOLDER_NAME)
-        grid.addWidget(self.folder_name_edit, 1, 3)
-        grid.addWidget(QLabel('Keep variants together:'), 1, 4)
+        self.folder_name_edit.setFixedWidth(220)
+        grid.addWidget(self.folder_name_edit, 2, 1)
+        grid.addWidget(QLabel('Keep variants together:'), 1, 3)
         self.variant_combo_box = FocusedScrollSettingsComboBox(
             key='validation_set_variant_matching',
             default=DEFAULT_VARIANT_MATCHING)
@@ -253,23 +255,39 @@ class ValidationSetDialog(QDialog):
         self.variant_combo_box.addItems(list(VARIANT_MATCHING_LEVELS))
         if self.variant_combo_box.currentText() not in VARIANT_MATCHING_LEVELS:
             self.variant_combo_box.setCurrentText(DEFAULT_VARIANT_MATCHING)
-        grid.addWidget(self.variant_combo_box, 1, 5)
-        grid.setColumnStretch(3, 1)
-        layout.addLayout(grid)
+        grid.addWidget(self.variant_combo_box, 1, 4,
+                       Qt.AlignmentFlag.AlignLeft)
+        grid.setColumnStretch(2, 1)
+        grid.setColumnMinimumWidth(2, 24)
+        layout.addWidget(settings_box)
 
         pick_row = QHBoxLayout()
+        pick_row.setSpacing(12)
         self.pick_button = QPushButton('Pick Images')
+        self.pick_button.setMinimumWidth(110)
         self.pick_button.clicked.connect(self.pick)
         pick_row.addWidget(self.pick_button)
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         pick_row.addWidget(self.status_label, 1)
         layout.addLayout(pick_row)
+
+        coverage_row = QHBoxLayout()
+        coverage_row.setSpacing(12)
         self.coverage_label = QLabel()
-        self.coverage_label.setWordWrap(True)
-        self.coverage_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.coverage_label)
+        coverage_row.addWidget(self.coverage_label)
+        self.missed_button = QPushButton()
+        self.missed_button.setCheckable(True)
+        self.missed_button.toggled.connect(self._update_missed_visibility)
+        coverage_row.addWidget(self.missed_button)
+        coverage_row.addStretch()
+        layout.addLayout(coverage_row)
+        self.missed_text = QPlainTextEdit()
+        self.missed_text.setReadOnly(True)
+        self.missed_text.setMaximumHeight(
+            self.missed_text.fontMetrics().lineSpacing() * 4 + 12)
+        self.missed_text.hide()
+        layout.addWidget(self.missed_text)
 
         show_row = QHBoxLayout()
         show_row.addWidget(QLabel('Show:'))
@@ -712,6 +730,8 @@ class ValidationSetDialog(QDialog):
     def _update_status(self):
         name_error = self._folder_name_error()
         self.coverage_label.clear()
+        self._missed_tags_text = ''
+        self._update_missed_visibility()
         if name_error:
             self.status_label.setText(name_error)
             self._update_buttons()
@@ -726,22 +746,24 @@ class ValidationSetDialog(QDialog):
             self.status_label.setText('This folder has no images.')
             self._update_buttons()
             return
-        text = (f'{total} {pluralize("image", total)}, so {target} make '
-                f'{percentage}%.')
+        parts = [f'{total} {pluralize("image", total)}',
+                 f'{percentage}% = {target}']
         if existing:
-            text += f' {existing} already in "{name}".'
+            parts.append(f'{existing} already in "{name}"')
         needed = max(0, target - existing)
         if needed == 0:
-            text += ' No more are needed.'
+            parts.append('no more needed')
         elif self._units is None:
-            text += (f' {needed} to pick: click "Pick Images".')
+            parts.append(f'{needed} to pick')
         else:
             picked = len(self._picked_items)
-            text += f' Picked {picked} of {needed}.'
-            if picked < needed:
-                text += (' The rest can\'t be picked without going over or '
-                         'using images marked "never pick" or dropped.')
+            parts.append(f'picked {picked} of {needed}')
             self.pick_button.setText('Re-roll')
+        text = '  \u00b7  '.join(parts)
+        if (needed and self._units is not None
+                and len(self._picked_items) < needed):
+            text += ('\nThe rest can\'t be picked without going over, or '
+                     'without images marked "never pick" or dropped.')
         if self._units is None:
             self.pick_button.setText('Pick Images')
         self.status_label.setText(text)
@@ -760,14 +782,24 @@ class ValidationSetDialog(QDialog):
                 'No tag is on enough images to expect it in a set this size.')
             return
         covered = len(expected) - len(missed)
-        text = (f'Tags covered: {covered} of {len(expected)} (the tags on at '
-                f'least {minimum} {pluralize("image", minimum)}).')
+        self.coverage_label.setText(
+            f'Tags covered: {covered} of {len(expected)}')
         if missed:
-            shown = ', '.join(missed[:_MAX_MISSED_TAGS_SHOWN])
-            more = len(missed) - _MAX_MISSED_TAGS_SHOWN
-            text += f' Missed: {shown}'
-            text += f', and {more} more.' if more > 0 else '.'
-        self.coverage_label.setText(text)
+            self._missed_tags_text = (
+                f'Tags on at least {minimum} {pluralize("image", minimum)} '
+                f'are expected in a set this size. Missed:\n'
+                + ', '.join(missed))
+            self.missed_button.setText(
+                f'Missed Tags ({len(missed)})')
+        self._update_missed_visibility()
+
+    @Slot()
+    def _update_missed_visibility(self):
+        has_missed = bool(self._missed_tags_text)
+        self.missed_button.setVisible(has_missed)
+        self.missed_text.setPlainText(self._missed_tags_text)
+        self.missed_text.setVisible(has_missed
+                                    and self.missed_button.isChecked())
 
     @Slot()
     def _refresh_view(self):
