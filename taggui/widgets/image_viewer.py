@@ -421,10 +421,10 @@ class ImageViewer(QWidget):
         overlay_layout.setContentsMargins(0, 0, 0, 0)
         overlay_layout.setSpacing(0)
         self._grid_previous_page_button = self._make_overlay_button(
-            '\u25c0', 'Previous page', lambda: self.go_to_grid_page(-1))
+            '\u25c0', lambda: self.go_to_grid_page(-1))
         self._grid_overlay_label = QLabel()
         self._grid_next_page_button = self._make_overlay_button(
-            '\u25b6', 'Next page', lambda: self.go_to_grid_page(1))
+            '\u25b6', lambda: self.go_to_grid_page(1))
         overlay_layout.addWidget(self._grid_previous_page_button)
         overlay_layout.addWidget(self._grid_overlay_label)
         overlay_layout.addWidget(self._grid_next_page_button)
@@ -447,19 +447,17 @@ class ImageViewer(QWidget):
         focus_layout.setContentsMargins(0, 0, 0, 0)
         focus_layout.setSpacing(0)
         self._focus_previous_image_button = self._make_overlay_button(
-            '\u25c0', 'Previous image',
-            self.focus_previous_image_requested.emit)
+            '\u25c0', self.focus_previous_image_requested.emit)
         self._focus_overlay_label = QLabel()
         self._focus_overlay_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._focus_next_image_button = self._make_overlay_button(
-            '\u25b6', 'Next image', self.focus_next_image_requested.emit)
+            '\u25b6', self.focus_next_image_requested.emit)
         separator = QFrame()
         separator.setObjectName('overlaySeparator')
         separator.setFixedWidth(1)
         self._focus_caption_button = self._make_overlay_button(
-            'Auto-Caption', 'Start auto-captioning the selected images',
-            self.focus_caption_requested.emit)
+            'Auto-Caption', self.focus_caption_requested.emit)
         for widget in (self._focus_previous_image_button,
                        self._focus_overlay_label,
                        self._focus_next_image_button, separator,
@@ -566,19 +564,13 @@ class ImageViewer(QWidget):
         self._update_focus_overlay()
 
     def set_focus_navigation_enabled(self, has_previous: bool,
-                                     has_next: bool,
-                                     previous_tool_tip: str = 'Previous image',
-                                     next_tool_tip: str = 'Next image'):
+                                     has_next: bool):
         self._focus_previous_image_button.setEnabled(has_previous)
         self._focus_next_image_button.setEnabled(has_next)
-        self._focus_previous_image_button.setToolTip(previous_tool_tip)
-        self._focus_next_image_button.setToolTip(next_tool_tip)
 
-    def set_focus_caption_state(self, text: str, tool_tip: str,
-                                enabled: bool):
+    def set_focus_caption_state(self, text: str, enabled: bool):
         button = self._focus_caption_button
         button.setText(text)
-        button.setToolTip(tool_tip)
         button.setEnabled(enabled)
         self._update_focus_overlay()
 
@@ -608,11 +600,9 @@ class ImageViewer(QWidget):
                      viewport.height() - overlay.height() - margin)
 
     @staticmethod
-    def _make_overlay_button(text: str, tool_tip: str,
-                             slot) -> QToolButton:
+    def _make_overlay_button(text: str, slot) -> QToolButton:
         button = QToolButton()
         button.setText(text)
-        button.setToolTip(tool_tip)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         # Clicking must not take keyboard focus from where the user was.
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)

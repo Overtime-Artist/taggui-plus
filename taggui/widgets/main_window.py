@@ -653,8 +653,6 @@ class MainWindow(QMainWindow):
         self.addActions(self._focus_mode_extra_actions)
         if focus_was_hidden:
             self._focus_image_tags_pane()
-        self.image_viewer.set_focus_overlay_text(
-            self.image_list.image_index_label.text())
         self._update_focus_navigation_buttons()
         self._update_focus_caption_button()
         self.image_viewer.set_focus_overlay_enabled(True)
@@ -730,14 +728,20 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _update_focus_navigation_buttons(self, *args):
+        """Refresh the focus mode bar's image count and \u25c0 / \u25b6 buttons.
+        Within a multi-image selection (the grid), both count only the
+        selected images."""
         row = self.image_list_selection_model.currentIndex().row()
         selected_rows = self._selected_rows_for_focus_navigation()
         if selected_rows and row in selected_rows:
             position = selected_rows.index(row)
+            self.image_viewer.set_focus_overlay_text(
+                f'Image {position + 1} / {len(selected_rows)}')
             self.image_viewer.set_focus_navigation_enabled(
-                position > 0, position < len(selected_rows) - 1,
-                'Previous selected image', 'Next selected image')
+                position > 0, position < len(selected_rows) - 1)
             return
+        self.image_viewer.set_focus_overlay_text(
+            self.image_list.image_index_label.text())
         last_row = self.proxy_image_list_model.rowCount() - 1
         self.image_viewer.set_focus_navigation_enabled(
             0 < row, 0 <= row < last_row)
@@ -750,12 +754,11 @@ class MainWindow(QMainWindow):
         button = captioner.start_cancel_button
         if not captioner.is_captioning:
             self.image_viewer.set_focus_caption_state(
-                'Auto-Caption', 'Start auto-captioning the selected images',
-                button.isEnabled())
+                'Auto-Caption', button.isEnabled())
             return
         if not button.isEnabled():
             self.image_viewer.set_focus_caption_state(
-                'Canceling\u2026', 'Canceling auto-captioning', False)
+                'Canceling\u2026', False)
             return
         text = 'Cancel Captioning'
         progress_bar = captioner.progress_bar
@@ -763,7 +766,7 @@ class MainWindow(QMainWindow):
                 and progress_bar.value() >= progress_bar.minimum()):
             text += f' ({progress_bar.value()}/{progress_bar.maximum()})'
         self.image_viewer.set_focus_caption_state(
-            text, 'Cancel auto-captioning', True)
+            text, True)
 
     @Slot()
     def _report_focus_mode_caption_error(self):
@@ -2192,8 +2195,6 @@ class MainWindow(QMainWindow):
             self.save_image_index)
         self.image_list_selection_model.currentChanged.connect(
             self.image_list.update_image_index_label)
-        self.image_list.image_index_text_changed.connect(
-            self.image_viewer.set_focus_overlay_text)
         self.image_list.image_index_text_changed.connect(
             self._update_focus_navigation_buttons)
         self.image_list_selection_model.selectionChanged.connect(
