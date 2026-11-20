@@ -185,6 +185,47 @@ def image_url_to_data_url(image_url: str, interruption_check=None) -> str:
     return f'data:{content_type};base64,{encoded_image}'
 
 
+def post_unavailable_reason(post, preview_url: str) -> str:
+    """Short reason a post shows no thumbnail, for the placeholder label."""
+    if not isinstance(post, dict):
+        return 'Not found'
+    if preview_url:
+        # Danbooru offered an image, but downloading it failed.
+        return "Couldn't load"
+    if post.get('is_banned'):
+        return 'Banned'
+    if post.get('is_deleted'):
+        return 'Deleted'
+    status = _media_status_reason(post.get('media_asset'))
+    if status:
+        return status
+    # Danbooru withholds the image links (with no flag) for posts with tags
+    # restricted to higher account levels.
+    return 'Restricted (account level)'
+
+
+def asset_unavailable_reason(asset, preview_url: str) -> str:
+    """Short reason a media asset shows no thumbnail."""
+    if not isinstance(asset, dict):
+        return 'Not found'
+    if preview_url:
+        return "Couldn't load"
+    return (_media_status_reason(asset)
+            or ('Restricted' if asset.get('is_public') is False
+                else 'No preview'))
+
+
+def _media_status_reason(asset) -> str:
+    if not isinstance(asset, dict):
+        return ''
+    status = str(asset.get('status') or '')
+    if not status or status == 'active':
+        return ''
+    return {'deleted': 'Image deleted', 'expunged': 'Image removed',
+            'processing': 'Still processing',
+            'failed': 'Upload failed'}.get(status, f'Image {status}')
+
+
 def build_post_summaries_concurrently(posts: list, interruption_check=None) -> list:
     """Turn raw Danbooru post dicts into lightweight summaries with an inline
     thumbnail data URL, downloading the thumbnails in parallel."""
@@ -193,11 +234,14 @@ def build_post_summaries_concurrently(posts: list, interruption_check=None) -> l
     if not valid_posts:
         return []
 
-    def thumbnail_for(post: dict) -> str:
+    def thumbnail_for(post: dict) -> tuple[str, str]:
         preview_url = str(post.get('preview_file_url')
                           or post.get('large_file_url')
                           or post.get('file_url') or '')
-        return image_url_to_data_url(preview_url, interruption_check)
+        data_url = image_url_to_data_url(preview_url, interruption_check)
+        reason = ('' if data_url
+                  else post_unavailable_reason(post, preview_url))
+        return data_url, reason
 
     summaries = []
     with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
@@ -207,9 +251,11 @@ def build_post_summaries_concurrently(posts: list, interruption_check=None) -> l
         }
         for post in valid_posts:
             post_id = post.get('id')
+            data_url, reason = thumbnail_futures[post_id].result()
             summaries.append({
                 'id': post_id,
-                'thumbnail_data_url': thumbnail_futures[post_id].result(),
+                'thumbnail_data_url': data_url,
+                'unavailable_reason': reason,
                 'image_width': post.get('image_width') or 0,
                 'image_height': post.get('image_height') or 0,
             })
@@ -535,6 +581,7 @@ class DanbooruWikiFetchThread(QThread):
         if not post_ids or self.isInterruptionRequested():
             return details_by_id
         posts_by_id = {}
+        failed_ids = set()
         batch_size = 200
         for start in range(0, len(post_ids), batch_size):
             if self.isInterruptionRequested():
@@ -546,10 +593,12 @@ class DanbooruWikiFetchThread(QThread):
             try:
                 with danbooru_urlopen(posts_url, timeout=15) as response:
                     if response.status != 200:
+                        failed_ids.update(chunk)
                         continue
                     posts = json.loads(
                         response.read().decode('utf-8', errors='replace'))
             except Exception:
+                failed_ids.update(chunk)
                 continue
             if isinstance(posts, list):
                 for post in posts:
@@ -560,10 +609,13 @@ class DanbooruWikiFetchThread(QThread):
             post_data = posts_by_id.get(post_id)
             if not isinstance(post_data, dict):
                 return None
+            preview_url = self._post_preview_url(post_data)
+            data_url = self.fetch_thumbnail_data_url(preview_url)
             return {
                 'post': post_data,
-                'thumbnail_data_url': self.fetch_thumbnail_data_url(
-                    self._post_preview_url(post_data))
+                'thumbnail_data_url': data_url,
+                'unavailable_reason': '' if data_url else
+                post_unavailable_reason(post_data, preview_url),
             }
         with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
             futures = {post_id: executor.submit(build, post_id)
@@ -572,6 +624,14 @@ class DanbooruWikiFetchThread(QThread):
                 data = future.result()
                 if data is not None:
                     details_by_id[post_id] = data
+        # Posts the search did not return: removed, or hidden from searches.
+        for post_id in post_ids:
+            if post_id not in details_by_id:
+                details_by_id[post_id] = {
+                    'post': None, 'thumbnail_data_url': '',
+                    'unavailable_reason': ("Couldn't load"
+                                           if post_id in failed_ids
+                                           else 'Not found')}
         return details_by_id
 
     def fetch_assets_details_batched(self, asset_ids: list) -> dict:
@@ -582,6 +642,7 @@ class DanbooruWikiFetchThread(QThread):
         if not asset_ids or self.isInterruptionRequested():
             return details_by_id
         assets_by_id = {}
+        failed_ids = set()
         batch_size = 200
         for start in range(0, len(asset_ids), batch_size):
             if self.isInterruptionRequested():
@@ -593,10 +654,12 @@ class DanbooruWikiFetchThread(QThread):
             try:
                 with danbooru_urlopen(assets_url, timeout=15) as response:
                     if response.status != 200:
+                        failed_ids.update(chunk)
                         continue
                     assets = json.loads(
                         response.read().decode('utf-8', errors='replace'))
             except Exception:
+                failed_ids.update(chunk)
                 continue
             if isinstance(assets, list):
                 for asset in assets:
@@ -607,10 +670,13 @@ class DanbooruWikiFetchThread(QThread):
             asset_data = assets_by_id.get(asset_id)
             if not isinstance(asset_data, dict):
                 return None
+            preview_url = self._asset_preview_url(asset_data)
+            data_url = self.fetch_thumbnail_data_url(preview_url)
             return {
                 'asset': asset_data,
-                'thumbnail_data_url': self.fetch_thumbnail_data_url(
-                    self._asset_preview_url(asset_data))
+                'thumbnail_data_url': data_url,
+                'unavailable_reason': '' if data_url else
+                asset_unavailable_reason(asset_data, preview_url),
             }
         with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
             futures = {asset_id: executor.submit(build, asset_id)
@@ -619,6 +685,13 @@ class DanbooruWikiFetchThread(QThread):
                 data = future.result()
                 if data is not None:
                     details_by_id[asset_id] = data
+        for asset_id in asset_ids:
+            if asset_id not in details_by_id:
+                details_by_id[asset_id] = {
+                    'asset': None, 'thumbnail_data_url': '',
+                    'unavailable_reason': ("Couldn't load"
+                                           if asset_id in failed_ids
+                                           else 'Not found')}
         return details_by_id
 
     def fetch_thumbnail_data_url(self, image_url: str):
@@ -1191,12 +1264,14 @@ class DanbooruWikiDialog(BaseWikiDialog):
                 'border: 1px solid palette(mid);" '
                 f'alt="Post #{html.escape(str(post_id))}">')
         else:
-            # Some posts have no usable thumbnail (e.g. video/flash) — show a
-            # simple labelled placeholder that still links to the post.
+            # Some posts have no usable thumbnail (e.g. banned or restricted)
+            # — show a labelled placeholder that still links to the post.
+            reason = str(post.get('unavailable_reason') or '')
+            reason_html = (f'<br>({html.escape(reason)})' if reason else '')
             inner = (
                 '<span style="display: inline-block; padding: 24px 10px; '
                 'border: 1px solid palette(mid); color: palette(mid);">'
-                f'post #{html.escape(str(post_id))}</span>')
+                f'post #{html.escape(str(post_id))}{reason_html}</span>')
         return (
             f'<td align="center" style="padding: 6px; vertical-align: middle;">'
             f'<a href="{html.escape(internal_url, quote=True)}">{inner}</a>'
@@ -2009,14 +2084,32 @@ class DanbooruWikiDialog(BaseWikiDialog):
         return ('<table cellspacing="0" style="border-collapse: collapse; '
                 f'margin: 4px 0 16px 0;">{"".join(rows_html)}</table>')
 
+    def _unavailable_thumbnail_html(self, url: str, label: str,
+                                    details) -> str:
+        """Clickable "post #N" text plus a muted reason for the missing
+        thumbnail."""
+        reason = ''
+        if isinstance(details, dict):
+            reason = str(details.get('unavailable_reason') or '')
+        else:
+            # Ids past MAX_PREVIEW_POSTS are never fetched.
+            reason = 'Not loaded'
+        link = (f'<a href="{html.escape(url, quote=True)}">'
+                f'{html.escape(label)}</a>')
+        if not reason:
+            return link
+        return (f'{link} <span style="color: {self._muted_note_color()};">'
+                f'({html.escape(reason)})</span>')
+
     def build_post_thumbnail_html(self, post_id: str) -> str:
         post_data = self.post_details_by_id.get(post_id)
         post_url = f'{DANBOORU_BASE_URL}/posts/{quote(post_id)}'
-        if not isinstance(post_data, dict):
-            return f'<a href="{html.escape(post_url, quote=True)}">post #{html.escape(post_id)}</a>'
-        thumbnail_data_url = str(post_data.get('thumbnail_data_url') or '')
+        thumbnail_data_url = ''
+        if isinstance(post_data, dict):
+            thumbnail_data_url = str(post_data.get('thumbnail_data_url') or '')
         if not thumbnail_data_url:
-            return f'<a href="{html.escape(post_url, quote=True)}">post #{html.escape(post_id)}</a>'
+            return self._unavailable_thumbnail_html(
+                post_url, f'post #{post_id}', post_data)
         return (
             f'<a href="{html.escape(post_url, quote=True)}">'
             f'<img src="{html.escape(thumbnail_data_url, quote=True)}" '
@@ -2028,11 +2121,12 @@ class DanbooruWikiDialog(BaseWikiDialog):
     def build_asset_thumbnail_html(self, asset_id: str) -> str:
         asset_data = self.asset_details_by_id.get(asset_id)
         asset_url = f'{DANBOORU_BASE_URL}/media_assets/{quote(asset_id)}'
-        if not isinstance(asset_data, dict):
-            return f'<a href="{html.escape(asset_url, quote=True)}">asset #{html.escape(asset_id)}</a>'
-        thumbnail_data_url = str(asset_data.get('thumbnail_data_url') or '')
+        thumbnail_data_url = ''
+        if isinstance(asset_data, dict):
+            thumbnail_data_url = str(asset_data.get('thumbnail_data_url') or '')
         if not thumbnail_data_url:
-            return f'<a href="{html.escape(asset_url, quote=True)}">asset #{html.escape(asset_id)}</a>'
+            return self._unavailable_thumbnail_html(
+                asset_url, f'asset #{asset_id}', asset_data)
         return (
             f'<a href="{html.escape(asset_url, quote=True)}">'
             f'<img src="{html.escape(thumbnail_data_url, quote=True)}" '
