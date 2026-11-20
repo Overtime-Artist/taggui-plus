@@ -52,6 +52,7 @@ import json
 import os
 import sys
 import threading
+import time
 import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -76,6 +77,13 @@ _SOLVE_TIMEOUT_MS = 90000
 # Once the ``cf_clearance`` cookie appears, wait briefly for the final
 # navigation/cookies to settle before treating the page as ready.
 _SOLVE_SETTLE_MS = 1500
+# After the user closes the verify window, requests to that host fail at once
+# for this long instead of reopening the window for every queued thumbnail.
+_DISMISS_COOLDOWN_S = 60
+# Hosts whose "/" is an error page (cdn.donmai.us answers it with a 403, and
+# scripts can't run there), so the challenge is solved on the first requested
+# URL instead.
+_HOSTS_WITHOUT_HOME_PAGE = {'cdn.donmai.us'}
 
 # Name of the shared QtWebEngine profile. Also used by the "Remove app data"
 # cleanup (utils/app_data.py) to locate and delete the on-disk profile folder.
@@ -298,6 +306,7 @@ class _OriginSession:
         self.ready = False
         self.solving = False
         self.queued = []
+        self.dismissed_at = None
 
     def ensure_browser(self):
         if self.page is not None:
@@ -377,6 +386,11 @@ class _OriginSession:
         if request['force']:
             self.ready = False
         if not self.ready:
+            if (not self.solving and self.dismissed_at is not None
+                    and time.monotonic() - self.dismissed_at
+                    < _DISMISS_COOLDOWN_S):
+                self._solver._deliver_fail(request['rid'])
+                return
             self.queued.append(request)
             if not self.solving:
                 self.solving = True
@@ -504,6 +518,7 @@ class _OriginSession:
 
         def on_window_closed():
             # The user closed the verify window; stop waiting immediately.
+            self.dismissed_at = time.monotonic()
             loop.quit()
 
         cookie_store.cookieAdded.connect(on_cookie_added)
@@ -523,7 +538,10 @@ class _OriginSession:
         reveal_timer.start(4000)
 
         overall_timer.start(_SOLVE_TIMEOUT_MS)
-        self.page.load(QUrl(self.origin + '/'))
+        start_url = self.origin + '/'
+        if self.host in _HOSTS_WITHOUT_HOME_PAGE and self.queued:
+            start_url = self.queued[0]['url']
+        self.page.load(QUrl(start_url))
         loop.exec()
         reveal_timer.stop()
         self.view.hide()
