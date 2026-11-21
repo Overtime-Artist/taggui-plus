@@ -654,7 +654,11 @@ fine-tuning, and moves them (with their caption files) into a subfolder.
   because it doesn't need to open the images. **Strict**, **Medium** and
   **Loose** also catch edited variants, but the first check of a folder reads
   every image (the results are shared with Find Duplicates, so later checks are
-  quick). **Off** skips the check entirely.
+  quick). **Off** skips the check entirely. Images already in the validation
+  subfolder are checked too: any variant of one of them is picked
+  automatically so it joins it, even if that goes over the share. If such a
+  variant is marked "never pick" or dropped, the status line says it will
+  stay in training.
 
 Click **Pick Images**. Images are chosen so that each tag appears in the
 validation set about as often as in the whole folder, and the line below shows

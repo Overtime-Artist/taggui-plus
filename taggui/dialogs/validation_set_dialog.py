@@ -200,6 +200,7 @@ class ValidationSetDialog(QDialog):
         # scanned for.
         self._units: list[list[int]] | None = None
         self._unit_of_item: dict[int, int] = {}
+        self._linked_units: list[int] = []
         self._scan_key = None
         self._picked_units: list[int] = []
         self._picked_items: set[int] = set()
@@ -599,25 +600,26 @@ class ValidationSetDialog(QDialog):
             return
         threshold = VARIANT_MATCHING_LEVELS.get(
             self.variant_combo_box.currentText(), 0)
-        candidates = self.items[:self._candidate_count]
-        scan_key = (tuple(get_path_key(image.path) for image in candidates),
+        scan_key = (tuple(get_path_key(image.path) for image in self.items),
                     threshold)
         if self._units is not None and scan_key == self._scan_key:
             self._pick_from_scratch()
             return
-        if self._candidate_count < 2 or threshold is None:
+        if len(self.items) < 2 or threshold is None:
             self._set_groups(scan_key, [])
             return
         self.pick_button.setEnabled(False)
         progress = QProgressDialog('Looking for variants of the same image...',
-                                   'Cancel', 0, len(candidates), self)
+                                   'Cancel', 0, len(self.items), self)
         progress.setWindowTitle('Create Validation Set')
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(400)
         progress.setAutoReset(False)
         progress.setValue(0)
         self._progress_dialog = progress
-        scanner = DuplicateScanner(candidates, threshold, self._cache)
+        # Images already set aside are scanned too, so their variants can
+        # follow them into the set.
+        scanner = DuplicateScanner(list(self.items), threshold, self._cache)
         scanner.scan_key = scan_key
         self._scanner = scanner
         scanner.progress.connect(self._on_scan_progress)
@@ -650,17 +652,25 @@ class ValidationSetDialog(QDialog):
 
     def _set_groups(self, scan_key, groups: list):
         index_by_key = {get_path_key(image.path): item for item, image
-                        in enumerate(self.items[:self._candidate_count])}
+                        in enumerate(self.items)}
         item_groups = []
+        linked_items = set()
         for group in groups:
             members = [index_by_key.get(get_path_key(member.path))
                        for member in group.members]
-            members = [member for member in members if member is not None]
-            if len(members) > 1:
-                item_groups.append(members)
+            candidates = [member for member in members if member is not None
+                          and member < self._candidate_count]
+            if len(candidates) > 1:
+                item_groups.append(candidates)
+            if any(member is not None and member >= self._candidate_count
+                   for member in members):
+                linked_items.update(candidates)
         self._units = build_units(self._candidate_count, item_groups)
         self._unit_of_item = {item: unit_index for unit_index, unit
                               in enumerate(self._units) for item in unit}
+        # Units with a variant already in the validation folder.
+        self._linked_units = sorted({self._unit_of_item[item]
+                                     for item in linked_items})
         self._scan_key = scan_key
         self._pick_from_scratch()
 
@@ -674,6 +684,14 @@ class ValidationSetDialog(QDialog):
         """Top up the picks to the target, keeping the current ones."""
         if self._units is None:
             return
+        # Variants of images already set aside always join them (unless
+        # marked "never pick" or dropped), even past the target, so no image
+        # ends up on both sides of the split.
+        for unit_index in self._linked_units:
+            if (unit_index not in self._picked_units
+                    and self._unit_eligible(self._units[unit_index])):
+                self._picked_units.append(unit_index)
+                self._picked_items.update(self._units[unit_index])
         item_tags = [list(image.tags) for image in self.items]
         fixed = self._existing_items() + sorted(self._picked_items)
         picked_units = set(self._picked_units)
@@ -874,6 +892,19 @@ class ValidationSetDialog(QDialog):
                      'without images marked "never pick" or dropped.')
         if self._units is None:
             self.pick_button.setText('Pick Images')
+        else:
+            picked_units = set(self._picked_units)
+            joined = sum(len(self._units[unit]) for unit in self._linked_units
+                         if unit in picked_units)
+            left = sum(len(self._units[unit]) for unit in self._linked_units
+                       if unit not in picked_units)
+            if joined:
+                text += (f'\nIncludes {joined} {pluralize("variant", joined)}'
+                         f' of images already in "{name}".')
+            if left:
+                text += (f'\n{left} {pluralize("variant", left)} of images '
+                         f'already in "{name}" will stay in training '
+                         f'(marked "never pick" or dropped).')
         if self._outside_change_note:
             text += '\n' + self._outside_change_note
         for file_path in self.never_pick.unreadable.values():
