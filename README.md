@@ -734,7 +734,11 @@ prefixes:
   the buttons at the top. **Double-click** switches between fit and 100%
   (actual size); **`1`** jumps to 100%, **`0`** fits to the window, and
   **`+`** / **`-`** or the mouse wheel zoom (pausing at exactly 100% on the
-  way).
+  way). While it's open, it follows along: viewing another post in the wiki
+  shows that post's image in the full-size window too.
+- The **Left** / **Right** arrow keys go to the previous / next page of a posts
+  search, or the previous / next post on a post's page. While typing in the
+  search bar, the arrow keys move the text cursor as usual.
 - Typing anything without a prefix does a normal wiki lookup for that tag.
 
 **Signing in to Danbooru (optional):** in **`Settings` → `Danbooru Wiki`**,

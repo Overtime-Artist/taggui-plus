@@ -21,6 +21,13 @@ _park_sweep_timer = None
 _park_quit_hook_installed = False
 _PARKED_THREAD_EXIT_WAIT_SECONDS = 20
 
+# Previous / Next links on posts search pages and single posts, followed by
+# the Left / Right arrow keys.
+PREVIOUS_LINK_PATTERN = re.compile(
+    r'<a href="(taggui-posts?:[^"]*)"[^>]*>&(?:laquo|lsaquo); Previous</a>')
+NEXT_LINK_PATTERN = re.compile(
+    r'<a href="(taggui-posts?:[^"]*)"[^>]*>Next &(?:raquo|rsaquo);</a>')
+
 
 def _sweep_parked_threads():
     _parked_threads[:] = [thread for thread in _parked_threads
@@ -294,6 +301,7 @@ class BaseWikiDialog(QDialog):
         self.current_image_has_tag_callback = current_image_has_tag_callback
         self.tag_history = []
         self.history_index = -1
+        self._page_nav_urls = {}
         self.fetch_thread = None
         self.active_fetch_threads = []
         self.current_request_key = ''
@@ -444,6 +452,9 @@ class BaseWikiDialog(QDialog):
         layout.addWidget(self.status_stack)
         layout.addWidget(self.content_browser)
         layout.addLayout(footer_layout)
+        # Push buttons would otherwise use Left / Right to move focus.
+        for button in self.findChildren(QPushButton):
+            button.installEventFilter(self)
 
     def _finish_wiki_init(self, tag: str):
         self.load_tag(tag, add_to_history=True)
@@ -562,9 +573,38 @@ class BaseWikiDialog(QDialog):
                 and event.type() == QEvent.Type.Resize
                 and self.hover_status_label.isVisible()):
             self._reposition_hover_status_label()
+        if (event.type() == QEvent.Type.KeyPress
+                and (watched is self.content_browser
+                     or isinstance(watched, QPushButton))
+                and self._handle_page_arrow_key(event)):
+            return True
         return super().eventFilter(watched, event)
 
+    def _handle_page_arrow_key(self, event) -> bool:
+        """Left / Right follow the page's Previous / Next link (posts search
+        pages and single posts). Typing in the search box keeps its normal
+        arrow keys, since this is only reached from other widgets."""
+        if (event.key() not in (Qt.Key.Key_Left, Qt.Key.Key_Right)
+                or event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
+            return False
+        if isinstance(self.focusWidget(), QLineEdit):
+            return False
+        url = self._page_nav_urls.get(
+            'previous' if event.key() == Qt.Key.Key_Left else 'next')
+        if not url:
+            return False
+        event.accept()
+        self.handle_anchor_clicked(QUrl(url))
+        return True
+
     def _set_browser_html(self, html_content: str):
+        # Remember the Previous / Next page links for the arrow keys.
+        self._page_nav_urls = {}
+        for key, pattern in (('previous', PREVIOUS_LINK_PATTERN),
+                             ('next', NEXT_LINK_PATTERN)):
+            match = pattern.search(html_content)
+            if match:
+                self._page_nav_urls[key] = html.unescape(match.group(1))
         if hasattr(self, 'hover_status_label'):
             self.hover_status_label.hide()
             self.hover_status_label.clear()
@@ -590,6 +630,8 @@ class BaseWikiDialog(QDialog):
                 focus_widget.click()
                 event.accept()
                 return
+        if self._handle_page_arrow_key(event):
+            return
         if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
             completer_popup = self.search_completer.popup()
             if completer_popup is not None and completer_popup.isVisible():

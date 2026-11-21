@@ -1651,6 +1651,7 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         self._set_browser_html(self._compose_post_html())
         self.hide_loading()
         self.update_add_to_library_button_state()
+        self._update_open_viewer(post)
 
     def _compose_post_html(self) -> str:
         post = self._stored_post or {}

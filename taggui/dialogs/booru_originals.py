@@ -237,7 +237,7 @@ class OriginalsMixin:
         width, height = self._original_dimensions(post)
         return dict(post, image_width=width, image_height=height)
 
-    def view_original(self, post: dict):
+    def view_original(self, post: dict, bring_to_front: bool = True):
         if self._image_viewer is None:
             viewer = BooruImageViewerDialog(self, self.SITE_NAME)
             viewer.download_requested.connect(
@@ -260,10 +260,22 @@ class OriginalsMixin:
             viewer.show_post(self._viewer_post(post),
                              self._write_sample_file(post))
         viewer.show()
-        viewer.raise_()
-        viewer.activateWindow()
+        if bring_to_front:
+            viewer.raise_()
+            viewer.activateWindow()
         self._request_original(post, self._on_viewer_original_ready,
                                self._on_viewer_original_failed)
+
+    def _update_open_viewer(self, post: dict):
+        """While the full-size viewer is open, follow the post shown in the
+        wiki, leaving keyboard focus in the wiki."""
+        viewer = self._image_viewer
+        if (viewer is None or not viewer.isVisible()
+                or not (post.get('file_url') and original_is_viewable(post))):
+            return
+        if str(viewer.post.get('id')) == str(post.get('id')):
+            return
+        self.view_original(post, bring_to_front=False)
 
     def _on_viewer_original_ready(self, post_id: str, path_text: str):
         if self._image_viewer is not None:
