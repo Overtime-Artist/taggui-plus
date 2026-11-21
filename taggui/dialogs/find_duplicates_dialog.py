@@ -17,11 +17,11 @@ from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject,
                             Signal, Slot)
 from PySide6.QtGui import (QFont, QIcon, QImageReader, QKeySequence, QPainter,
                            QPalette, QPen, QPixmap, QShortcut)
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
+from PySide6.QtWidgets import (QApplication, QCheckBox,
                                QComboBox, QDialog,
                                QFileDialog, QFrame, QGridLayout, QGroupBox,
                                QHBoxLayout, QLabel, QMessageBox,
-                               QProgressDialog, QPushButton, QRadioButton,
+                               QProgressDialog, QPushButton,
                                QScrollArea, QSizePolicy, QSlider, QVBoxLayout,
                                QWidget)
 
@@ -375,6 +375,18 @@ def choose_keeper(members: list, rule: str, tag_counts: dict):
         if member_key > best_key:
             best, best_key = member, member_key
     return best
+
+
+def closest_keeper(member, keepers: list):
+    """Return the kept image `member` most closely matches: an identical
+    file first, then the smallest fingerprint difference."""
+    def distance(keeper):
+        if member.sha256 is not None and member.sha256 == keeper.sha256:
+            return -1
+        if member.dhash is None or keeper.dhash is None:
+            return float('inf')
+        return hamming_distance(member.dhash, keeper.dhash)
+    return min(keepers, key=distance)
 
 
 def describe_relation(member, keeper) -> str:
@@ -777,7 +789,7 @@ class FindDuplicatesDialog(QDialog):
                 f'{tags_text}')
 
     def _build_card(self, member, group_cards) -> tuple:
-        """Return (card, keep radio, relation label, info label)."""
+        """Return (card, keep check box, relation label, info label)."""
         card = _DuplicateCard()
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(6, 6, 6, 6)
@@ -800,10 +812,10 @@ class FindDuplicatesDialog(QDialog):
         relation_label = QLabel(' ')
         card_layout.addWidget(relation_label)
 
-        radio = QRadioButton('Keep')
-        _make_indicator_visible(radio)
-        card_layout.addWidget(radio)
-        return card, radio, relation_label, info_label
+        keep_box = QCheckBox('Keep')
+        _make_indicator_visible(keep_box)
+        card_layout.addWidget(keep_box)
+        return card, keep_box, relation_label, info_label
 
     # ------------------------------------------------------------------
     # Thumbnails
@@ -837,19 +849,19 @@ class FindDuplicatesDialog(QDialog):
     def _show_preview(self, group_cards, member):
         """Open a large preview that can cycle through the group's images
         and let the user pick which one to keep."""
-        if group_cards is not None and group_cards.radio_members:
-            radio_members = list(group_cards.radio_members)
+        if group_cards is not None and group_cards.keep_box_members:
+            keep_box_members = list(group_cards.keep_box_members)
         else:
             # Fallback: a standalone image with no group/keep context.
-            radio_members = [(None, member)]
+            keep_box_members = [(None, member)]
 
         index = 0
-        for position, (_radio, current) in enumerate(radio_members):
+        for position, (_keep_box, current) in enumerate(keep_box_members):
             if current is member:
                 index = position
                 break
 
-        dialog = _PreviewDialog(self, radio_members, index,
+        dialog = _PreviewDialog(self, keep_box_members, index,
                                 self._thumbnails)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.exec()
@@ -868,17 +880,18 @@ class FindDuplicatesDialog(QDialog):
                                                rule, self._tag_counts))
 
     def _keeper_targets(self) -> list[tuple]:
-        """Return (kept member, [other members]) for every group that is not
-        ignored. Includes members hidden behind a group's "+N more" tile."""
+        """Return ([kept members], [other members]) for every group that is
+        not ignored. Includes members hidden behind a group's "+N more"
+        tile."""
         pairs = []
         for group_cards in self._group_selections:
             if group_cards.ignored:
                 continue
-            keeper = group_cards.keep_member
+            keepers = list(group_cards.keep_members)
             others = [member for member in group_cards.group.members
-                      if member is not keeper]
+                      if not group_cards.is_kept(member)]
             if others:
-                pairs.append((keeper, others))
+                pairs.append((keepers, others))
         return pairs
 
     def _set_actions_enabled(self, enabled: bool):
@@ -892,13 +905,10 @@ class FindDuplicatesDialog(QDialog):
 
     def _merge_tags_by_row(self, pairs, lookup, acted_on=None) -> dict:
         """Return {model row: tags} adding the other images' tags (that the
-        keeper lacks) to each keeper. Only others in `acted_on` (a set of
-        paths) count, if given."""
+        keepers lack) to every kept image. Only others in `acted_on` (a set
+        of paths) count, if given."""
         tags_by_row = {}
-        for keeper, others in pairs:
-            keeper_entry = lookup.get(keeper.path)
-            if keeper_entry is None:
-                continue
+        for keepers, others in pairs:
             tags = []
             for member in others:
                 if acted_on is not None and member.path not in acted_on:
@@ -906,8 +916,12 @@ class FindDuplicatesDialog(QDialog):
                 entry = lookup.get(member.path)
                 if entry is not None:
                     tags.extend(entry[1].tags)
-            if tags:
-                tags_by_row.setdefault(keeper_entry[0], []).extend(tags)
+            if not tags:
+                continue
+            for keeper in keepers:
+                keeper_entry = lookup.get(keeper.path)
+                if keeper_entry is not None:
+                    tags_by_row.setdefault(keeper_entry[0], []).extend(tags)
         return tags_by_row
 
     def _add_tags_by_row(self, tags_by_row: dict, action_name: str):
@@ -1027,8 +1041,8 @@ class FindDuplicatesDialog(QDialog):
     def _warn_no_targets(self):
         QMessageBox.information(
             self, 'Find Duplicates',
-            'There is nothing to act on: every group is ticked "Ignore". '
-            'Un-ignore a group first.')
+            'There is nothing to act on: every group is either ticked '
+            '"Ignore" or keeps all of its images.')
 
 
 def _set_thumbnail(label: QLabel, pixmap):
@@ -1114,19 +1128,19 @@ class _PreviewDialog(QDialog):
     whole group, with controls overlaid on the image and a full-screen
     toggle.
 
-    ``radio_members`` is a list of ``(QRadioButton | None, member)`` tuples
-    shared with the main dialog, so "Keep this image" here checks the
-    matching radio back in the results list.
+    ``keep_box_members`` is a list of ``(QCheckBox | None, member)`` tuples
+    shared with the main dialog, so "Keep this image" here toggles the
+    matching Keep box back in the results list.
     """
 
-    def __init__(self, parent, radio_members, index, thumbnails=None):
+    def __init__(self, parent, keep_box_members, index, thumbnails=None):
         super().__init__(parent)
-        self.radio_members = radio_members
+        self.keep_box_members = keep_box_members
         self.index = index
         self._grid = False
         self._was_maximized = False
         self._zoomed_at_double_click = False
-        members = [member for _radio, member in radio_members]
+        members = [member for _keep_box, member in keep_box_members]
         self.model = _GroupImagesModel(members, thumbnails or {}, self)
 
         layout = QVBoxLayout(self)
@@ -1268,23 +1282,25 @@ class _PreviewDialog(QDialog):
             'variant_grid_cell_cap',
             defaultValue=DEFAULT_SETTINGS['variant_grid_cell_cap'], type=int))
 
-    def _kept_member(self):
-        for radio, member in self.radio_members:
-            if radio is not None and radio.isChecked():
-                return member
-        return None
+    def _kept_members(self) -> list:
+        return [member for keep_box, member in self.keep_box_members
+                if keep_box is not None and keep_box.isChecked()]
 
     def _show_current(self, keep_zoom: bool = False):
         """Show the current image, in the single-image or the grid view.
-        With ``keep_zoom`` a zoomed-in view keeps its zoom and position, so
-        the same detail can be compared across the group."""
+        With ``keep_zoom`` the zoom and position carry over, so the same
+        detail can be compared across the group."""
         if self._grid:
             self.viewer.update_grid_current(self._indices(), self.index,
                                             self._grid_cell_cap())
         else:
             self.viewer.exit_grid()
             index = self.model.index(self.index)
-            if keep_zoom and not self._at_fit_zoom():
+            if keep_zoom:
+                # Unlike load_image, this keeps the previous picture on
+                # screen until the new one is decoded, instead of first
+                # showing a blurry thumbnail placeholder, so small
+                # differences can be compared at fit-to-window zoom too.
                 self.viewer.reload_image(index)
             else:
                 self.viewer.load_image(index)
@@ -1294,8 +1310,8 @@ class _PreviewDialog(QDialog):
         return abs(self.viewer.zoom_factor - 1.0) < 1e-9
 
     def _update_info(self):
-        _radio, member = self.radio_members[self.index]
-        total = len(self.radio_members)
+        _keep_box, member = self.keep_box_members[self.index]
+        total = len(self.keep_box_members)
         self.setWindowTitle(
             f'{member.path}  \u2014  {self.index + 1} of {total}')
         self.name_label.setText(
@@ -1307,9 +1323,9 @@ class _PreviewDialog(QDialog):
         if member.size is not None:
             parts.append(_format_size(member.size))
         parts.append(_format_modified(member.mtime_ns))
-        kept = self._kept_member()
-        if kept is not None:
-            relation = describe_relation(member, kept)
+        kept = self._kept_members()
+        if kept and not any(member is other for other in kept):
+            relation = describe_relation(member, closest_keeper(member, kept))
             if relation:
                 parts.append(relation)
         self.details_label.setText('  \u2022  '.join(parts))
@@ -1317,16 +1333,15 @@ class _PreviewDialog(QDialog):
         multiple = total > 1
         self.prev_button.setEnabled(multiple)
         self.next_button.setEnabled(multiple)
-        radio = self.radio_members[self.index][0]
-        if radio is None:
-            self.keep_button.setText('Keep this image (K)')
-            self.keep_button.setEnabled(False)
-        elif radio.isChecked():
-            self.keep_button.setText('\u2713 Keeping this image')
-            self.keep_button.setEnabled(False)
+        keep_box = self.keep_box_members[self.index][0]
+        if keep_box is not None and keep_box.isChecked():
+            self.keep_button.setText('\u2713 Keeping this image (K)')
         else:
             self.keep_button.setText('Keep this image (K)')
-            self.keep_button.setEnabled(True)
+        # The group's only kept image has its Keep box locked.
+        self.keep_button.setEnabled(
+            keep_box is not None
+            and keep_box.isEnabledTo(keep_box.parentWidget()))
         self.grid_button.setText('Single view (G)' if self._grid
                                  else 'Grid view (G)')
         self.grid_button.setEnabled(multiple or self._grid)
@@ -1336,21 +1351,23 @@ class _PreviewDialog(QDialog):
         self._position_overlays()
 
     def _step(self, delta):
-        if len(self.radio_members) < 2:
+        if len(self.keep_box_members) < 2:
             return
-        self.index = (self.index + delta) % len(self.radio_members)
+        self.index = (self.index + delta) % len(self.keep_box_members)
         self._show_current(keep_zoom=True)
         self._show_overlays()
 
     def _keep_current(self):
-        radio, _member = self.radio_members[self.index]
-        if radio is None or radio.isChecked():
+        """Toggle whether the current image is kept."""
+        keep_box, _member = self.keep_box_members[self.index]
+        if keep_box is None or not keep_box.isEnabledTo(
+                keep_box.parentWidget()):
             return
-        radio.setChecked(True)
+        keep_box.setChecked(not keep_box.isChecked())
         self._update_info()
 
     def toggle_grid(self):
-        if not self._grid and len(self.radio_members) < 2:
+        if not self._grid and len(self.keep_box_members) < 2:
             return
         self._grid = not self._grid
         if self._grid:
@@ -1386,7 +1403,11 @@ class _PreviewDialog(QDialog):
         if self._grid:
             self._open_in_single_view(self.index)
         else:
-            self._keep_current()
+            # Enter only keeps; unkeeping needs K or the button, so a stray
+            # Enter can't drop an image from the keep list.
+            keep_box = self.keep_box_members[self.index][0]
+            if keep_box is not None and not keep_box.isChecked():
+                self._keep_current()
 
     # --- Full screen ----------------------------------------------------------
 
@@ -1477,16 +1498,17 @@ class _GroupCards:
 
     Only the first ``_MAX_MEMBERS_PER_GROUP`` images are shown initially; a
     clickable "+N more" tile expands the row to show every image in the group.
-    ``keep_member`` is the image to keep, even when it is hidden.
+    ``keep_members`` are the images to keep (at least one), even when they
+    are hidden.
     """
 
     def __init__(self, dialog, group, keep_member):
         self.dialog = dialog
         self.group = group
-        self.keep_member = keep_member
+        self.keep_members = [keep_member]
         self.expanded = False
-        # list of (QRadioButton, member) for the currently shown cards.
-        self.radio_members: list = []
+        # list of (keep QCheckBox, member) for the currently shown cards.
+        self.keep_box_members: list = []
         # list of (relation QLabel, info QLabel, member) for the shown cards.
         self.card_labels: list = []
         self.shown_count = 0
@@ -1541,10 +1563,7 @@ class _GroupCards:
         self.cards_scroll.setEnabled(not ignored)
 
     def _populate(self):
-        button_group = QButtonGroup(self.box)
-        button_group.setExclusive(True)
-        self.button_group = button_group
-        self.radio_members = []
+        self.keep_box_members = []
         self.card_labels = []
         self.cards = []
 
@@ -1556,13 +1575,12 @@ class _GroupCards:
         members = self.group.members
         shown = members if self.expanded else members[:_MAX_MEMBERS_PER_GROUP]
         for position, member in enumerate(shown):
-            card, radio, relation_label, info_label = \
+            card, keep_box, relation_label, info_label = \
                 self.dialog._build_card(member, self)
-            radio.setChecked(member is self.keep_member)
-            radio.toggled.connect(
+            keep_box.setChecked(self.is_kept(member))
+            keep_box.toggled.connect(
                 lambda checked, m=member: self._on_keep_toggled(checked, m))
-            button_group.addButton(radio)
-            self.radio_members.append((radio, member))
+            self.keep_box_members.append((keep_box, member))
             self.card_labels.append((relation_label, info_label, member))
             self.cards.append((card, member))
             cards_layout.addWidget(card)
@@ -1590,19 +1608,46 @@ class _GroupCards:
         self.shown_count = len(shown)
         self.update_relations()
 
+    def is_kept(self, member) -> bool:
+        return any(kept is member for kept in self.keep_members)
+
     def _on_keep_toggled(self, checked: bool, member):
-        if checked:
-            self.keep_member = member
-            self.update_relations()
+        if checked and not self.is_kept(member):
+            self.keep_members.append(member)
+        elif not checked:
+            if len(self.keep_members) == 1 and self.is_kept(member):
+                # The last kept image can't be unkept; its box is disabled,
+                # so this only guards against programmatic unchecking.
+                self._set_box_checked(member, True)
+                return
+            self.keep_members = [kept for kept in self.keep_members
+                                 if kept is not member]
+        self.update_relations()
+
+    def _set_box_checked(self, member, checked: bool):
+        for keep_box, shown in self.keep_box_members:
+            if shown is member:
+                keep_box.blockSignals(True)
+                keep_box.setChecked(checked)
+                keep_box.blockSignals(False)
 
     def update_relations(self):
-        """Refresh the "Kept" / "Differs by N" label on every shown card."""
+        """Refresh the "Kept" / "Differs by N" labels and the Keep boxes on
+        every shown card. Other images are compared with the kept image they
+        most closely match."""
         for relation_label, _info_label, member in self.card_labels:
-            text = describe_relation(member, self.keep_member)
-            relation_label.setText(f'<b>{text}</b>' if member
-                                   is self.keep_member else text)
+            if self.is_kept(member):
+                relation_label.setText('<b>Kept</b>')
+            else:
+                relation_label.setText(describe_relation(
+                    member, closest_keeper(member, self.keep_members)))
         for card, member in self.cards:
-            card.set_kept(member is self.keep_member)
+            card.set_kept(self.is_kept(member))
+        only_one = len(self.keep_members) == 1
+        for keep_box, member in self.keep_box_members:
+            # The only kept image's box is locked so the group always keeps
+            # at least one image.
+            keep_box.setEnabled(not (only_one and self.is_kept(member)))
 
     def refresh_info(self):
         """Refresh each shown card's details (e.g. its tag count)."""
@@ -1610,15 +1655,16 @@ class _GroupCards:
             info_label.setText(self.dialog._card_info_text(member))
 
     def set_keep(self, member):
-        """Make `member` the keeper, expanding the group if it is hidden."""
-        if all(shown is not member for _radio, shown in self.radio_members):
-            self.keep_member = member
+        """Make `member` the only kept image, expanding the group if it is
+        hidden."""
+        self.keep_members = [member]
+        if all(shown is not member
+               for _keep_box, shown in self.keep_box_members):
             self.expand()
             return
-        for radio, shown in self.radio_members:
-            if shown is member:
-                radio.setChecked(True)
-                return
+        for _keep_box, shown in self.keep_box_members:
+            self._set_box_checked(shown, shown is member)
+        self.update_relations()
 
     def expand(self):
         if self.expanded:
