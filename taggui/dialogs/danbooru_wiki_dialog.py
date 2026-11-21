@@ -50,6 +50,7 @@ BULLETED_REFERENCE_LINE_PATTERN = re.compile(
     r'^\s*[\*\-•]\s+(!?(?:post|asset)\s+#\d+)(.*)$',
     re.IGNORECASE
 )
+LIST_ITEM_PATTERN = re.compile(r'^(\*+)\s+(.*)$')
 TOKEN_PATTERN = re.compile(
     r'"[^"]+":\[https?://[^\]\s]+\]'
     r'|"[^"]+":https?://(?:[^\s"<\]()]+|\([^\s"<\]()]*\))+'
@@ -2337,31 +2338,17 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
 
             # List items: use inline <p> with text bullet to avoid Qt's
             # oversized <li> disc bullets and large default list indentation.
-            # Check *** before ** before * since each is a prefix of the next.
-            if stripped_line.startswith('*** '):
-                flush_thumbnails()
-                while html_lines and html_lines[-1] == '<br>':
-                    html_lines.pop()
-                list_item = self.linkify_inline_text(stripped_line[4:].strip())
-                html_lines.append(
-                    f'<p style="margin: 0 0 0 32px;">&bull;&nbsp;{list_item}</p>')
-                continue
-            if stripped_line.startswith('** '):
+            # The number of leading asterisks is the nesting depth.
+            list_match = LIST_ITEM_PATTERN.match(stripped_line)
+            if list_match:
                 flush_thumbnails()
                 # Strip heading's trailing <br> so list items sit close to the heading.
                 while html_lines and html_lines[-1] == '<br>':
                     html_lines.pop()
-                list_item = self.linkify_inline_text(stripped_line[3:].strip())
+                indent = 16 * (len(list_match.group(1)) - 1)
+                list_item = self.linkify_inline_text(list_match.group(2).strip())
                 html_lines.append(
-                    f'<p style="margin: 0 0 0 16px;">&bull;&nbsp;{list_item}</p>')
-                continue
-            if stripped_line.startswith('* '):
-                flush_thumbnails()
-                while html_lines and html_lines[-1] == '<br>':
-                    html_lines.pop()
-                list_item = self.linkify_inline_text(stripped_line[2:].strip())
-                html_lines.append(
-                    f'<p style="margin: 0;">&bull;&nbsp;{list_item}</p>')
+                    f'<p style="margin: 0 0 0 {indent}px;">&bull;&nbsp;{list_item}</p>')
                 continue
 
             flush_thumbnails()
