@@ -724,10 +724,17 @@ prefixes:
   `posts:no humans`. Separate several tags with commas to find posts that have
   all of them, e.g. `posts: dog, cat`. Danbooru limits how many tags you can
   search at once; signing in (below) raises that limit.
-- On a post's page, **View full size** (or clicking the image) opens the
+- On a post's page, the image fits the window's width (never enlarged past the
+  size the site provides). **View full size** (or clicking the image) opens the
   original image in a zoomable window, and **Download original** saves it
   (the save dialog starts in the folder you last used). Videos offer only the
   download.
+- The full-size window opens fitted to the window, but a small image is never
+  enlarged past its actual size. The current zoom percentage is shown next to
+  the buttons at the top. **Double-click** switches between fit and 100%
+  (actual size); **`1`** jumps to 100%, **`0`** fits to the window, and
+  **`+`** / **`-`** or the mouse wheel zoom (pausing at exactly 100% on the
+  way).
 - Typing anything without a prefix does a normal wiki lookup for that tag.
 
 **Signing in to Danbooru (optional):** in **`Settings` → `Danbooru Wiki`**,

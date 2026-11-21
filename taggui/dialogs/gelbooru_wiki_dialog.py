@@ -1,13 +1,14 @@
 import html
 import re
-from base64 import b64decode, b64encode
+from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 from PySide6.QtCore import QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QImage
+from PySide6.QtGui import QDesktopServices
 
-from dialogs.booru_originals import ORIGINAL_INTERNAL_LINK_PREFIX, OriginalsMixin
+from dialogs.booru_originals import (ORIGINAL_INTERNAL_LINK_PREFIX,
+                                     OriginalsMixin, decode_data_url_image)
 from dialogs.wiki_dialog_base import (AUTOCOMPLETE_COUNT_SUFFIX_PATTERN,
                                       BaseWikiDialog, park_running_threads)
 from models.tag_library_model import TagLibraryModel
@@ -488,10 +489,7 @@ class GelbooruPostViewThread(QThread):
         data_url = image_url_to_data_url(str(image_url or ''),
                                          self.isInterruptionRequested)
         post['_taggui_image_data_url'] = data_url
-        image = QImage()
-        if data_url and image.loadFromData(
-                b64decode(data_url.split(',', 1)[1])):
-            post['_taggui_image_size'] = (image.width(), image.height())
+        post['_taggui_image'] = decode_data_url_image(data_url)
         self.post_ready.emit(self.request_key, post)
 
 
@@ -1130,12 +1128,7 @@ class GelbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         if not data_url:
             return (note or '<p style="color: palette(mid); margin: 4px 0;">'
                     'This post cannot be previewed here.</p>') + browser_link
-        image_width = (post.get('_taggui_image_size') or (0, 0))[0]
-        viewport_width = self.content_browser.viewport().width() - 32
-        display_width = max(1, min(image_width or viewport_width,
-                                   viewport_width))
-        image_html = (f'<img src="{html.escape(data_url, quote=True)}" '
-                      f'width="{display_width}">')
+        image_html = self._fitted_post_image_html(post)
         if not post.get('is_video'):
             image_html = self._link_image_to_original(post, image_html)
             browser_link = ''

@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel,
                                QVBoxLayout)
 
 from dialogs.booru_originals import (ORIGINAL_INTERNAL_LINK_PREFIX,
-                                     OriginalsMixin, original_file_extension,
+                                     OriginalsMixin, decode_data_url_image,
+                                     original_file_extension,
                                      original_is_viewable)
 from models.tag_library_model import TagLibraryModel
 from utils.settings import get_settings
@@ -130,10 +131,6 @@ POSTS_PER_PAGE = 20
 # Typing this prefix in the search box (e.g. "posts:no humans") searches posts
 # for that tag directly instead of opening its wiki page.
 POSTS_SEARCH_PREFIX = 'posts:'
-# Longest edge (in pixels) of Danbooru's "sample"/large image, which is what we
-# embed on a single-post view. We never display it larger than this so the image
-# is never upscaled (which would look blurry).
-POST_VIEW_MAX_IMAGE_EDGE = 850
 # Danbooru tag categories → display colours (light theme, dark theme).
 TAG_CATEGORY_COLORS = {
     'copyright': ('#a800aa', '#c973cd'),
@@ -818,6 +815,8 @@ class DanbooruPostViewThread(QThread):
                         or post.get('preview_file_url') or '')
         post['_taggui_image_data_url'] = image_url_to_data_url(
             image_url, self.isInterruptionRequested)
+        post['_taggui_image'] = decode_data_url_image(
+            post['_taggui_image_data_url'])
         self.post_ready.emit(self.request_key, post)
 
 
@@ -1716,26 +1715,8 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
             return ('<p style="color: palette(mid); margin: 4px 0;">'
                     'This post cannot be previewed here '
                     '(it may be a video, animation, or restricted).</p>' + link)
-        width = int(post.get('image_width') or 0)
-        height = int(post.get('image_height') or 0)
-        if width > 0 and height > 0:
-            # `width`/`height` are the ORIGINAL dimensions, but the image we embed
-            # is Danbooru's sample (long edge <= POST_VIEW_MAX_IMAGE_EDGE). Work
-            # out the sample's natural width so we never scale it up.
-            longest_edge = max(width, height)
-            if longest_edge > POST_VIEW_MAX_IMAGE_EDGE:
-                natural_width = max(
-                    1, round(width * POST_VIEW_MAX_IMAGE_EDGE / longest_edge))
-            else:
-                natural_width = width
-            viewport_width = self.content_browser.viewport().width() - 32
-            display_width = max(1, min(natural_width, viewport_width))
-            size_attr = f'width="{display_width}"'
-        else:
-            size_attr = 'style="max-width: 100%;"'
         image_html = self._link_image_to_original(
-            post, f'<img src="{html.escape(data_url, quote=True)}" '
-                  f'{size_attr}>')
+            post, self._fitted_post_image_html(post))
         return f'<p style="margin: 4px 0;">{image_html}</p>'
 
     def _build_post_info_html(self, post: dict, is_dark: bool) -> str:

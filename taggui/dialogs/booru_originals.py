@@ -4,13 +4,14 @@ import html
 import re
 import shutil
 import tempfile
-from base64 import b64decode
+from base64 import b64decode, b64encode
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from PySide6.QtCore import QStandardPaths, QThread, Signal, Slot
-from PySide6.QtGui import QImageReader
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QStandardPaths,
+                            QThread, Qt, Signal, Slot)
+from PySide6.QtGui import QImage, QImageReader
+from PySide6.QtWidgets import QFileDialog, QStyle
 
 from dialogs.booru_image_viewer import BooruImageViewerDialog
 from utils.settings import get_settings
@@ -37,6 +38,16 @@ def original_is_viewable(post: dict) -> bool:
     formats = {bytes(name).decode().lower()
                for name in QImageReader.supportedImageFormats()}
     return extension in formats
+
+
+def decode_data_url_image(data_url: str) -> QImage:
+    image = QImage()
+    if ',' in data_url:
+        try:
+            image.loadFromData(b64decode(data_url.split(',', 1)[1]))
+        except ValueError:
+            pass
+    return image
 
 
 class OriginalFetchThread(QThread):
@@ -336,6 +347,49 @@ class OriginalsMixin:
                          f'style="color: {link_color};">{label}</a>')
         return ('<p style="margin: 4px 0;">'
                 + ' &nbsp;|&nbsp; '.join(links) + '</p>')
+
+    def _fitted_post_image_html(self, post: dict) -> str:
+        """The post page's ``<img>``: as wide as the downloaded image, but no
+        wider than the page. QTextBrowser scales images without smoothing,
+        which looks pixelated, so the image is pre-scaled smoothly to the
+        exact on-screen pixel size (including display scaling)."""
+        data_url = str(post.get('_taggui_image_data_url') or '')
+        image = post.get('_taggui_image')
+        if not isinstance(image, QImage):
+            image = decode_data_url_image(data_url)
+            post['_taggui_image'] = image
+        if image.isNull():
+            return (f'<img src="{html.escape(data_url, quote=True)}" '
+                    'style="max-width: 100%;">')
+        browser = self.content_browser
+        viewport_width = browser.viewport().width() - 32
+        if not browser.verticalScrollBar().isVisible():
+            # Post pages almost always scroll; leave room for the scroll bar
+            # so it appearing doesn't add a horizontal one.
+            viewport_width -= browser.style().pixelMetric(
+                QStyle.PixelMetric.PM_ScrollBarExtent, None, browser)
+        display_width = max(1, min(image.width(), viewport_width))
+        pixel_width = max(1, round(
+            display_width * browser.devicePixelRatioF()))
+        if pixel_width != image.width():
+            cached = post.get('_taggui_scaled_image')
+            if cached and cached[0] == pixel_width:
+                data_url = cached[1]
+            else:
+                scaled = image.scaledToWidth(
+                    pixel_width, Qt.TransformationMode.SmoothTransformation)
+                image_format = 'PNG' if image.hasAlphaChannel() else 'JPEG'
+                buffer_bytes = QByteArray()
+                buffer = QBuffer(buffer_bytes)
+                buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+                scaled.save(buffer, image_format,
+                            -1 if image_format == 'PNG' else 92)
+                buffer.close()
+                data_url = (f'data:image/{image_format.lower()};base64,'
+                            + b64encode(bytes(buffer_bytes)).decode('ascii'))
+                post['_taggui_scaled_image'] = (pixel_width, data_url)
+        return (f'<img src="{html.escape(data_url, quote=True)}" '
+                f'width="{display_width}">')
 
     def _link_image_to_original(self, post: dict, image_html: str) -> str:
         """Make the post page's image open the full-size viewer."""
