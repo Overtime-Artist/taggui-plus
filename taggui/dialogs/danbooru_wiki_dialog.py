@@ -60,7 +60,7 @@ TOKEN_PATTERN = re.compile(
     r'|"[^"]+":\[/[^\]\s]+\]'
     r'|"[^"]+":/[^\s"<\])]+'
     r'|https?://\S+|\[\[[^\]]+\]\]|\{\{[^}]+\}\}|pool\s+#\d+'
-    r'|!?(?:post|asset)\s+#\d+|"[^"]+":#[A-Za-z0-9_-]+',
+    r'|!?(?:post|asset)\s+#\d+|"[^"]+":\[?#[A-Za-z0-9_-]+\]?',
     re.IGNORECASE
 )
 NAMED_EXTERNAL_LINK_PATTERN = re.compile(
@@ -1826,10 +1826,11 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
             escaped_url = html.escape(token, quote=True)
             return f'<a href="{escaped_url}">{html.escape(token)}</a>'
 
-        if token.startswith('"') and '":#' in token:
-            quoted_label, anchor_target = token.split('":#', 1)
+        if token.startswith('"') and ('":#' in token or '":[#' in token):
+            separator = '":[#' if '":[#' in token else '":#'
+            quoted_label, anchor_target = token.split(separator, 1)
             anchor_label = quoted_label[1:].strip()
-            normalized_anchor_target = anchor_target.strip()
+            normalized_anchor_target = anchor_target.strip().rstrip(']')
             if not normalized_anchor_target:
                 return html.escape(token)
             return (
