@@ -105,8 +105,12 @@ SPOILER_PATTERN = re.compile(r'\[spoiler\](.*?)\[/spoiler\]',
 # apply_inline_formatting_tags).
 CODE_PATTERN = re.compile(r'\[code\](.*?)\[/code\]', re.IGNORECASE | re.DOTALL)
 # DText translation notes used inline, e.g. a thumbnail caption
-# "[[tag]] [tn]| note[/tn]" (a [tn] that starts a line is a block note).
-INLINE_TN_PATTERN = re.compile(r'\[tn\](.*?)\[/tn\]', re.IGNORECASE | re.DOTALL)
+# "[[tag]] [tn]| note[/tn]" (a [tn] that starts a line is a block note). DText
+# also accepts the <tn>...</tn> form, which arrives here HTML-escaped.
+INLINE_TN_PATTERN = re.compile(
+    r'(?:\[tn\]|&lt;tn&gt;)(.*?)(?:\[/tn\]|&lt;/tn&gt;)',
+    re.IGNORECASE | re.DOTALL)
+ANGLE_TN_TAG_PATTERN = re.compile(r'<(/?)tn>', re.IGNORECASE)
 # DText tables: [table] [thead]/[tbody] [tr] [th]/[td] ... [/table].
 TABLE_ROW_PATTERN = re.compile(r'\[tr\](.*?)\[/tr\]', re.IGNORECASE | re.DOTALL)
 TABLE_CELL_PATTERN = re.compile(
@@ -2102,6 +2106,7 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         )
 
     def convert_dtext_to_html(self, body: str) -> str:
+        body = ANGLE_TN_TAG_PATTERN.sub(r'[\1tn]', body)
         lines = body.splitlines()
         html_lines = []
         thumbnail_buffer = []  # list of (thumb_html, caption_html)

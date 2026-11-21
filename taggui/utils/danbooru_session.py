@@ -50,6 +50,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -84,6 +85,9 @@ _DISMISS_COOLDOWN_S = 60
 # scripts can't run there), so the challenge is solved on the first requested
 # URL instead.
 _HOSTS_WITHOUT_HOME_PAGE = {'cdn.donmai.us'}
+_CHALLENGE_TITLE_PATTERN = re.compile(
+    r'just a moment|attention required|verifying|checking your browser',
+    re.IGNORECASE)
 
 # Name of the shared QtWebEngine profile. Also used by the "Remove app data"
 # cleanup (utils/app_data.py) to locate and delete the on-disk profile folder.
@@ -423,6 +427,25 @@ class _OriginSession:
             timeout_ms,
             lambda rid=request_id: self._solver._deliver_fail(rid))
 
+    def _load_script_page(self):
+        """Replace the (script-blocking) image document with an empty page
+        that has this origin, so same-origin ``fetch()`` calls can run."""
+        from PySide6.QtCore import QEventLoop
+        loop = QEventLoop()
+        timer = QTimer(self._solver)
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        self.page.loadFinished.connect(loop.quit)
+        timer.start(10000)
+        self.page.setHtml('<!doctype html><html><body></body></html>',
+                          QUrl(self.origin + '/'))
+        loop.exec()
+        timer.stop()
+        try:
+            self.page.loadFinished.disconnect(loop.quit)
+        except Exception:
+            pass
+
     def _solve(self):
         """Clear the challenge for this origin in a modal, always-on-top window.
 
@@ -511,10 +534,18 @@ class _OriginSession:
         def on_load_finished(ok):
             _log(f'[{self.host}] challenge page navigation finished (ok={ok})')
             # Give the page a moment to run any challenge JS, then inspect it.
-            QTimer.singleShot(
-                400,
-                lambda: self.page.runJavaScript(
-                    _CHALLENGE_PROBE_JS, 0, on_probe_result))
+            QTimer.singleShot(400, probe_page)
+
+        def probe_page():
+            if self.host in _HOSTS_WITHOUT_HOME_PAGE:
+                # The CDN serves images sandboxed, so no script (including
+                # the probe) can run in them. Judge by the title instead: the
+                # challenge always has a recognisable one, an image does not.
+                title = self.page.title() or ''
+                if title and not _CHALLENGE_TITLE_PATTERN.search(title):
+                    mark_cleared()
+                    return
+            self.page.runJavaScript(_CHALLENGE_PROBE_JS, 0, on_probe_result)
 
         def on_window_closed():
             # The user closed the verify window; stop waiting immediately.
@@ -562,6 +593,8 @@ class _OriginSession:
             pass
 
         self.ready = harvested['ok']
+        if self.ready and self.host in _HOSTS_WITHOUT_HOME_PAGE:
+            self._load_script_page()
         if self.ready:
             _log(f'[{self.host}] cleared Cloudflare challenge; fetching '
                  f'through the browser page')
