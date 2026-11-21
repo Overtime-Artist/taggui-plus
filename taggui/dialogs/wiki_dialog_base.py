@@ -1000,6 +1000,18 @@ class BaseWikiDialog(QDialog):
             return
         self.load_tag(selected_tag, add_to_history=True)
 
+    @staticmethod
+    def posts_tags_from_wiki_tag(normalized_tag: str) -> str:
+        """Space-separated posts-search tags for a wiki lookup that found no
+        page. Commas separate tags, so "dog,_cat_ears" (typed "dog, cat
+        ears") becomes "dog cat_ears"."""
+        tags = []
+        for part in str(normalized_tag or '').split(','):
+            tag = part.strip(' _')
+            if tag and tag not in tags:
+                tags.append(tag)
+        return ' '.join(tags)
+
     @Slot(str, str)
     def show_not_found(self, request_key: str, normalized_tag: str):
         if request_key != self.current_request_key:

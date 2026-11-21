@@ -917,7 +917,7 @@ class GelbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         """A tag without a wiki page shows its posts instead."""
         if request_key != self.current_request_key:
             return
-        tag = str(normalized_tag or '').strip()
+        tag = self.posts_tags_from_wiki_tag(normalized_tag)
         if not (request_key.startswith('tag:') and tag):
             super().show_not_found(request_key, normalized_tag)
             return

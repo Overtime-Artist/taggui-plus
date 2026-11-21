@@ -1353,8 +1353,9 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         a bad numeric wiki-page id still shows the normal "not found" message."""
         if request_key != self.current_request_key:
             return
-        if request_key.startswith('tag:') and str(normalized_tag or '').strip():
-            self._fallback_to_posts_search(str(normalized_tag).strip())
+        tags = self.posts_tags_from_wiki_tag(normalized_tag)
+        if request_key.startswith('tag:') and tags:
+            self._fallback_to_posts_search(tags)
             return
         super().show_not_found(request_key, normalized_tag)
 

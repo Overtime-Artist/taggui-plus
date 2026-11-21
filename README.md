@@ -723,7 +723,9 @@ prefixes:
 - To search **posts** for a tag, type `posts:` followed by the tag — for example
   `posts:no humans`. Separate several tags with commas to find posts that have
   all of them, e.g. `posts: dog, cat`. Danbooru limits how many tags you can
-  search at once; signing in (below) raises that limit.
+  search at once; signing in (below) raises that limit. Without `posts:`, a
+  search that has no wiki page (including several comma-separated tags) shows
+  the matching posts instead.
 - On a post's page, the image fits the window's width (never enlarged past the
   size the site provides). **View full size** (or clicking the image) opens the
   original image in a zoomable window, and **Download original** saves it
@@ -763,7 +765,8 @@ doesn't have them):
   the wiki, post pages and autocomplete, and a wiki page shows example posts.
 - **Post search** uses the same `posts:` prefix, e.g. `posts: dog, cat`.
   Gelbooru has no limit on how many tags you can combine. Looking up a tag
-  that has no wiki page shows its posts instead.
+  (or several comma-separated tags) that has no wiki page shows its posts
+  instead.
 - Post pages offer the same **View full size** and **Download original**
   buttons.
 
