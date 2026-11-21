@@ -2556,9 +2556,14 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
 
     @Slot(str)
     def on_search_text_changed(self, text: str):
-        if '(' in text and ')' in text:
-            cleaned = AUTOCOMPLETE_COUNT_SUFFIX_PATTERN.sub('', text).strip()
-            if cleaned and cleaned != text:
+        # Drop a pasted autocomplete count like " (1.2k)". Only rewrite the
+        # box when one was actually removed: tags such as "nice nature
+        # (umamusume)" also contain parentheses, and stripping the text
+        # anyway would eat the space typed after them.
+        cleaned, removed = AUTOCOMPLETE_COUNT_SUFFIX_PATTERN.subn('', text)
+        if removed:
+            cleaned = cleaned.strip()
+            if cleaned:
                 self.search_line_edit.setText(cleaned)
                 text = cleaned
         self.queue_autocomplete_search(text)

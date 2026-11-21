@@ -763,11 +763,24 @@ class MainWindow(QMainWindow):
             return
         text = 'Cancel Captioning'
         progress_bar = captioner.progress_bar
+        progress = None
         if (not progress_bar.isHidden()
                 and progress_bar.value() >= progress_bar.minimum()):
             text += f' ({progress_bar.value()}/{progress_bar.maximum()})'
+            if progress_bar.maximum() > progress_bar.minimum():
+                progress = ((progress_bar.value() - progress_bar.minimum())
+                            / (progress_bar.maximum()
+                               - progress_bar.minimum()))
         self.image_viewer.set_focus_caption_state(
-            text, True)
+            text, True, progress)
+
+    @Slot()
+    def _update_focus_caption_highlight(self, *args):
+        """Outline the focus mode bar's caption button while Alt+C has put
+        keyboard focus on the hidden Start button it stands in for."""
+        self.image_viewer.set_focus_caption_highlighted(
+            QApplication.focusWidget()
+            is self.auto_captioner.start_cancel_button)
 
     @Slot()
     def _report_focus_mode_caption_error(self):
@@ -2974,6 +2987,8 @@ class MainWindow(QMainWindow):
         self.auto_captioner.captioning_finished.connect(
             self._report_focus_mode_caption_error)
         self._update_focus_caption_button()
+        QApplication.instance().focusChanged.connect(
+            self._update_focus_caption_highlight)
         self.auto_captioner.captioning_started.connect(
             self._on_captioning_started)
         self.auto_captioner.captioning_started.connect(

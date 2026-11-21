@@ -5,7 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import (QEvent, QModelIndex, QObject, QPoint, QRect,
                              QRunnable, QSize, Qt, QThreadPool, QTimer, Signal,
                              Slot)
-from PySide6.QtGui import (QIcon, QImage, QImageReader, QPainter,
+from PySide6.QtGui import (QColor, QIcon, QImage, QImageReader, QPainter,
                            QPalette, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
                                QScrollArea, QSizePolicy, QToolButton,
@@ -341,6 +341,56 @@ class ImageScrollArea(QScrollArea):
         return super().eventFilter(obj, event)
 
 
+class _FocusCaptionButton(QToolButton):
+    """The focus mode bar's auto-caption button. While several images are
+    being captioned it fills up from the left like the Auto-Captioner's
+    progress bar, and it is outlined while the Alt+C shortcut has put
+    keyboard focus on the (hidden) Start button it stands in for."""
+
+    def __init__(self):
+        super().__init__()
+        self._progress: float | None = None
+        self._shortcut_highlighted = False
+
+    def set_progress(self, progress: float | None):
+        if progress is not None:
+            progress = max(0.0, min(float(progress), 1.0))
+        if progress != self._progress:
+            self._progress = progress
+            self.update()
+
+    def set_shortcut_highlighted(self, highlighted: bool):
+        if highlighted != self._shortcut_highlighted:
+            self._shortcut_highlighted = highlighted
+            self.update()
+
+    def paintEvent(self, event):
+        highlight = QApplication.palette().color(QPalette.ColorRole.Highlight)
+        radius = 6
+        if self._progress:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            fill = QColor(highlight)
+            fill.setAlpha(190)
+            painter.setBrush(fill)
+            # Clip to the filled width so the rounded corners stay intact.
+            painter.setClipRect(QRect(0, 0, round(self.width()
+                                                  * self._progress),
+                                      self.height()))
+            painter.drawRoundedRect(self.rect(), radius, radius)
+            painter.end()
+        super().paintEvent(event)
+        if self._shortcut_highlighted:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(highlight, 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1),
+                                    radius - 1, radius - 1)
+            painter.end()
+
+
 class ImageViewer(QWidget):
     clicked = Signal()
     # Emitted when a grid cell is clicked (not dragged), carrying the proxy
@@ -457,7 +507,8 @@ class ImageViewer(QWidget):
         separator.setObjectName('overlaySeparator')
         separator.setFixedWidth(1)
         self._focus_caption_button = self._make_overlay_button(
-            'Auto-Caption', self.focus_caption_requested.emit)
+            'Auto-Caption', self.focus_caption_requested.emit,
+            _FocusCaptionButton())
         for widget in (self._focus_previous_image_button,
                        self._focus_overlay_label,
                        self._focus_next_image_button, separator,
@@ -568,11 +619,18 @@ class ImageViewer(QWidget):
         self._focus_previous_image_button.setEnabled(has_previous)
         self._focus_next_image_button.setEnabled(has_next)
 
-    def set_focus_caption_state(self, text: str, enabled: bool):
+    def set_focus_caption_state(self, text: str, enabled: bool,
+                                progress: float | None = None):
+        """``progress`` (0-1) fills the button like a progress bar; None
+        shows no fill."""
         button = self._focus_caption_button
         button.setText(text)
         button.setEnabled(enabled)
+        button.set_progress(progress)
         self._update_focus_overlay()
+
+    def set_focus_caption_highlighted(self, highlighted: bool):
+        self._focus_caption_button.set_shortcut_highlighted(highlighted)
 
     def _update_focus_overlay(self):
         overlay = self._focus_overlay
@@ -600,8 +658,10 @@ class ImageViewer(QWidget):
                      viewport.height() - overlay.height() - margin)
 
     @staticmethod
-    def _make_overlay_button(text: str, slot) -> QToolButton:
-        button = QToolButton()
+    def _make_overlay_button(text: str, slot,
+                             button: QToolButton | None = None
+                             ) -> QToolButton:
+        button = button if button is not None else QToolButton()
         button.setText(text)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         # Clicking must not take keyboard focus from where the user was.
