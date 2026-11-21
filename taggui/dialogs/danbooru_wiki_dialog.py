@@ -23,7 +23,10 @@ from utils.danbooru_session import (api_key_problem, cancel_pending_fetches,
                                     initialize_on_main_thread)
 from dialogs.wiki_dialog_base import (AUTOCOMPLETE_ANY_SUFFIX_PATTERN, AUTOCOMPLETE_COUNT_SUFFIX_PATTERN,
                                      BaseWikiDialog, TAG_GROUP_NORMALIZED_PREFIX,
-                                     TAG_GROUP_SEARCH_PREFIX, park_running_threads)
+                                     TAG_GROUP_SEARCH_PREFIX, display_wiki_title,
+                                     join_wiki_namespace, park_running_threads,
+                                     split_wiki_namespace,
+                                     strip_wiki_search_prefix)
 
 DANBOORU_BASE_URL = 'https://danbooru.donmai.us'
 # The Danbooru help page describing what tag deprecation means. Linked from the
@@ -834,7 +837,8 @@ class DanbooruTagAutocompleteThread(QThread):
         self.query_text = query_text
 
     def run(self):
-        original_query_text = self.query_text.strip()
+        original_query_text = join_wiki_namespace(
+            strip_wiki_search_prefix(self.query_text)[1])
         if not original_query_text:
             self.suggestions_ready.emit(self.query_text, [])
             return
@@ -938,7 +942,7 @@ class DanbooruTagAutocompleteThread(QThread):
             self.suggestions_ready.emit(self.query_text, [])
             return
 
-        group_filter = query_text[len(TAG_GROUP_NORMALIZED_PREFIX):].strip()
+        group_filter = query_text[len(TAG_GROUP_NORMALIZED_PREFIX):].strip(' _')
         group_filter = group_filter.replace(' ', '_').casefold()
         group_titles = self.get_tag_group_titles()
         if not group_titles:
@@ -1198,7 +1202,7 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
         title_color = (self._wiki_link_color(self._stored_wiki_title)
                        or ('#6baef6' if is_dark else '#0066cc'))
-        display_title = self._stored_wiki_title.replace('_', ' ')
+        display_title = display_wiki_title(self._stored_wiki_title)
         rendered_body = self.convert_dtext_to_html(self._stored_wiki_body)
         other_names_html = self._build_other_names_html(is_dark)
         deprecated_html = self._build_deprecated_note_html(is_dark)
@@ -1293,19 +1297,11 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
 
 
     def normalize_tag(self, tag: str) -> str:
-        normalized = str(tag).strip()
-        normalized_casefold = normalized.casefold()
-        if normalized_casefold.startswith(TAG_GROUP_SEARCH_PREFIX):
-            normalized = ('tag_group:'
-                          + normalized[len(TAG_GROUP_SEARCH_PREFIX):].lstrip())
-        elif normalized_casefold.startswith(TAG_GROUP_NORMALIZED_PREFIX):
-            normalized = ('tag_group:'
-                          + normalized[len(TAG_GROUP_NORMALIZED_PREFIX):].lstrip())
-        normalized = normalized.replace(' ', '_')
-        if normalized.casefold().startswith(TAG_GROUP_NORMALIZED_PREFIX):
-            normalized = ('tag_group:'
-                          + normalized[len(TAG_GROUP_NORMALIZED_PREFIX):]
-                          .casefold())
+        # "tag group: birds" / "help: pixiv" -> "tag_group:birds" /
+        # "help:pixiv". Danbooru's namespaced wiki titles are all lowercase.
+        normalized = join_wiki_namespace(tag).replace(' ', '_')
+        if split_wiki_namespace(normalized) is not None:
+            normalized = normalized.casefold()
         return normalized
 
 
@@ -1353,8 +1349,8 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         a bad numeric wiki-page id still shows the normal "not found" message."""
         if request_key != self.current_request_key:
             return
-        tags = self.posts_tags_from_wiki_tag(normalized_tag)
-        if request_key.startswith('tag:') and tags:
+        tags = self.posts_fallback_tags(request_key, normalized_tag)
+        if tags:
             self._fallback_to_posts_search(tags)
             return
         super().show_not_found(request_key, normalized_tag)
@@ -1384,7 +1380,7 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         else:
             self.pending_history_update = True
 
-        display_tag = normalized_tag.replace('_', ' ')
+        display_tag = display_wiki_title(normalized_tag)
         self.current_request_key = f'tag:{normalized_tag}'
         self.setWindowTitle(f'Danbooru Wiki: {display_tag}')
         self.set_search_text_silently(display_tag)
@@ -1507,10 +1503,9 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         display_tags = self._posts_display_tags(tags)
         self.current_request_key = f'posts:{tags}:{page}'
         self.setWindowTitle(f'Danbooru Posts: {display_tags} (page {page})')
-        # A multi-tag search keeps its "posts:" prefix in the box so pressing
-        # Enter again repeats the same search rather than a wiki lookup.
-        self.set_search_text_silently(
-            f'posts: {display_tags}' if ' ' in tags else display_tags)
+        # Posts searches always show their "posts:" prefix, so the box reads
+        # the same however the search was started and Enter repeats it.
+        self.set_search_text_silently(f'posts: {display_tags}')
         self._active_composer = None
         self.show_loading()
         self._set_browser_html('')
@@ -2412,7 +2407,7 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
             self.history_index = len(self.tag_history) - 1
             self.pending_history_append_on_load = False
             self.update_navigation_buttons()
-        display_tag = title.replace('_', ' ')
+        display_tag = display_wiki_title(title)
         self.setWindowTitle(f'Danbooru Wiki: {display_tag}')
         self.set_search_text_silently(display_tag)
         self.update_add_to_library_button_state()

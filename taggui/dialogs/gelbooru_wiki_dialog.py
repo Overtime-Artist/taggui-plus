@@ -10,7 +10,10 @@ from PySide6.QtGui import QDesktopServices
 from dialogs.booru_originals import (ORIGINAL_INTERNAL_LINK_PREFIX,
                                      OriginalsMixin, decode_data_url_image)
 from dialogs.wiki_dialog_base import (AUTOCOMPLETE_COUNT_SUFFIX_PATTERN,
-                                      BaseWikiDialog, park_running_threads)
+                                      BaseWikiDialog, display_wiki_title,
+                                      join_wiki_namespace,
+                                      park_running_threads,
+                                      strip_wiki_search_prefix)
 from models.tag_library_model import TagLibraryModel
 from utils.gelbooru_posts import (AUTOCOMPLETE_TAG_TYPES, FETCH_WORKER_COUNT,
                                   POSTS_PER_PAGE, autocomplete_entries,
@@ -501,7 +504,8 @@ class GelbooruTagAutocompleteThread(QThread):
         self.query_text = query_text
 
     def run(self):
-        query = self.query_text.strip()
+        query = join_wiki_namespace(
+            strip_wiki_search_prefix(self.query_text)[1])
         if not query or query.casefold().startswith(POSTS_SEARCH_PREFIX):
             self.suggestions_ready.emit(self.query_text, [])
             return
@@ -659,7 +663,7 @@ class GelbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
 
     # ---- Tags and URLs ----
     def normalize_tag(self, tag: str) -> str:
-        return str(tag).strip().replace(' ', '_')
+        return join_wiki_namespace(tag).replace(' ', '_')
 
     def wiki_url_for_tag(self, normalized_tag: str) -> str:
         return (f'{GELBOORU_BASE_URL}/index.php?page=wiki&s=list&search='
@@ -807,7 +811,7 @@ class GelbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
             self.pending_history_update = False
         else:
             self.pending_history_update = True
-        display_tag = normalized_tag.replace('_', ' ')
+        display_tag = display_wiki_title(normalized_tag)
         self.current_wiki_id = ''
         self.set_search_text_silently(display_tag)
         self._start_view(f'tag:{normalized_tag.casefold()}',
@@ -845,7 +849,7 @@ class GelbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
             self._push_history(entry)
             self.pending_history_append_on_load = False
             self.update_navigation_buttons()
-        display_tag = title.replace('_', ' ')
+        display_tag = display_wiki_title(title)
         self.setWindowTitle(f'Gelbooru Wiki: {display_tag}')
         self.set_search_text_silently(display_tag)
         self.update_add_to_library_button_state()
@@ -885,7 +889,7 @@ class GelbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         other_names_html = self._build_chips_html(other_names, self._is_dark())
         return (
             f'<h1 style="font-size: 1.5em; color: {title_color}; '
-            f'margin: 0 0 4px 0;">{html.escape(title.replace("_", " "))}</h1>'
+            f'margin: 0 0 4px 0;">{html.escape(display_wiki_title(title))}</h1>'
             f'{other_names_html}'
             f'<div style="line-height: 1.2; margin-top: 4px;">'
             f'{paragraphs_from_line_breaks(body_html)}</div>'
@@ -917,8 +921,8 @@ class GelbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         """A tag without a wiki page shows its posts instead."""
         if request_key != self.current_request_key:
             return
-        tag = self.posts_tags_from_wiki_tag(normalized_tag)
-        if not (request_key.startswith('tag:') and tag):
+        tag = self.posts_fallback_tags(request_key, normalized_tag)
+        if not tag:
             super().show_not_found(request_key, normalized_tag)
             return
         self.pending_history_append_on_load = False
@@ -976,9 +980,9 @@ class GelbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
         if add_to_history:
             self._push_history({'type': 'posts', 'tags': tags, 'page': page})
         display_tags = self._posts_display_tags(tags)
-        # A multi-tag search keeps its "posts:" prefix so Enter repeats it.
-        self.set_search_text_silently(
-            f'posts: {display_tags}' if ' ' in tags else display_tags)
+        # Posts searches always show their "posts:" prefix so Enter repeats
+        # them and the box reads the same however they were started.
+        self.set_search_text_silently(f'posts: {display_tags}')
         self._start_view(f'posts:{tags}:{page}',
                          f'Gelbooru Posts: {display_tags} (page {page})')
         posts_thread = GelbooruPostsSearchThread(

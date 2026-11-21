@@ -715,17 +715,25 @@ You reach tag groups and post search through the **search bar** using simple
 prefixes:
 
 - To search a **tag group**, type `tag group:` followed by the group name — for
-  example `tag group:hair`. Typing just `tag group:` on its own suggests
+  example `tag group: hair` (the space after the colon is optional). Typing
+  just `tag group:` on its own suggests
   matching groups via autocomplete, but for a **complete list** it's better to
   look up the **`tag groups`** wiki page itself (type `tag groups` into the
   search bar with no prefix), which lists every tag group in its table of
   contents.
+- Danbooru's other special pages work the same way: `help:`, `howto:`,
+  `about:`, `api:` and `pool group:` (e.g. `help: pixiv`). The search bar and
+  page heading always show them with a space after the colon. If such a page
+  doesn't exist you get a "not found" message rather than a posts search.
 - To search **posts** for a tag, type `posts:` followed by the tag — for example
-  `posts:no humans`. Separate several tags with commas to find posts that have
+  `posts: no humans`. Separate several tags with commas to find posts that have
   all of them, e.g. `posts: dog, cat`. Danbooru limits how many tags you can
   search at once; signing in (below) raises that limit. Without `posts:`, a
   search that has no wiki page (including several comma-separated tags) shows
-  the matching posts instead.
+  the matching posts instead. Whichever way a posts search starts, the search
+  bar shows it as `posts: …`.
+- To look up **only** a wiki page, type `wiki:` first (e.g. `wiki: cats`). If
+  there's no such page you get a "not found" message instead of posts.
 - On a post's page, the image fits the window's width (never enlarged past the
   size the site provides). **View full size** (or clicking the image) opens the
   original image in a zoomable window, and **Download original** saves it
@@ -766,7 +774,7 @@ doesn't have them):
 - **Post search** uses the same `posts:` prefix, e.g. `posts: dog, cat`.
   Gelbooru has no limit on how many tags you can combine. Looking up a tag
   (or several comma-separated tags) that has no wiki page shows its posts
-  instead.
+  instead, and the `wiki:` prefix works here too.
 - Post pages offer the same **View full size** and **Download original**
   buttons.
 

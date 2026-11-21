@@ -159,6 +159,58 @@ AUTOCOMPLETE_COUNT_SUFFIX_PATTERN = re.compile(
 AUTOCOMPLETE_ANY_SUFFIX_PATTERN = re.compile(r'\s*\([^)]+\)\s*$')
 TAG_GROUP_SEARCH_PREFIX = 'tag group:'
 TAG_GROUP_NORMALIZED_PREFIX = 'tag_group:'
+# Typing this prefix searches the wiki only: a missing page shows "not found"
+# instead of falling back to a posts search.
+WIKI_SEARCH_PREFIX = 'wiki:'
+# Wiki-only namespaces. These are typed and shown as "help: pixiv" (space after
+# the colon) but looked up as "help:pixiv". They are never post tags, so a
+# missing page doesn't fall back to a posts search.
+WIKI_NAMESPACE_PATTERN = re.compile(
+    r'^\s*(tag[ _]group|pool[ _]group|help|howto|about|api)\s*:[\s_]*(.*?)\s*$',
+    re.IGNORECASE | re.DOTALL)
+
+
+def split_wiki_namespace(text: str):
+    """("help", "pixiv") for "help: pixiv" / "help:pixiv", else None."""
+    match = WIKI_NAMESPACE_PATTERN.match(str(text or ''))
+    if not match:
+        return None
+    return match.group(1).casefold().replace(' ', '_'), match.group(2)
+
+
+def join_wiki_namespace(text: str) -> str:
+    """Drop the space after a wiki namespace's colon ("help: x" -> "help:x")."""
+    parts = split_wiki_namespace(text)
+    if parts is None:
+        return str(text or '').strip()
+    return f'{parts[0]}:{parts[1]}'
+
+
+def display_wiki_title(title: str) -> str:
+    """Readable title: underscores become spaces and a wiki namespace gets a
+    space after its colon ("tag_group:birds" -> "tag group: birds")."""
+    parts = split_wiki_namespace(title)
+    if parts is None:
+        return str(title or '').replace('_', ' ').strip()
+    namespace, name = parts
+    return f'{namespace.replace("_", " ")}: {name.replace("_", " ")}'.rstrip()
+
+
+def strip_wiki_search_prefix(text: str):
+    """(True, rest) when the text starts with "wiki:", else (False, text)."""
+    stripped = str(text or '').strip()
+    if stripped.casefold().startswith(WIKI_SEARCH_PREFIX):
+        return True, stripped[len(WIKI_SEARCH_PREFIX):].strip()
+    return False, stripped
+
+
+def completion_filter_text(text: str) -> str:
+    """The search-box text as the autocomplete popup should filter on it:
+    without a "wiki:" prefix and with namespaces in their display form."""
+    _, rest = strip_wiki_search_prefix(text)
+    if split_wiki_namespace(rest) is not None:
+        return display_wiki_title(rest)
+    return rest
 
 
 class TagNameOnlyCompleter(QCompleter):
@@ -171,6 +223,7 @@ class TagNameOnlyCompleter(QCompleter):
         self.prev_completion = ''
 
     def setCompletionPrefix(self, prefix: str):
+        prefix = completion_filter_text(prefix)
         self.prev_completion = prefix
         super().setCompletionPrefix(prefix)
 
@@ -180,18 +233,18 @@ class TagNameOnlyCompleter(QCompleter):
         completion = super().pathFromIndex(index)
         tag_name = self.display_to_tag.get(completion, '')
         if tag_name:
-            return tag_name.replace('_', ' ')
-        return AUTOCOMPLETE_ANY_SUFFIX_PATTERN.sub(
-            '', completion).strip().replace('_', ' ')
+            return display_wiki_title(tag_name)
+        return display_wiki_title(AUTOCOMPLETE_ANY_SUFFIX_PATTERN.sub(
+            '', completion).strip())
 
     def insertText(self, completion: str):
         tag_name = self.display_to_tag.get(completion, '')
         if tag_name:
-            super().insertText(tag_name.replace('_', ' '))
+            super().insertText(display_wiki_title(tag_name))
         else:
             clean_text = AUTOCOMPLETE_ANY_SUFFIX_PATTERN.sub(
                 '', completion).strip()
-            super().insertText(clean_text.replace('_', ' '))
+            super().insertText(display_wiki_title(clean_text))
 
 
 class BaseWikiDialog(QDialog):
@@ -871,10 +924,30 @@ class BaseWikiDialog(QDialog):
         self.stop_all_autocomplete_threads()
         search_text = self.extract_tag_name_from_search_text(
             self.search_line_edit.text())
+        wiki_only, search_text = strip_wiki_search_prefix(search_text)
+        search_text = self.extract_tag_name_from_search_text(search_text)
         if not search_text:
             return
-        self.search_line_edit.setText(search_text.replace('_', ' '))
+        self.search_line_edit.setText(display_wiki_title(search_text))
+        self._wiki_only_request_key = None
         self.load_tag(search_text, add_to_history=True)
+        if wiki_only:
+            # The lookup always answers later (from a worker thread), so the
+            # request key set by load_tag identifies it.
+            self._wiki_only_request_key = self.current_request_key
+
+    def posts_fallback_tags(self, request_key: str,
+                            normalized_tag: str) -> str:
+        """Tags to search posts for when a wiki lookup finds no page, or ''
+        to show "not found" instead (a "wiki:" search, a wiki namespace such
+        as "help:", or a lookup by page id)."""
+        if not request_key.startswith('tag:'):
+            return ''
+        if request_key == getattr(self, '_wiki_only_request_key', None):
+            return ''
+        if split_wiki_namespace(normalized_tag) is not None:
+            return ''
+        return self.posts_tags_from_wiki_tag(normalized_tag)
 
     def stop_all_fetch_threads(self):
         """Called while the dialog closes. Never blocks: see
@@ -965,7 +1038,7 @@ class BaseWikiDialog(QDialog):
             is_tag_group = bool(suggestion.get('is_tag_group'))
             is_wiki_only = bool(suggestion.get('is_wiki_only'))
             tag_count = int(suggestion.get('post_count') or 0)
-            human_readable_tag = tag_name.replace('_', ' ')
+            human_readable_tag = display_wiki_title(tag_name)
             if (is_tag_group
                     and human_readable_tag.casefold().startswith('tag group:')):
                 display_text = f'{human_readable_tag} (Tag Group)'
@@ -982,6 +1055,10 @@ class BaseWikiDialog(QDialog):
             self.search_autocomplete_model.appendRow(item)
         self.search_completer.display_to_tag = self.autocomplete_display_to_tag
         if suggestions and self.search_line_edit.hasFocus():
+            # Qt filters the popup on the raw box text; match "wiki: cat" and
+            # "tag group:b" against the suggestions' display form instead.
+            self.search_completer.setCompletionPrefix(
+                self.search_line_edit.text())
             self.search_completer.complete()
 
     def suggestion_color(self, suggestion: dict) -> str:
@@ -1019,7 +1096,7 @@ class BaseWikiDialog(QDialog):
         self.pending_history_append_on_load = False
         self.show_status_message('No wiki page found for this tag.')
         self._set_browser_html(
-            f'<h3>{html.escape(normalized_tag)}</h3>'
+            f'<h3>{html.escape(display_wiki_title(normalized_tag))}</h3>'
             f'<p>No wiki entry was found on {self.SITE_NAME}.</p>')
         self.update_add_to_library_button_state()
 
