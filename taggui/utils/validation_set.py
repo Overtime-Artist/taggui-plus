@@ -28,9 +28,12 @@ DEFAULT_FOLDER_NAME = 'Validation_Set'
 NEVER_PICK_FILE_NAME = '.taggui_validation.json'
 
 # Variant matching levels -> maximum dHash distance (see duplicate_detection).
-# 0 still groups byte-identical copies.
+# None skips the check entirely; 0 groups only byte-identical copies, which
+# needs no image decoding.
+EXACT_VARIANT_MATCHING = 'Exact / identical only'
 VARIANT_MATCHING_LEVELS = {
-    'Off (exact copies only)': 0,
+    'Off': None,
+    EXACT_VARIANT_MATCHING: 0,
     'Strict': 4,
     'Medium': 10,
     'Loose': 16,

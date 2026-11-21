@@ -24,6 +24,7 @@ recomputes files whose modification time changed.
 from __future__ import annotations
 
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -114,7 +115,8 @@ class DuplicateCache:
         return None
 
     def put(self, image_path: Path, mtime_ns: int | None,
-            sha256: str | None, dhash: int | None) -> None:
+            sha256: str | None, dhash: int | None,
+            dhash_computed: bool = True) -> None:
         if mtime_ns is None:
             return
         self._entries[str(image_path)] = {
@@ -123,7 +125,8 @@ class DuplicateCache:
             'dhash': dhash,
             # Records which hash resolution produced ``dhash`` so that changing
             # _DHASH_BITS invalidates values computed by an older version.
-            'dhash_bits': _DHASH_BITS,
+            # None means only the SHA-256 was computed (an exact-only scan).
+            'dhash_bits': _DHASH_BITS if dhash_computed else None,
         }
         self._dirty = True
 
@@ -235,17 +238,36 @@ def find_duplicate_groups(images, threshold: int,
     image_list = list(images)
     total = len(image_list)
     records: list[ImageRecord | None] = [None] * total
-    # (record index, needs a new SHA-256) for files not answered by the cache.
-    to_hash: list[tuple[int, bool]] = []
+    exact_only = threshold <= 0
+    # (record index, needs a new SHA-256, needs a dHash) for files not
+    # answered by the cache.
+    to_hash: list[tuple[int, bool, bool]] = []
     done = 0
     for index, image in enumerate(image_list):
         path = Path(image.path)
         size, mtime_ns = _stat_size_mtime(path)
-        cached = cache.get(path, mtime_ns)
-        record = ImageRecord(
+        records[index] = ImageRecord(
             path=path, dimensions=getattr(image, 'dimensions', None),
             size=size, mtime_ns=mtime_ns, sha256=None, dhash=None)
-        records[index] = record
+    if exact_only:
+        # Identical files must be the same size, so only files sharing a
+        # size with another file are read, and none are decoded.
+        size_counts = Counter(record.size for record in records
+                              if record.size is not None)
+    for index, record in enumerate(records):
+        path = record.path
+        cached = cache.get(path, record.mtime_ns)
+        if exact_only:
+            if cached is not None and cached.get('sha256') is not None:
+                record.sha256 = cached.get('sha256')
+                if cached.get('dhash_bits') == _DHASH_BITS:
+                    record.dhash = cached.get('dhash')
+                done += 1
+            elif size_counts.get(record.size, 0) > 1:
+                to_hash.append((index, True, False))
+            else:
+                done += 1
+            continue
         if cached is not None:
             record.sha256 = cached.get('sha256')
             # Reuse the cached dHash only if it was computed at the current
@@ -256,17 +278,17 @@ def find_duplicate_groups(images, threshold: int,
                 record.dhash = cached.get('dhash')
                 done += 1
                 continue
-            to_hash.append((index, False))
+            to_hash.append((index, False, True))
         else:
-            to_hash.append((index, True))
+            to_hash.append((index, True, True))
     if progress_callback is not None:
         progress_callback('hashing', done, total)
 
     def hash_record(job):
-        index, needs_sha = job
+        index, needs_sha, needs_dhash = job
         path = records[index].path
         sha256 = _hash_file(path) if needs_sha else records[index].sha256
-        return index, sha256, compute_dhash(path)
+        return index, sha256, (compute_dhash(path) if needs_dhash else None)
 
     # Decoding large images dominates scan time. Pillow and hashlib release
     # the GIL while working, so several threads give a near-linear speed-up
@@ -276,12 +298,14 @@ def find_duplicate_groups(images, threshold: int,
                              len(to_hash)))
         executor = ThreadPoolExecutor(max_workers=workers)
         try:
-            futures = [executor.submit(hash_record, job) for job in to_hash]
+            futures = {executor.submit(hash_record, job): job[2]
+                       for job in to_hash}
             for future in as_completed(futures):
                 index, sha256, dhash = future.result()
                 record = records[index]
                 record.sha256, record.dhash = sha256, dhash
-                cache.put(record.path, record.mtime_ns, sha256, dhash)
+                cache.put(record.path, record.mtime_ns, sha256, dhash,
+                          dhash_computed=futures[future])
                 done += 1
                 if progress_callback is not None:
                     progress_callback('hashing', done, total)

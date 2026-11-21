@@ -29,7 +29,8 @@ from utils.settings_widgets import (FocusedScrollComboBox,
                                     SettingsBigCheckBox)
 from utils.utils import pluralize
 from utils.validation_set import (DEFAULT_FOLDER_NAME,
-                                  DEFAULT_VARIANT_MATCHING, NeverPickStore,
+                                  DEFAULT_VARIANT_MATCHING,
+                                  EXACT_VARIANT_MATCHING, NeverPickStore,
                                   VARIANT_MATCHING_LEVELS, build_units,
                                   is_in_validation_folder, is_within,
                                   pick_units, return_destination,
@@ -272,7 +273,11 @@ class ValidationSetDialog(QDialog):
         self.variant_combo_box.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.variant_combo_box.addItems(list(VARIANT_MATCHING_LEVELS))
-        if self.variant_combo_box.currentText() not in VARIANT_MATCHING_LEVELS:
+        if (self.settings.value('validation_set_variant_matching')
+                == 'Off (exact copies only)'):
+            # Older name for what is now "Exact / identical only".
+            self.variant_combo_box.setCurrentText(EXACT_VARIANT_MATCHING)
+        elif self.variant_combo_box.currentText() not in VARIANT_MATCHING_LEVELS:
             self.variant_combo_box.setCurrentText(DEFAULT_VARIANT_MATCHING)
         grid.addWidget(self.variant_combo_box, 1, 4,
                        Qt.AlignmentFlag.AlignLeft)
@@ -600,7 +605,7 @@ class ValidationSetDialog(QDialog):
         if self._units is not None and scan_key == self._scan_key:
             self._pick_from_scratch()
             return
-        if self._candidate_count < 2:
+        if self._candidate_count < 2 or threshold is None:
             self._set_groups(scan_key, [])
             return
         self.pick_button.setEnabled(False)

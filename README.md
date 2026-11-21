@@ -650,7 +650,11 @@ fine-tuning, and moves them (with their caption files) into a subfolder.
   source.
 - **Keep variants together** — near-identical variants of an image are picked
   (or skipped) together, so no near-copy ends up on both sides of the split.
-  **Off** still keeps byte-identical copies together.
+  **Exact / identical only** groups only byte-identical copies and is quick,
+  because it doesn't need to open the images. **Strict**, **Medium** and
+  **Loose** also catch edited variants, but the first check of a folder reads
+  every image (the results are shared with Find Duplicates, so later checks are
+  quick). **Off** skips the check entirely.
 
 Click **Pick Images**. Images are chosen so that each tag appears in the
 validation set about as often as in the whole folder, and the line below shows
