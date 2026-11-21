@@ -62,6 +62,8 @@ TOKEN_PATTERN = re.compile(
     # URL in build_link_html.
     r'|"[^"]+":\[/[^\]\s]+\]'
     r'|"[^"]+":/[^\s"<\])]+'
+    # DText "<https://...>" (angle brackets delimit the URL and aren't shown).
+    r'|<https?://[^\s<>]+>'
     r'|https?://\S+|\[\[[^\]]+\]\]|\{\{[^}]+\}\}|pool\s+#\d+'
     r'|!?(?:post|asset)\s+#\d+|"[^"]+":\[?#[A-Za-z0-9_-]+\]?',
     re.IGNORECASE
@@ -113,6 +115,8 @@ CODE_PATTERN = re.compile(r'\[code\](.*?)\[/code\]', re.IGNORECASE | re.DOTALL)
 INLINE_TN_PATTERN = re.compile(
     r'(?:\[tn\]|&lt;tn&gt;)(.*?)(?:\[/tn\]|&lt;/tn&gt;)',
     re.IGNORECASE | re.DOTALL)
+UNCLOSED_TN_PATTERN = re.compile(
+    r'^(.*?)(?:\[tn\]|&lt;tn&gt;)(.*)$', re.IGNORECASE | re.DOTALL)
 ANGLE_TN_TAG_PATTERN = re.compile(r'<(/?)tn>', re.IGNORECASE)
 # DText tables: [table] [thead]/[tbody] [tr] [th]/[td] ... [/table].
 TABLE_ROW_PATTERN = re.compile(r'\[tr\](.*?)\[/tr\]', re.IGNORECASE | re.DOTALL)
@@ -1818,6 +1822,8 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
             escaped_url = html.escape(f'{DANBOORU_BASE_URL}{path}', quote=True)
             return f'<a href="{escaped_url}">{html.escape(label)}</a>'
 
+        if token.startswith('<http') and token.endswith('>'):
+            token = token[1:-1]
         if token.startswith('http'):
             escaped_url = html.escape(token, quote=True)
             return f'<a href="{escaped_url}">{html.escape(token)}</a>'
@@ -1908,6 +1914,16 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
             text = text.replace('[br]', '<br>')
         else:
             text = text.replace('[br]', ' ')
+        # Inline [code] is literal: hide it from link detection (otherwise
+        # "[code]http://[/code]" becomes a link that swallows "[/code]") and
+        # put it back for apply_inline_formatting_tags to render.
+        code_spans: list[str] = []
+
+        def hide_code(match: re.Match) -> str:
+            code_spans.append(match.group(0))
+            return f'\x00RAWCODE{len(code_spans) - 1}\x00'
+
+        text = CODE_PATTERN.sub(hide_code, text)
         html_parts = []
         position = 0
         for token_match in TOKEN_PATTERN.finditer(text):
@@ -1924,7 +1940,11 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
             html_parts.append(self.build_link_html(token, link_label_suffix=trailing_suffix))
             position = new_position
         html_parts.append(html.escape(text[position:]).replace('&lt;br&gt;', '<br>'))
-        return self.apply_inline_formatting_tags(''.join(html_parts))
+        joined_html = ''.join(html_parts)
+        for index, span in enumerate(code_spans):
+            joined_html = joined_html.replace(
+                f'\x00RAWCODE{index}\x00', html.escape(span, quote=False))
+        return self.apply_inline_formatting_tags(joined_html)
 
     def apply_inline_formatting_tags(self, text_html: str) -> str:
         # [code]...[/code] is literal monospace text. Stash each span behind a
@@ -1953,6 +1973,13 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
                 f'<span style="font-size: 0.85em; '
                 f'color: {self._muted_note_color()};">'
                 f'{match.group(1).strip()}</span>'),
+            formatted_text)
+        # Danbooru closes an unclosed [tn] at the end of its paragraph.
+        formatted_text = UNCLOSED_TN_PATTERN.sub(
+            lambda match: (
+                f'{match.group(1)}<span style="font-size: 0.85em; '
+                f'color: {self._muted_note_color()};">'
+                f'{match.group(2).strip()}</span>'),
             formatted_text)
         for index, rendered in enumerate(code_placeholders):
             formatted_text = formatted_text.replace(
@@ -2188,6 +2215,42 @@ class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
             # A stray closing tag with no matching opener: drop it silently
             # rather than printing the literal marker.
             if casefolded_line == '[/quote]':
+                continue
+
+            # A block [code] ... [/code] on their own lines: literal,
+            # preformatted text on a shaded background.
+            if casefolded_line == '[code]':
+                flush_thumbnails()
+                while html_lines and html_lines[-1] == '<br>':
+                    html_lines.pop()
+                scan_index = index + 1
+                while (scan_index < len(lines)
+                       and lines[scan_index].strip().casefold() != '[/code]'):
+                    scan_index += 1
+                skip_until = scan_index + 1
+                code_text = '\n'.join(
+                    lines[index + 1:scan_index]).strip('\r\n')
+                html_lines.append(
+                    '<table cellspacing="0" style="margin: 2px 0 14px 0;">'
+                    '<tr><td style="background-color: palette(alternate-base);'
+                    ' padding: 6px 10px;"><pre style="margin: 0; '
+                    f'font-family: monospace;">{html.escape(code_text)}</pre>'
+                    '</td></tr></table>')
+                continue
+            if casefolded_line == '[/code]':
+                continue
+
+            if casefolded_line == '[hr]':
+                flush_thumbnails()
+                while html_lines and html_lines[-1] == '<br>':
+                    html_lines.pop()
+                # A plain <hr> after a table starts at the table's right
+                # edge in QTextBrowser, so draw the rule as a full-width table.
+                html_lines.append(
+                    '<table width="100%" cellspacing="0" '
+                    'style="margin: 6px 0 10px 0;"><tr><td '
+                    'style="border-top: 1px solid palette(mid);"></td></tr>'
+                    '</table>')
                 continue
 
             # DText tables: everything from [table] to [/table], usually one
