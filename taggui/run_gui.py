@@ -23,6 +23,9 @@ QT_MESSAGES_TO_SUPPRESS = (
     # Cloudflare's challenge page logs invisible console messages (e.g.
     # '%c%d ... NaN' and '%c%o ... [object Object]') to detect open DevTools.
     'font-size:0;color:transparent',
+    # The Danbooru CDN serves images sandboxed, so the embedded browser's
+    # bridge script is refused when the challenge solver loads one. Harmless.
+    "Blocked script execution in 'https://cdn.donmai.us/",
     'Failed to parse audio contentType:',
     'Failed to parse video contentType:',
     'challenges.cloudflare.com/cdn-cgi/challenge-platform/',
