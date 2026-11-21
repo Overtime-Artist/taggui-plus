@@ -386,15 +386,16 @@ class GelbooruWikiFetchThread(QThread):
             return None
 
     def find_best_wiki_result(self, search_html: str) -> tuple[str, str]:
+        # Only an exact title match counts: when nothing matches, Gelbooru's
+        # list shows unrelated recently edited pages (e.g. "cats" listed
+        # "meowth" first), so guessing the first entry opens the wrong page.
         matches = list(WIKI_RESULT_LINK_PATTERN.finditer(search_html))
         if matches:
             for match in matches:
                 title_text = html.unescape(match.group(2).strip())
                 if normalize_tag_for_lookup(title_text) == self.normalized_tag:
                     return match.group(1).strip(), title_text
-            first_match = matches[0]
-            return first_match.group(1).strip(), html.unescape(
-                first_match.group(2).strip())
+            return '', ''
 
         generic_candidates = []
         for generic_match in WIKI_GENERIC_LINK_PATTERN.finditer(search_html):
@@ -414,7 +415,7 @@ class GelbooruWikiFetchThread(QThread):
             if normalize_tag_for_lookup(label) == self.normalized_tag:
                 return wiki_id, label
         if generic_candidates:
-            return generic_candidates[0]
+            return '', ''
 
         title_match = WIKI_VIEW_TITLE_PATTERN.search(search_html)
         id_match = WIKI_VIEW_ID_FALLBACK_PATTERN.search(search_html)
