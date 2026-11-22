@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDialog,
                                QFileDialog,
                                QHBoxLayout, QHeaderView, QLabel, QMessageBox,
                                QProgressDialog, QPushButton, QStyle,
-                               QTabWidget,
+                               QStyleOptionTabWidgetFrame, QTabWidget,
                                QTextBrowser, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
@@ -601,15 +601,23 @@ class DirectoryAnalyticsDialog(QDialog):
         tree = self.subfolder_tree
         columns_width = sum(tree.header().sectionSize(column)
                             for column in range(tree.columnCount()))
-        # Everything around the table: dialog margins and tab frame (measured
-        # from the visible page, as hidden pages aren't laid out), the tree's
-        # frame and a vertical scrollbar.
+        # Everything around the table: dialog margins and tab frame, the
+        # tree's frame and a vertical scrollbar. The page area comes from the
+        # style, as tab pages aren't laid out until the window is shown.
         if not self.isVisible():
-            # Lay out the hidden window so the space around the table is
-            # known.
+            # Lay out the hidden window so the tab widget's size is known.
             self.layout().activate()
-        page = self.tabs.currentWidget()
-        surrounding = (self.width() - page.width()
+        tabs = self.tabs
+        option = QStyleOptionTabWidgetFrame()
+        option.initFrom(tabs)
+        option.rect = tabs.rect()
+        option.lineWidth = tabs.style().pixelMetric(
+            QStyle.PixelMetric.PM_DefaultFrameWidth, None, tabs)
+        option.shape = tabs.tabBar().shape()
+        option.tabBarSize = tabs.tabBar().sizeHint()
+        page_width = tabs.style().subElementRect(
+            QStyle.SubElement.SE_TabWidgetTabContents, option, tabs).width()
+        surrounding = (self.width() - page_width
                        + 2 * tree.frameWidth()
                        + tree.style().pixelMetric(
                            QStyle.PixelMetric.PM_ScrollBarExtent, None, tree)
