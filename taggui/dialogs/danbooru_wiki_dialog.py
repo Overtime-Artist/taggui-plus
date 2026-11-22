@@ -13,11 +13,8 @@ from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel,
                                QVBoxLayout)
 
 from dialogs.booru_originals import (ORIGINAL_INTERNAL_LINK_PREFIX,
-                                     OriginalsMixin, decode_data_url_image,
-                                     original_file_extension,
-                                     original_is_viewable)
+                                     OriginalsMixin, decode_data_url_image)
 from models.tag_library_model import TagLibraryModel
-from utils.settings import get_settings
 from utils.danbooru_session import (api_key_problem, cancel_pending_fetches,
                                     danbooru_urlopen,
                                     initialize_on_main_thread)

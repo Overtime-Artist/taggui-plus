@@ -159,9 +159,14 @@ class _BytesResponse:
         self.status = status
         self.headers = _Headers(content_type)
         self._body = body or b''
+        self._offset = 0
 
-    def read(self):
-        return self._body
+    def read(self, size: int = -1):
+        if size is None or size < 0:
+            return self._body
+        chunk = self._body[self._offset:self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
     def __enter__(self):
         return self

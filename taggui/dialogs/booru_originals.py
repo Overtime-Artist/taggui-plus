@@ -73,7 +73,13 @@ class OriginalFetchThread(QThread):
                 if status != 200:
                     raise OSError(
                         f'{self.site_name} returned status {status}.')
-                file_bytes = response.read()
+                # Read in chunks so closing the dialog stops the download.
+                chunks = []
+                while chunk := response.read(256 * 1024):
+                    if self.isInterruptionRequested():
+                        return
+                    chunks.append(chunk)
+                file_bytes = b''.join(chunks)
             if self.isInterruptionRequested():
                 return
             if not file_bytes:
