@@ -609,10 +609,10 @@ using perceptual hashing and shows each group side by side.
     if the grid is zoomed, the first double-click only resets the zoom), `K`
     (or the **Keep this image** button) keeps or unkeeps the shown image,
     `Enter` keeps it, `F11` toggles full screen and `Esc` leaves full screen
-    or closes the viewer. The controls hide after a moment without mouse
-    movement and reappear when you move the mouse, change image or keep or
-    unkeep one; their text size and transparency follow the overlay settings
-    in **Settings → Images pane**. The image on show stays undimmed in the
+    or closes the viewer. The controls stay on screen; their text size and
+    transparency follow the overlay settings in **Settings → Images pane**.
+    A kept image shows a green check mark next to **Keeping this image**,
+    matching the green **Keep** check boxes in the results list. The image on show stays undimmed in the
     results list.
 
 > [!WARNING]

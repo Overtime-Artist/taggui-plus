@@ -13,8 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject,
-                            QRunnable, Qt, QThread, QThreadPool, QTimer,
-                            Signal, Slot)
+                            QPoint, QRect, QRunnable, QSize, Qt, QThread,
+                            QThreadPool, QTimer, Signal, Slot)
 from PySide6.QtGui import (QColor, QFont, QIcon, QImageReader, QKeySequence,
                            QPainter, QPalette, QPen, QPixmap, QShortcut)
 from PySide6.QtWidgets import (QApplication, QCheckBox,
@@ -38,6 +38,8 @@ from widgets.image_viewer import (GRID_DIM_OPACITY, ImageViewer,
 
 # Thumbnail edge length (pixels) for the cards in a duplicate group.
 _THUMBNAIL_SIZE = 140
+# The green of the Images pane's completion check mark.
+_KEPT_GREEN = '#3cc23c'
 # Rendering caps so a pathological result set (e.g. thousands of near-identical
 # training images merged into giant groups) can never freeze the UI or exhaust
 # memory. Groups are shown this many at a time ("Show next ... groups"), and
@@ -95,12 +97,17 @@ def _strictness_text(value: int) -> str:
 
 
 def _apply_indicator_palette(button):
-    # Only the Base color is overridden, so the other colors keep following
-    # the app theme.
+    # Only the Base color (and, for a Keep box, the check mark's Text color)
+    # is overridden, so the other colors keep following the app theme.
     window_color = button.palette().color(QPalette.ColorRole.Window)
-    if button.palette().color(QPalette.ColorRole.Base) != window_color:
+    check_color = getattr(button, 'check_mark_color', None)
+    if (button.palette().color(QPalette.ColorRole.Base) != window_color
+            or (check_color is not None and button.palette().color(
+                QPalette.ColorRole.Text) != check_color)):
         palette = QPalette()
         palette.setColor(QPalette.ColorRole.Base, window_color)
+        if check_color is not None:
+            palette.setColor(QPalette.ColorRole.Text, check_color)
         button.setPalette(palette)
 
 
@@ -952,6 +959,9 @@ class FindDuplicatesDialog(QDialog):
         card_layout.addWidget(relation_label)
 
         keep_box = QCheckBox('Keep')
+        # Fusion draws the check mark in the Text color made 20% darker, and
+        # the label in WindowText, so only the mark turns green.
+        keep_box.check_mark_color = QColor(_KEPT_GREEN).lighter(120)
         _make_indicator_visible(keep_box)
         card_layout.addWidget(keep_box)
         return card, keep_box, relation_label, info_label, caption_label
@@ -1267,8 +1277,6 @@ class _GroupImagesModel(QAbstractListModel):
         return None
 
 
-# Hide the overlaid controls after this long without mouse movement.
-_OVERLAY_HIDE_DELAY_MS = 2500
 _OVERLAY_MARGIN = 10
 
 
@@ -1345,6 +1353,8 @@ class _PreviewDialog(QDialog):
         self.prev_button = self._make_button('\u25c0 Previous')
         self.prev_button.clicked.connect(lambda: self._step(-1))
         self.keep_button = self._make_button('Keep this image (K)')
+        self.keep_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.keep_button.clicked.connect(self._keep_current)
         self.next_button = self._make_button('Next \u25b6')
         self.next_button.clicked.connect(lambda: self._step(1))
@@ -1353,17 +1363,10 @@ class _PreviewDialog(QDialog):
         self.overlays = (self.info_overlay, self.view_overlay,
                          self.nav_overlay)
 
-        self._hide_timer = QTimer(self)
-        self._hide_timer.setSingleShot(True)
-        self._hide_timer.setInterval(_OVERLAY_HIDE_DELAY_MS)
-        self._hide_timer.timeout.connect(self._hide_overlays_if_idle)
-        # Watch mouse movement anywhere over the image to bring the controls
-        # back, and viewport resizes to keep them in their corners.
+        # Watch for double-clicks over the image, and viewport resizes to
+        # keep the controls in their corners.
         for widget in (viewport, self.viewer.image_label):
-            widget.setMouseTracking(True)
             widget.installEventFilter(self)
-        for overlay in self.overlays:
-            overlay.installEventFilter(self)
 
         self.viewer.grid_cell_clicked.connect(self._on_grid_cell_clicked)
         # Double-clicking a grid cell opens it in the single-image view.
@@ -1524,9 +1527,11 @@ class _PreviewDialog(QDialog):
         self.next_button.setEnabled(multiple)
         keep_box = self.keep_box_members[self.index][0]
         if keep_box is not None and keep_box.isChecked():
-            self.keep_button.setText('\u2713 Keeping this image (K)')
+            self.keep_button.setText('Keeping this image (K)')
+            self.keep_button.setIcon(self._check_mark_icon())
         else:
             self.keep_button.setText('Keep this image (K)')
+            self.keep_button.setIcon(QIcon())
         self.keep_button.setEnabled(keep_box is not None)
         self.grid_button.setText('Single view (G)' if self._grid
                                  else 'Grid view (G)')
@@ -1542,7 +1547,6 @@ class _PreviewDialog(QDialog):
             return
         self.index = (self.index + delta) % len(self.keep_box_members)
         self._show_current(keep_zoom=True)
-        self._show_overlays()
 
     def _keep_current(self):
         """Toggle whether the current image is kept."""
@@ -1553,9 +1557,6 @@ class _PreviewDialog(QDialog):
         if self._grid:
             self._update_grid_marks()
         self._update_info()
-        # Bring the controls back so a keyboard keep / unkeep shows its
-        # result on the Keep button.
-        self._show_overlays()
 
     def toggle_grid(self):
         if not self._grid and len(self.keep_box_members) < 2:
@@ -1568,7 +1569,6 @@ class _PreviewDialog(QDialog):
             self._update_info()
         else:
             self._show_current()
-        self._show_overlays()
 
     def _open_in_single_view(self, row: int):
         self.index = row
@@ -1616,7 +1616,6 @@ class _PreviewDialog(QDialog):
             self.setAttribute(Qt.WidgetAttribute.WA_Moved, True)
             self.showFullScreen()
         self._update_info()
-        self._show_overlays()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
@@ -1647,34 +1646,29 @@ class _PreviewDialog(QDialog):
         for overlay in self.overlays:
             overlay.raise_()
 
-    def _show_overlays(self):
-        for overlay in self.overlays:
-            overlay.show()
-        self._position_overlays()
-        self.viewer.scroll_area.viewport().unsetCursor()
-        self._hide_timer.start()
-
-    def _hide_overlays_if_idle(self):
-        # Keep the controls while the cursor is on them.
-        if any(overlay.underMouse() for overlay in self.overlays):
-            self._hide_timer.start()
-            return
-        for overlay in self.overlays:
-            overlay.hide()
-        if self.isFullScreen() and not self.viewer.scroll_area.is_dragging:
-            self.viewer.scroll_area.viewport().setCursor(
-                Qt.CursorShape.BlankCursor)
+    def _check_mark_icon(self) -> QIcon:
+        """A green check mark the size of the Keep button's text."""
+        self.keep_button.ensurePolished()
+        metrics = self.keep_button.fontMetrics()
+        ratio = self.devicePixelRatioF()
+        size = QSize(metrics.horizontalAdvance('\u2713'), metrics.height())
+        pixmap = QPixmap(size * ratio)
+        pixmap.setDevicePixelRatio(ratio)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setFont(self.keep_button.font())
+        painter.setPen(QColor(_KEPT_GREEN))
+        painter.drawText(QRect(QPoint(0, 0), size),
+                         Qt.AlignmentFlag.AlignCenter, '\u2713')
+        painter.end()
+        self.keep_button.setIconSize(size)
+        return QIcon(pixmap)
 
     def eventFilter(self, watched, event):
         event_type = event.type()
         if event_type == QEvent.Type.MouseButtonDblClick:
             # Seen before the viewer resets the zoom for the same event.
             self._zoomed_at_double_click = not self._at_fit_zoom()
-        elif event_type == QEvent.Type.MouseMove:
-            if not all(overlay.isVisible() for overlay in self.overlays):
-                self._show_overlays()
-            else:
-                self._hide_timer.start()
         elif (event_type == QEvent.Type.Resize
               and watched is self.viewer.scroll_area.viewport()):
             self._position_overlays()
@@ -1682,7 +1676,7 @@ class _PreviewDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        QTimer.singleShot(0, self._show_overlays)
+        QTimer.singleShot(0, self._position_overlays)
 
 
 class _GroupCards:
