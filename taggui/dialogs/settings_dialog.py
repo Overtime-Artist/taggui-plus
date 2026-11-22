@@ -420,25 +420,11 @@ class SettingsDialog(QDialog):
         show_grid_overlay_check_box = SettingsBigCheckBox(
             key='variant_grid_overlay_show',
             default=DEFAULT_SETTINGS['variant_grid_overlay_show'])
-        grid_overlay_font_size_label = QLabel(
-            'Grid page/count overlay text size (pt)')
+        grid_overlay_font_size_label = QLabel('Overlay text size (pt)')
         grid_overlay_transparency_label = QLabel(
-            'Grid page/count overlay background transparency (%)')
-
-        def update_grid_overlay_sub_settings_enabled(checked: bool):
-            # Grey out the overlay appearance controls when the overlay is off.
-            grid_overlay_font_size_spin_box.setEnabled(checked)
-            grid_overlay_transparency_spin_box.setEnabled(checked)
-            grid_overlay_font_size_label.setEnabled(checked)
-            grid_overlay_transparency_label.setEnabled(checked)
-
-        update_grid_overlay_sub_settings_enabled(
-            show_grid_overlay_check_box.isChecked())
+            'Overlay background transparency (%)')
         show_grid_overlay_check_box.stateChanged.connect(
-            lambda _: (
-                update_grid_overlay_sub_settings_enabled(
-                    show_grid_overlay_check_box.isChecked()),
-                self.variant_grid_overlay_settings_changed.emit()))
+            lambda _: self.variant_grid_overlay_settings_changed.emit())
 
         grid_layout.addWidget(QLabel('Show grid page/count overlay'), row, 0,
                               Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)

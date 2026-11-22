@@ -609,8 +609,11 @@ using perceptual hashing and shows each group side by side.
     if the grid is zoomed, the first double-click only resets the zoom), `K`
     (or the **Keep this image** button) keeps or unkeeps the shown image,
     `Enter` keeps it, `F11` toggles full screen and `Esc` leaves full screen
-    or closes the viewer. The image on show stays undimmed in the results
-    list.
+    or closes the viewer. The controls hide after a moment without mouse
+    movement and reappear when you move the mouse, change image or keep or
+    unkeep one; their text size and transparency follow the overlay settings
+    in **Settings → Images pane**. The image on show stays undimmed in the
+    results list.
 
 > [!WARNING]
 > The strictness slider is **very sensitive to variant sets** — groups of images
@@ -836,7 +839,9 @@ Danbooru key above, and is only sent to `gelbooru.com` over HTTPS.
   max preview zoom, auto-focusing the Add Tag box when you type, and the
   **variant grid view** (group tags and show a synchronized grid when multiple
   images are selected, plus its max cell count — see
-  [Tagging variant images](#tagging-variant-images)). **Note:**
+  [Tagging variant images](#tagging-variant-images)), and the text size and
+  background transparency of the overlays drawn on images (the grid page bar,
+  the focus mode bar and the Find Duplicates large viewer). **Note:**
   setting the **max preview zoom** very high can cause performance issues when
   zoomed in on large images. TagGUI Plus mitigates this — for example it
   automatically switches to faster (lower-quality) rendering above 10x zoom and

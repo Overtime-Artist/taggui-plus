@@ -19,11 +19,11 @@ from PySide6.QtGui import (QColor, QFont, QIcon, QImageReader, QKeySequence,
                            QPainter, QPalette, QPen, QPixmap, QShortcut)
 from PySide6.QtWidgets import (QApplication, QCheckBox,
                                QComboBox, QDialog,
-                               QFileDialog, QFrame, QGridLayout, QGroupBox,
+                               QFileDialog, QFrame, QGroupBox,
                                QHBoxLayout, QLabel, QMessageBox,
                                QPlainTextEdit, QProgressDialog, QPushButton,
-                               QScrollArea, QSizePolicy, QSlider, QVBoxLayout,
-                               QWidget)
+                               QScrollArea, QSizePolicy, QSlider, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from models.image_list_model import ImageListModel, Scope
 from utils.duplicate_detection import (DuplicateCache, find_duplicate_groups,
@@ -33,7 +33,8 @@ from utils.settings_widgets import (FocusedScrollSettingsComboBox,
                                     SettingsBigCheckBox)
 from utils.utils import get_confirmation_dialog_reply, pluralize
 from widgets.image_list import transfer_images, trash_images
-from widgets.image_viewer import GRID_DIM_OPACITY, ImageViewer
+from widgets.image_viewer import (GRID_DIM_OPACITY, ImageViewer,
+                                  overlay_style_sheet)
 
 # Thumbnail edge length (pixels) for the cards in a duplicate group.
 _THUMBNAIL_SIZE = 140
@@ -536,12 +537,10 @@ class FindDuplicatesDialog(QDialog):
         layout.addWidget(description)
 
         # --- Scan controls --------------------------------------------------
-        # Strictness gets its own row so the slider keeps a usable width next
-        # to the longest strictness description.
-        scan_grid = QGridLayout()
-        scan_grid.setHorizontalSpacing(8)
-        scan_grid.addWidget(QLabel('Scope:'), 0, 0)
+        # Each line is its own row, so a label's width never pads the
+        # control after a shorter label (as a shared grid column would).
         scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel('Scope:'))
         self.scope_combo_box = FocusedScrollSettingsComboBox(
             key='duplicate_scan_scope', default=Scope.ALL_IMAGES.value)
         self.scope_combo_box.addItems(list(Scope))
@@ -558,8 +557,11 @@ class FindDuplicatesDialog(QDialog):
         scope_row.addSpacing(6)
         scope_row.addWidget(self.scope_count_label)
         scope_row.addStretch()
-        scan_grid.addLayout(scope_row, 0, 1, 1, 3)
-        scan_grid.addWidget(QLabel('Strictness:'), 1, 0)
+        layout.addLayout(scope_row)
+        # Strictness gets its own row so the slider keeps a usable width next
+        # to the longest strictness description.
+        strictness_row = QHBoxLayout()
+        strictness_row.addWidget(QLabel('Strictness:'))
         self.strictness_slider = QSlider(Qt.Orientation.Horizontal)
         self.strictness_slider.setMinimum(0)
         self.strictness_slider.setMaximum(_MAX_THRESHOLD)
@@ -568,7 +570,7 @@ class FindDuplicatesDialog(QDialog):
         self.strictness_slider.setTickInterval(2)
         self.strictness_slider.setMinimumWidth(200)
         self.strictness_slider.valueChanged.connect(self._update_strictness_label)
-        scan_grid.addWidget(self.strictness_slider, 1, 1)
+        strictness_row.addWidget(self.strictness_slider, 1)
         self.strictness_label = QLabel()
         # Reserve room for the longest description so the slider doesn't
         # change width while it is dragged.
@@ -576,12 +578,11 @@ class FindDuplicatesDialog(QDialog):
         self.strictness_label.setMinimumWidth(max(
             metrics.horizontalAdvance(_strictness_text(value))
             for value in range(_MAX_THRESHOLD + 1)) + 4)
-        scan_grid.addWidget(self.strictness_label, 1, 2)
+        strictness_row.addWidget(self.strictness_label)
         self.scan_button = QPushButton('Scan')
         self.scan_button.clicked.connect(self.start_scan)
-        scan_grid.addWidget(self.scan_button, 1, 3)
-        scan_grid.setColumnStretch(1, 1)
-        layout.addLayout(scan_grid)
+        strictness_row.addWidget(self.scan_button)
+        layout.addLayout(strictness_row)
         self._update_scope_count_label()
         self._update_strictness_label(self.strictness_slider.value())
 
@@ -1266,22 +1267,6 @@ class _GroupImagesModel(QAbstractListModel):
         return None
 
 
-_OVERLAY_STYLE = (
-    'QFrame#previewOverlay { background-color: rgba(0, 0, 0, 160);'
-    ' border-radius: 6px; }'
-    'QFrame#previewOverlay QLabel { color: rgba(255, 255, 255, 230);'
-    ' background: transparent; }'
-    'QFrame#previewOverlay QPushButton { color: white;'
-    ' background-color: rgba(255, 255, 255, 28);'
-    ' border: 1px solid rgba(255, 255, 255, 70); border-radius: 4px;'
-    ' padding: 4px 10px; }'
-    'QFrame#previewOverlay QPushButton:hover {'
-    ' background-color: rgba(255, 255, 255, 60); }'
-    'QFrame#previewOverlay QPushButton:pressed {'
-    ' background-color: rgba(255, 255, 255, 90); }'
-    'QFrame#previewOverlay QPushButton:disabled {'
-    ' color: rgba(255, 255, 255, 110);'
-    ' border-color: rgba(255, 255, 255, 35); }')
 # Hide the overlaid controls after this long without mouse movement.
 _OVERLAY_HIDE_DELAY_MS = 2500
 _OVERLAY_MARGIN = 10
@@ -1336,42 +1321,35 @@ class _PreviewDialog(QDialog):
         # Top left: what is shown.
         self.info_overlay = self._make_overlay(viewport)
         info_layout = QVBoxLayout(self.info_overlay)
-        info_layout.setContentsMargins(10, 6, 10, 6)
-        info_layout.setSpacing(2)
+        info_layout.setContentsMargins(0, 3, 0, 3)
+        info_layout.setSpacing(0)
         self.name_label = QLabel()
-        name_font = QFont(self.font())
-        name_font.setBold(True)
-        self.name_label.setFont(name_font)
+        self.name_label.setObjectName('overlayTitle')
         self.details_label = QLabel()
         info_layout.addWidget(self.name_label)
         info_layout.addWidget(self.details_label)
 
         # Top right: view controls.
         self.view_overlay = self._make_overlay(viewport)
-        view_layout = QHBoxLayout(self.view_overlay)
-        view_layout.setContentsMargins(6, 6, 6, 6)
         self.grid_button = self._make_button('Grid view (G)')
         self.grid_button.clicked.connect(self.toggle_grid)
         self.full_screen_button = self._make_button('Full screen (F11)')
         self.full_screen_button.clicked.connect(self.toggle_full_screen)
         self.close_button = self._make_button('Close (Esc)')
         self.close_button.clicked.connect(self.reject)
-        for button in (self.grid_button, self.full_screen_button,
-                       self.close_button):
-            view_layout.addWidget(button)
+        self._fill_bar(self.view_overlay, (
+            self.grid_button, self.full_screen_button, self.close_button))
 
         # Bottom centre: paging and the keep decision.
         self.nav_overlay = self._make_overlay(viewport)
-        nav_layout = QHBoxLayout(self.nav_overlay)
-        nav_layout.setContentsMargins(6, 6, 6, 6)
-        self.prev_button = self._make_button('\u2190 Previous')
+        self.prev_button = self._make_button('\u25c0 Previous')
         self.prev_button.clicked.connect(lambda: self._step(-1))
         self.keep_button = self._make_button('Keep this image (K)')
         self.keep_button.clicked.connect(self._keep_current)
-        self.next_button = self._make_button('Next \u2192')
+        self.next_button = self._make_button('Next \u25b6')
         self.next_button.clicked.connect(lambda: self._step(1))
-        for button in (self.prev_button, self.keep_button, self.next_button):
-            nav_layout.addWidget(button)
+        self._fill_bar(self.nav_overlay, (
+            self.prev_button, self.keep_button, self.next_button))
         self.overlays = (self.info_overlay, self.view_overlay,
                          self.nav_overlay)
 
@@ -1439,21 +1417,38 @@ class _PreviewDialog(QDialog):
 
     @staticmethod
     def _make_overlay(parent) -> QFrame:
+        # Styled like the main image viewer's focus mode bar.
         overlay = QFrame(parent)
-        overlay.setObjectName('previewOverlay')
-        overlay.setStyleSheet(_OVERLAY_STYLE)
+        overlay.setObjectName('overlayBar')
+        overlay.setStyleSheet(overlay_style_sheet())
         overlay.setCursor(Qt.CursorShape.ArrowCursor)
         # Clicks on the panel itself must not pan the image or pick a cell.
         overlay.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation)
         return overlay
 
     @staticmethod
-    def _make_button(text: str) -> QPushButton:
-        button = QPushButton(text)
+    def _fill_bar(overlay: QFrame, buttons):
+        """Lay ``buttons`` out in a row on ``overlay``, split by thin
+        separators like the focus mode bar."""
+        layout = QHBoxLayout(overlay)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        for position, button in enumerate(buttons):
+            if position:
+                separator = QFrame()
+                separator.setObjectName('overlaySeparator')
+                separator.setFixedWidth(1)
+                layout.addWidget(separator)
+            layout.addWidget(button)
+
+    @staticmethod
+    def _make_button(text: str) -> QToolButton:
+        button = QToolButton()
+        button.setText(text)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
         # Keep keyboard focus off the buttons so the arrow keys, Enter and
         # Esc always reach the viewer's shortcuts.
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        button.setAutoDefault(False)
         return button
 
     # --- Showing images -----------------------------------------------------
@@ -1558,6 +1553,9 @@ class _PreviewDialog(QDialog):
         if self._grid:
             self._update_grid_marks()
         self._update_info()
+        # Bring the controls back so a keyboard keep / unkeep shows its
+        # result on the Keep button.
+        self._show_overlays()
 
     def toggle_grid(self):
         if not self._grid and len(self.keep_box_members) < 2:
@@ -1835,8 +1833,23 @@ class _GroupCards:
         for card, member in self.cards:
             card.set_kept(self.is_kept(member))
             card.set_viewed(member is self.viewed_member)
-        self.keep_all_button.setEnabled(kept_count < total)
-        self.keep_none_button.setEnabled(kept_count > 0)
+        self._set_buttons_enabled(kept_count < total, kept_count > 0)
+
+    def _set_buttons_enabled(self, keep_all: bool, keep_none: bool):
+        # Disabling the focused button makes Qt move focus on to the next
+        # widget, and the results scroll area then scrolls to show it. Hand
+        # focus to the other button (which is enabled) first instead.
+        pairs = ((self.keep_all_button, keep_all),
+                 (self.keep_none_button, keep_none))
+        for button, enabled in pairs:
+            if enabled:
+                button.setEnabled(True)
+        for (button, enabled), (other, _) in zip(pairs, reversed(pairs)):
+            if not enabled:
+                if (button is button.window().focusWidget()
+                        and other.isEnabled()):
+                    other.setFocus(Qt.FocusReason.OtherFocusReason)
+                button.setEnabled(False)
 
     def set_viewed(self, member):
         """Mark the image shown in the large viewer (None when it closes)."""

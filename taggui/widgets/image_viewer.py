@@ -50,6 +50,51 @@ GRID_DIM_OPACITY = 0.28
 GRID_PARTIAL_EMIT_SECONDS = 0.4
 
 
+def transparency_to_alpha(transparency: int) -> int:
+    """Map a transparency percentage (0-100) to an alpha value (0-255).
+
+    Mirrors the resolution badge: 0% transparency -> fully opaque (255),
+    100% transparency -> fully transparent (0).
+    """
+    clamped = max(0, min(int(transparency), 100))
+    return round(255 * (100 - clamped) / 100)
+
+
+def overlay_style_sheet() -> str:
+    """Style sheet for the dark control bars overlaid on images (the grid
+    page bar, the focus mode bar and the Find Duplicates large viewer),
+    using the overlay text size and transparency settings. Bars are QFrames
+    named ``overlayBar`` holding QLabels and QToolButtons, optionally split
+    by 1px-wide QFrames named ``overlaySeparator``; a QLabel named
+    ``overlayTitle`` is bold."""
+    settings = get_settings()
+    font_size = max(1, settings.value(
+        'variant_grid_overlay_font_size',
+        defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_font_size'],
+        type=int))
+    alpha = transparency_to_alpha(settings.value(
+        'variant_grid_overlay_transparency',
+        defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_transparency'],
+        type=int))
+    background = (f'background-color: rgba(0, 0, 0, {alpha}); '
+                  f'border-radius: 6px;')
+    text = (f'color: rgba(255, 255, 255, 220); '
+            f'font-size: {font_size}pt;')
+    return (
+        f'QFrame#overlayBar {{ {background} }}'
+        f'QFrame#overlaySeparator {{ background-color: '
+        f'rgba(255, 255, 255, 60); margin: 5px 0; }}'
+        f'QLabel {{ background: transparent; {text} padding: 3px 8px; }}'
+        f'QLabel#overlayTitle {{ font-weight: bold; }}'
+        f'QToolButton {{ background: transparent; border: none; '
+        f'border-radius: 6px; {text} padding: 3px 8px; }}'
+        f'QToolButton:hover {{ background-color: '
+        f'rgba(255, 255, 255, 50); }}'
+        f'QToolButton:pressed {{ background-color: '
+        f'rgba(255, 255, 255, 90); }}'
+        f'QToolButton:disabled {{ color: rgba(255, 255, 255, 70); }}')
+
+
 class _ImageFileLoader(QObject, QRunnable):
     """Loads a full-resolution image file in a background thread.
 
@@ -480,10 +525,6 @@ class ImageViewer(QWidget):
         overlay_layout.addWidget(self._grid_next_page_button)
         self._grid_overlay.hide()
         self._grid_overlay_show = True
-        self._grid_overlay_font_size = DEFAULT_SETTINGS[
-            'variant_grid_overlay_font_size']
-        self._grid_overlay_background_alpha = self._transparency_to_alpha(
-            DEFAULT_SETTINGS['variant_grid_overlay_transparency'])
         self._grid_overlay_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         # Control bar (bottom-right), shown only in focus mode, where the
@@ -550,51 +591,14 @@ class ImageViewer(QWidget):
             defaultValue=DEFAULT_SETTINGS['max_image_preview_zoom'],
             type=int))
 
-    @staticmethod
-    def _transparency_to_alpha(transparency: int) -> int:
-        """Map a transparency percentage (0-100) to an alpha value (0-255).
-
-        Mirrors the resolution badge: 0% transparency -> fully opaque (255),
-        100% transparency -> fully transparent (0).
-        """
-        clamped = max(0, min(int(transparency), 100))
-        return round(255 * (100 - clamped) / 100)
-
     def refresh_grid_overlay_style(self):
-        """Re-read the grid overlay settings and apply them to the label."""
-        settings = get_settings()
-        self._grid_overlay_show = settings.value(
+        """Re-read the overlay settings and apply them to the grid page bar
+        and the focus mode bar."""
+        self._grid_overlay_show = get_settings().value(
             'variant_grid_overlay_show',
             defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_show'],
             type=bool)
-        self._grid_overlay_font_size = settings.value(
-            'variant_grid_overlay_font_size',
-            defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_font_size'],
-            type=int)
-        transparency = settings.value(
-            'variant_grid_overlay_transparency',
-            defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_transparency'],
-            type=int)
-        self._grid_overlay_background_alpha = self._transparency_to_alpha(
-            transparency)
-        font_size = max(1, self._grid_overlay_font_size)
-        background = (f'background-color: rgba(0, 0, 0, '
-                      f'{self._grid_overlay_background_alpha}); '
-                      f'border-radius: 6px;')
-        text = (f'color: rgba(255, 255, 255, 220); '
-                f'font-size: {font_size}pt;')
-        style = (
-            f'QFrame#overlayBar {{ {background} }}'
-            f'QFrame#overlaySeparator {{ background-color: '
-            f'rgba(255, 255, 255, 60); margin: 5px 0; }}'
-            f'QLabel {{ background: transparent; {text} padding: 3px 8px; }}'
-            f'QToolButton {{ background: transparent; border: none; '
-            f'border-radius: 6px; {text} padding: 3px 8px; }}'
-            f'QToolButton:hover {{ background-color: '
-            f'rgba(255, 255, 255, 50); }}'
-            f'QToolButton:pressed {{ background-color: '
-            f'rgba(255, 255, 255, 90); }}'
-            f'QToolButton:disabled {{ color: rgba(255, 255, 255, 70); }}')
+        style = overlay_style_sheet()
         self._grid_overlay.setStyleSheet(style)
         self._focus_overlay.setStyleSheet(style)
         # Show/hide immediately to reflect a toggled "show overlay" setting.
