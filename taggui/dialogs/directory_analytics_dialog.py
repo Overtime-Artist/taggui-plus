@@ -19,7 +19,7 @@ import sys
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import (QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl,
+from PySide6.QtCore import (QObject, QRunnable, Qt, QThreadPool, QUrl,
                             Signal, Slot)
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDialog,
@@ -239,9 +239,11 @@ class DirectoryAnalyticsDialog(QDialog):
         layout.addLayout(button_row)
 
         self._set_placeholder('Scanning\u2026')
-        # Run the first scan once the dialog is on screen, so the progress
-        # window appears over it rather than on its own beforehand.
-        QTimer.singleShot(0, self.start_scan)
+
+    def open_after_first_scan(self):
+        """Run the first scan with only its progress window on screen, then
+        show the dialog already sized to the results (cancelling closes it)."""
+        self.start_scan()
 
     def done(self, result):
         # Stop a running scan; its result is ignored once the dialog closes.
@@ -262,11 +264,13 @@ class DirectoryAnalyticsDialog(QDialog):
             self.status_label.setText('No folder is loaded. Load a directory '
                                       'first, then reopen this tool.')
             self._set_placeholder('No folder loaded.')
+            self.show()
             return
         images = list(self.image_list_model.images)
         if not images:
             self.status_label.setText('No images are loaded in this folder.')
             self._set_placeholder('No images loaded.')
+            self.show()
             return
 
         self.rescan_button.setEnabled(False)
@@ -276,7 +280,11 @@ class DirectoryAnalyticsDialog(QDialog):
 
         # Starts as a busy indicator while the folder is listed (the number of
         # files isn't known yet), then counts the images analysed.
-        progress = QProgressDialog('Listing files\u2026', 'Cancel', 0, 0, self)
+        # Before the dialog is first shown, the progress window sits over the
+        # main window instead.
+        progress = QProgressDialog(
+            'Listing files\u2026', 'Cancel', 0, 0,
+            self if self.isVisible() else self.parentWidget())
         progress.setWindowTitle('Directory Analytics')
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
@@ -308,6 +316,9 @@ class DirectoryAnalyticsDialog(QDialog):
             progress.reset()
             self.rescan_button.setEnabled(True)
             if was_cancelled or report is None:
+                if not self.isVisible():
+                    self.reject()
+                    return
                 self.status_label.setText('Scan cancelled.')
                 self._set_placeholder('Scan cancelled.')
                 return
@@ -321,6 +332,7 @@ class DirectoryAnalyticsDialog(QDialog):
             self.status_label.setText(
                 f'Scanned {report.total_images} images '
                 f'({format_size(report.total_size_bytes)}).')
+            self.show()
 
         scanner.walking.connect(on_walking)
         scanner.progress.connect(on_progress)
@@ -592,6 +604,10 @@ class DirectoryAnalyticsDialog(QDialog):
         # Everything around the table: dialog margins and tab frame (measured
         # from the visible page, as hidden pages aren't laid out), the tree's
         # frame and a vertical scrollbar.
+        if not self.isVisible():
+            # Lay out the hidden window so the space around the table is
+            # known.
+            self.layout().activate()
         page = self.tabs.currentWidget()
         surrounding = (self.width() - page.width()
                        + 2 * tree.frameWidth()
@@ -601,6 +617,10 @@ class DirectoryAnalyticsDialog(QDialog):
         needed = columns_width + surrounding
         target = min(needed, int(available.width() * 0.9))
         if target <= self.width():
+            return
+        if not self.isVisible():
+            # Qt centres it over the main window when it is shown.
+            self.resize(target, self.height())
             return
         center = self.frameGeometry().center()
         self.resize(target, self.height())

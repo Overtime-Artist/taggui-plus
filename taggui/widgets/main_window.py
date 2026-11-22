@@ -1919,7 +1919,7 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
 
         dialog.finished.connect(forget_dialog)
-        dialog.show()
+        dialog.open_after_first_scan()
 
     def _close_directory_analytics_dialog(self):
         if self._directory_analytics_dialog is not None:
