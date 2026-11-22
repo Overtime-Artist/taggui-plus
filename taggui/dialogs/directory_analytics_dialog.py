@@ -245,6 +245,11 @@ class DirectoryAnalyticsDialog(QDialog):
         show the dialog already sized to the results (cancelling closes it)."""
         self.start_scan()
 
+    def _show_if_hidden(self):
+        # show() on an open dialog the user has dragged re-centres it over
+        # the main window.
+        if not self.isVisible():
+            self.show()
     def done(self, result):
         # Stop a running scan; its result is ignored once the dialog closes.
         self._closed = True
@@ -264,13 +269,13 @@ class DirectoryAnalyticsDialog(QDialog):
             self.status_label.setText('No folder is loaded. Load a directory '
                                       'first, then reopen this tool.')
             self._set_placeholder('No folder loaded.')
-            self.show()
+            self._show_if_hidden()
             return
         images = list(self.image_list_model.images)
         if not images:
             self.status_label.setText('No images are loaded in this folder.')
             self._set_placeholder('No images loaded.')
-            self.show()
+            self._show_if_hidden()
             return
 
         self.rescan_button.setEnabled(False)
@@ -332,7 +337,7 @@ class DirectoryAnalyticsDialog(QDialog):
             self.status_label.setText(
                 f'Scanned {report.total_images} images '
                 f'({format_size(report.total_size_bytes)}).')
-            self.show()
+            self._show_if_hidden()
 
         scanner.walking.connect(on_walking)
         scanner.progress.connect(on_progress)
