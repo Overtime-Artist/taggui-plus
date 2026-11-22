@@ -2,9 +2,11 @@ import html
 import re
 import time
 
-from PySide6.QtCore import QEvent, QMimeData, Qt, QTimer, QUrl, Slot
-from PySide6.QtGui import (QColor, QPalette, QStandardItem, QStandardItemModel,
-                           QTextCursor)
+from PySide6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QMimeData,
+                            Qt, QTimer, QUrl, Slot)
+from PySide6.QtGui import (QColor, QFontMetrics, QPainter, QPainterPath,
+                           QPalette, QPixmap, QStandardItem,
+                           QStandardItemModel, QTextCursor)
 from PySide6.QtWidgets import (QApplication, QCompleter, QDialog, QHBoxLayout,
                                QLabel, QLineEdit, QProgressBar, QPushButton,
                                QStackedWidget, QTextBrowser, QVBoxLayout)
@@ -18,6 +20,13 @@ _parked_threads = []
 _park_sweep_timer = None
 _park_quit_hook_installed = False
 _PARKED_THREAD_EXIT_WAIT_SECONDS = 20
+
+# Previous / Next links on posts search pages and single posts, followed by
+# the Left / Right arrow keys.
+PREVIOUS_LINK_PATTERN = re.compile(
+    r'<a href="(taggui-posts?:[^"]*)"[^>]*>&(?:laquo|lsaquo); Previous</a>')
+NEXT_LINK_PATTERN = re.compile(
+    r'<a href="(taggui-posts?:[^"]*)"[^>]*>Next &(?:raquo|rsaquo);</a>')
 
 
 def _sweep_parked_threads():
@@ -150,6 +159,58 @@ AUTOCOMPLETE_COUNT_SUFFIX_PATTERN = re.compile(
 AUTOCOMPLETE_ANY_SUFFIX_PATTERN = re.compile(r'\s*\([^)]+\)\s*$')
 TAG_GROUP_SEARCH_PREFIX = 'tag group:'
 TAG_GROUP_NORMALIZED_PREFIX = 'tag_group:'
+# Typing this prefix searches the wiki only: a missing page shows "not found"
+# instead of falling back to a posts search.
+WIKI_SEARCH_PREFIX = 'wiki:'
+# Wiki-only namespaces. These are typed and shown as "help: pixiv" (space after
+# the colon) but looked up as "help:pixiv". They are never post tags, so a
+# missing page doesn't fall back to a posts search.
+WIKI_NAMESPACE_PATTERN = re.compile(
+    r'^\s*(tag[ _]group|pool[ _]group|help|howto|about|api)\s*:[\s_]*(.*?)\s*$',
+    re.IGNORECASE | re.DOTALL)
+
+
+def split_wiki_namespace(text: str):
+    """("help", "pixiv") for "help: pixiv" / "help:pixiv", else None."""
+    match = WIKI_NAMESPACE_PATTERN.match(str(text or ''))
+    if not match:
+        return None
+    return match.group(1).casefold().replace(' ', '_'), match.group(2)
+
+
+def join_wiki_namespace(text: str) -> str:
+    """Drop the space after a wiki namespace's colon ("help: x" -> "help:x")."""
+    parts = split_wiki_namespace(text)
+    if parts is None:
+        return str(text or '').strip()
+    return f'{parts[0]}:{parts[1]}'
+
+
+def display_wiki_title(title: str) -> str:
+    """Readable title: underscores become spaces and a wiki namespace gets a
+    space after its colon ("tag_group:birds" -> "tag group: birds")."""
+    parts = split_wiki_namespace(title)
+    if parts is None:
+        return str(title or '').replace('_', ' ').strip()
+    namespace, name = parts
+    return f'{namespace.replace("_", " ")}: {name.replace("_", " ")}'.rstrip()
+
+
+def strip_wiki_search_prefix(text: str):
+    """(True, rest) when the text starts with "wiki:", else (False, text)."""
+    stripped = str(text or '').strip()
+    if stripped.casefold().startswith(WIKI_SEARCH_PREFIX):
+        return True, stripped[len(WIKI_SEARCH_PREFIX):].strip()
+    return False, stripped
+
+
+def completion_filter_text(text: str) -> str:
+    """The search-box text as the autocomplete popup should filter on it:
+    without a "wiki:" prefix and with namespaces in their display form."""
+    _, rest = strip_wiki_search_prefix(text)
+    if split_wiki_namespace(rest) is not None:
+        return display_wiki_title(rest)
+    return rest
 
 
 class TagNameOnlyCompleter(QCompleter):
@@ -162,6 +223,7 @@ class TagNameOnlyCompleter(QCompleter):
         self.prev_completion = ''
 
     def setCompletionPrefix(self, prefix: str):
+        prefix = completion_filter_text(prefix)
         self.prev_completion = prefix
         super().setCompletionPrefix(prefix)
 
@@ -171,18 +233,18 @@ class TagNameOnlyCompleter(QCompleter):
         completion = super().pathFromIndex(index)
         tag_name = self.display_to_tag.get(completion, '')
         if tag_name:
-            return tag_name.replace('_', ' ')
-        return AUTOCOMPLETE_ANY_SUFFIX_PATTERN.sub(
-            '', completion).strip().replace('_', ' ')
+            return display_wiki_title(tag_name)
+        return display_wiki_title(AUTOCOMPLETE_ANY_SUFFIX_PATTERN.sub(
+            '', completion).strip())
 
     def insertText(self, completion: str):
         tag_name = self.display_to_tag.get(completion, '')
         if tag_name:
-            super().insertText(tag_name.replace('_', ' '))
+            super().insertText(display_wiki_title(tag_name))
         else:
             clean_text = AUTOCOMPLETE_ANY_SUFFIX_PATTERN.sub(
                 '', completion).strip()
-            super().insertText(clean_text.replace('_', ' '))
+            super().insertText(display_wiki_title(clean_text))
 
 
 class BaseWikiDialog(QDialog):
@@ -206,6 +268,76 @@ class BaseWikiDialog(QDialog):
     EMPTY_TAG_MESSAGE = ''
     AUTOCOMPLETE_THREAD_CLASS = None
 
+    def _render_chip_data_url(self, text: str, is_dark: bool) -> tuple:
+        """Render a single synonym chip (rounded rectangle + text) to a PNG
+        data URL. QTextBrowser ignores padding/border-radius on inline HTML,
+        so we draw the chip as an image to get true rounded corners. Returns
+        (data_url, logical_width, logical_height)."""
+        scale = max(1.0, self.devicePixelRatioF())
+        font = self.content_browser.font()
+        metrics = QFontMetrics(font)
+        padding_x = 8
+        padding_y = 3
+        text_width = metrics.horizontalAdvance(text)
+        text_height = metrics.height()
+        logical_width = text_width + padding_x * 2
+        logical_height = text_height + padding_y * 2
+
+        pixmap = QPixmap(round(logical_width * scale), round(logical_height * scale))
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        background = QColor('#3a3f4b' if is_dark else '#eef1f5')
+        text_color = QColor('#d7dae0' if is_dark else '#333333')
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setFont(font)
+        path = QPainterPath()
+        path.addRoundedRect(0.5, 0.5, logical_width - 1.0,
+                            logical_height - 1.0, 5.0, 5.0)
+        painter.fillPath(path, background)
+        painter.setPen(text_color)
+        painter.drawText(0, 0, logical_width, logical_height,
+                         int(Qt.AlignmentFlag.AlignCenter), text)
+        painter.end()
+
+        byte_array = QByteArray()
+        buffer = QBuffer(byte_array)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        pixmap.save(buffer, 'PNG')
+        buffer.close()
+        encoded = bytes(byte_array.toBase64()).decode('ascii')
+        return (f'data:image/png;base64,{encoded}',
+                logical_width, logical_height)
+
+    def _build_chips_html(self, names, is_dark: bool) -> str:
+        """Render names (e.g. a tag's other names) as a wrapped row of chips."""
+        names = [str(name).strip() for name in (names or [])
+                 if str(name).strip()]
+        if not names:
+            return ''
+        # All chips share the same height (same font), so compute a tight,
+        # pixel-based line-height: just the chip height plus a small gap so that
+        # wrapped rows sit as close together as the inline gap between chips.
+        metrics = QFontMetrics(self.content_browser.font())
+        chip_pixel_height = metrics.height() + 6
+        row_gap = 5
+        line_height = chip_pixel_height + row_gap
+        chips = []
+        for name in names:
+            label = name.replace('_', ' ')
+            data_url, chip_width, chip_height = self._render_chip_data_url(
+                label, is_dark)
+            # Let the browser copy this chip image as its text.
+            self.content_browser.register_image_text(data_url, label)
+            chips.append(
+                f'<img src="{data_url}" width="{chip_width}" '
+                f'height="{chip_height}" '
+                f'style="vertical-align: middle;">')
+        return (f'<div style="margin: 2px 0 3px 0; line-height: {line_height}px;">'
+                f'{"&nbsp;".join(chips)}</div>')
+
     def _init_wiki_state(self, tag_library_model,
                          add_to_library_callback=None,
                          add_to_selected_images_callback=None,
@@ -222,6 +354,7 @@ class BaseWikiDialog(QDialog):
         self.current_image_has_tag_callback = current_image_has_tag_callback
         self.tag_history = []
         self.history_index = -1
+        self._page_nav_urls = {}
         self.fetch_thread = None
         self.active_fetch_threads = []
         self.current_request_key = ''
@@ -372,6 +505,9 @@ class BaseWikiDialog(QDialog):
         layout.addWidget(self.status_stack)
         layout.addWidget(self.content_browser)
         layout.addLayout(footer_layout)
+        # Push buttons would otherwise use Left / Right to move focus.
+        for button in self.findChildren(QPushButton):
+            button.installEventFilter(self)
 
     def _finish_wiki_init(self, tag: str):
         self.load_tag(tag, add_to_history=True)
@@ -490,9 +626,38 @@ class BaseWikiDialog(QDialog):
                 and event.type() == QEvent.Type.Resize
                 and self.hover_status_label.isVisible()):
             self._reposition_hover_status_label()
+        if (event.type() == QEvent.Type.KeyPress
+                and (watched is self.content_browser
+                     or isinstance(watched, QPushButton))
+                and self._handle_page_arrow_key(event)):
+            return True
         return super().eventFilter(watched, event)
 
+    def _handle_page_arrow_key(self, event) -> bool:
+        """Left / Right follow the page's Previous / Next link (posts search
+        pages and single posts). Typing in the search box keeps its normal
+        arrow keys, since this is only reached from other widgets."""
+        if (event.key() not in (Qt.Key.Key_Left, Qt.Key.Key_Right)
+                or event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
+            return False
+        if isinstance(self.focusWidget(), QLineEdit):
+            return False
+        url = self._page_nav_urls.get(
+            'previous' if event.key() == Qt.Key.Key_Left else 'next')
+        if not url:
+            return False
+        event.accept()
+        self.handle_anchor_clicked(QUrl(url))
+        return True
+
     def _set_browser_html(self, html_content: str):
+        # Remember the Previous / Next page links for the arrow keys.
+        self._page_nav_urls = {}
+        for key, pattern in (('previous', PREVIOUS_LINK_PATTERN),
+                             ('next', NEXT_LINK_PATTERN)):
+            match = pattern.search(html_content)
+            if match:
+                self._page_nav_urls[key] = html.unescape(match.group(1))
         if hasattr(self, 'hover_status_label'):
             self.hover_status_label.hide()
             self.hover_status_label.clear()
@@ -518,6 +683,8 @@ class BaseWikiDialog(QDialog):
                 focus_widget.click()
                 event.accept()
                 return
+        if self._handle_page_arrow_key(event):
+            return
         if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
             completer_popup = self.search_completer.popup()
             if completer_popup is not None and completer_popup.isVisible():
@@ -757,10 +924,30 @@ class BaseWikiDialog(QDialog):
         self.stop_all_autocomplete_threads()
         search_text = self.extract_tag_name_from_search_text(
             self.search_line_edit.text())
+        wiki_only, search_text = strip_wiki_search_prefix(search_text)
+        search_text = self.extract_tag_name_from_search_text(search_text)
         if not search_text:
             return
-        self.search_line_edit.setText(search_text.replace('_', ' '))
+        self.search_line_edit.setText(display_wiki_title(search_text))
+        self._wiki_only_request_key = None
         self.load_tag(search_text, add_to_history=True)
+        if wiki_only:
+            # The lookup always answers later (from a worker thread), so the
+            # request key set by load_tag identifies it.
+            self._wiki_only_request_key = self.current_request_key
+
+    def posts_fallback_tags(self, request_key: str,
+                            normalized_tag: str) -> str:
+        """Tags to search posts for when a wiki lookup finds no page, or ''
+        to show "not found" instead (a "wiki:" search, a wiki namespace such
+        as "help:", or a lookup by page id)."""
+        if not request_key.startswith('tag:'):
+            return ''
+        if request_key == getattr(self, '_wiki_only_request_key', None):
+            return ''
+        if split_wiki_namespace(normalized_tag) is not None:
+            return ''
+        return self.posts_tags_from_wiki_tag(normalized_tag)
 
     def stop_all_fetch_threads(self):
         """Called while the dialog closes. Never blocks: see
@@ -851,7 +1038,7 @@ class BaseWikiDialog(QDialog):
             is_tag_group = bool(suggestion.get('is_tag_group'))
             is_wiki_only = bool(suggestion.get('is_wiki_only'))
             tag_count = int(suggestion.get('post_count') or 0)
-            human_readable_tag = tag_name.replace('_', ' ')
+            human_readable_tag = display_wiki_title(tag_name)
             if (is_tag_group
                     and human_readable_tag.casefold().startswith('tag group:')):
                 display_text = f'{human_readable_tag} (Tag Group)'
@@ -868,6 +1055,10 @@ class BaseWikiDialog(QDialog):
             self.search_autocomplete_model.appendRow(item)
         self.search_completer.display_to_tag = self.autocomplete_display_to_tag
         if suggestions and self.search_line_edit.hasFocus():
+            # Qt filters the popup on the raw box text; match "wiki: cat" and
+            # "tag group:b" against the suggestions' display form instead.
+            self.search_completer.setCompletionPrefix(
+                self.search_line_edit.text())
             self.search_completer.complete()
 
     def suggestion_color(self, suggestion: dict) -> str:
@@ -886,6 +1077,18 @@ class BaseWikiDialog(QDialog):
             return
         self.load_tag(selected_tag, add_to_history=True)
 
+    @staticmethod
+    def posts_tags_from_wiki_tag(normalized_tag: str) -> str:
+        """Space-separated posts-search tags for a wiki lookup that found no
+        page. Commas separate tags, so "dog,_cat_ears" (typed "dog, cat
+        ears") becomes "dog cat_ears"."""
+        tags = []
+        for part in str(normalized_tag or '').split(','):
+            tag = part.strip(' _')
+            if tag and tag not in tags:
+                tags.append(tag)
+        return ' '.join(tags)
+
     @Slot(str, str)
     def show_not_found(self, request_key: str, normalized_tag: str):
         if request_key != self.current_request_key:
@@ -893,7 +1096,7 @@ class BaseWikiDialog(QDialog):
         self.pending_history_append_on_load = False
         self.show_status_message('No wiki page found for this tag.')
         self._set_browser_html(
-            f'<h3>{html.escape(normalized_tag)}</h3>'
+            f'<h3>{html.escape(display_wiki_title(normalized_tag))}</h3>'
             f'<p>No wiki entry was found on {self.SITE_NAME}.</p>')
         self.update_add_to_library_button_state()
 

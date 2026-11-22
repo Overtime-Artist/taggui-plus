@@ -13,17 +13,17 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject,
-                            QRunnable, Qt, QThread, QThreadPool, QTimer,
-                            Signal, Slot)
-from PySide6.QtGui import (QFont, QIcon, QImageReader, QKeySequence, QPainter,
-                           QPalette, QPen, QPixmap, QShortcut)
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
+                            QPoint, QRect, QRunnable, QSize, Qt, QThread,
+                            QThreadPool, QTimer, Signal, Slot)
+from PySide6.QtGui import (QColor, QFont, QIcon, QImageReader, QKeySequence,
+                           QPainter, QPalette, QPen, QPixmap, QShortcut)
+from PySide6.QtWidgets import (QApplication, QCheckBox,
                                QComboBox, QDialog,
-                               QFileDialog, QFrame, QGridLayout, QGroupBox,
+                               QFileDialog, QFrame, QGroupBox,
                                QHBoxLayout, QLabel, QMessageBox,
-                               QProgressDialog, QPushButton, QRadioButton,
-                               QScrollArea, QSizePolicy, QSlider, QVBoxLayout,
-                               QWidget)
+                               QPlainTextEdit, QProgressDialog, QPushButton,
+                               QScrollArea, QSizePolicy, QSlider, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from models.image_list_model import ImageListModel, Scope
 from utils.duplicate_detection import (DuplicateCache, find_duplicate_groups,
@@ -33,10 +33,13 @@ from utils.settings_widgets import (FocusedScrollSettingsComboBox,
                                     SettingsBigCheckBox)
 from utils.utils import get_confirmation_dialog_reply, pluralize
 from widgets.image_list import transfer_images, trash_images
-from widgets.image_viewer import ImageViewer
+from widgets.image_viewer import (GRID_DIM_OPACITY, ImageViewer,
+                                  overlay_style_sheet)
 
 # Thumbnail edge length (pixels) for the cards in a duplicate group.
 _THUMBNAIL_SIZE = 140
+# The green of the Images pane's completion check mark.
+_KEPT_GREEN = '#3cc23c'
 # Rendering caps so a pathological result set (e.g. thousands of near-identical
 # training images merged into giant groups) can never freeze the UI or exhaust
 # memory. Groups are shown this many at a time ("Show next ... groups"), and
@@ -55,11 +58,18 @@ _DUPLICATE_TAG = 'duplicate'
 # Rules for picking the image to keep in each group.
 KEEP_LARGEST_RESOLUTION = 'Largest resolution'
 KEEP_LARGEST_FILE = 'Largest file'
-KEEP_NEWEST_FILE = 'Newest file'
-KEEP_OLDEST_FILE = 'Oldest file'
+KEEP_NEWEST_CREATED = 'Newest (created date)'
+KEEP_OLDEST_CREATED = 'Oldest (created date)'
+KEEP_NEWEST_MODIFIED = 'Newest (modified date)'
+KEEP_OLDEST_MODIFIED = 'Oldest (modified date)'
 KEEP_MOST_TAGS = 'Most tags'
-KEEP_RULES = [KEEP_LARGEST_RESOLUTION, KEEP_LARGEST_FILE, KEEP_NEWEST_FILE,
-              KEEP_OLDEST_FILE, KEEP_MOST_TAGS]
+KEEP_RULES = [KEEP_LARGEST_RESOLUTION, KEEP_LARGEST_FILE, KEEP_NEWEST_CREATED,
+              KEEP_OLDEST_CREATED, KEEP_NEWEST_MODIFIED, KEEP_OLDEST_MODIFIED,
+              KEEP_MOST_TAGS]
+# Saved rule names from before the created/modified split (both compared the
+# modified date).
+_LEGACY_KEEP_RULES = {'Newest file': KEEP_NEWEST_MODIFIED,
+                      'Oldest file': KEEP_OLDEST_MODIFIED}
 
 
 class _ClickableLabel(QLabel):
@@ -87,12 +97,17 @@ def _strictness_text(value: int) -> str:
 
 
 def _apply_indicator_palette(button):
-    # Only the Base color is overridden, so the other colors keep following
-    # the app theme.
+    # Only the Base color (and, for a Keep box, the check mark's Text color)
+    # is overridden, so the other colors keep following the app theme.
     window_color = button.palette().color(QPalette.ColorRole.Window)
-    if button.palette().color(QPalette.ColorRole.Base) != window_color:
+    check_color = getattr(button, 'check_mark_color', None)
+    if (button.palette().color(QPalette.ColorRole.Base) != window_color
+            or (check_color is not None and button.palette().color(
+                QPalette.ColorRole.Text) != check_color)):
         palette = QPalette()
         palette.setColor(QPalette.ColorRole.Base, window_color)
+        if check_color is not None:
+            palette.setColor(QPalette.ColorRole.Text, check_color)
         button.setPalette(palette)
 
 
@@ -120,17 +135,54 @@ def _make_indicator_visible(button):
 
 
 class _DuplicateCard(QFrame):
-    """A frameless card; the kept one is outlined in the highlight color,
-    like a selected image in the Images pane."""
+    """A frameless card; a kept one is outlined in the highlight color, like
+    a selected image in the Images pane. A card that isn't kept is dimmed
+    (like an image without the focused tag in the grid view) unless the
+    mouse is over it or it is the image shown in the large viewer."""
 
     def __init__(self):
         super().__init__()
         self.kept = False
+        self.viewed = False
+        self._hovered = False
+        # Drawn over the card's contents to dim them; mouse clicks pass
+        # through to the thumbnail, links and Keep box below.
+        self._dim_overlay = _DimOverlay(self)
 
     def set_kept(self, kept: bool):
         if kept != self.kept:
             self.kept = kept
             self.update()
+        self._update_dimming()
+
+    def set_viewed(self, viewed: bool):
+        self.viewed = viewed
+        self._update_dimming()
+
+    def is_dimmed(self) -> bool:
+        return not (self.kept or self.viewed or self._hovered)
+
+    def _update_dimming(self):
+        if self.is_dimmed():
+            self._dim_overlay.setGeometry(self.rect())
+            self._dim_overlay.raise_()
+            self._dim_overlay.show()
+        else:
+            self._dim_overlay.hide()
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self._update_dimming()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self._update_dimming()
+        super().leaveEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._dim_overlay.setGeometry(self.rect())
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -141,6 +193,22 @@ class _DuplicateCard(QFrame):
         painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Highlight),
                             2))
         painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 4, 4)
+
+
+class _DimOverlay(QWidget):
+    """Covers a card with the results background color so its contents show
+    at the grid view's dimmed opacity."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        color = QColor(self.palette().color(QPalette.ColorRole.Base))
+        color.setAlphaF(1.0 - GRID_DIM_OPACITY)
+        painter.fillRect(self.rect(), color)
 
 
 def _format_size(num_bytes) -> str:
@@ -157,16 +225,35 @@ def _format_size(num_bytes) -> str:
     return f'{size:.1f} GB'
 
 
-def _format_modified(mtime_ns) -> str:
-    """Return the file's modified date (what "Newest file" and "Oldest file"
-    compare), e.g. 'Modified 2024-05-01 14:32'."""
-    if mtime_ns is None:
-        return 'Modified ?'
+def _format_date(label: str, timestamp_ns) -> str:
+    """Return e.g. 'Modified 2024-05-01 14:32' (the dates the newest/oldest
+    keep rules compare)."""
+    if timestamp_ns is None:
+        return f'{label} ?'
     try:
-        stamp = datetime.fromtimestamp(mtime_ns / 1e9)
+        stamp = datetime.fromtimestamp(timestamp_ns / 1e9)
     except (OverflowError, OSError, ValueError):
-        return 'Modified ?'
-    return f'Modified {stamp:%Y-%m-%d %H:%M}'
+        return f'{label} ?'
+    return f'{label} {stamp:%Y-%m-%d %H:%M}'
+
+
+def _show_text_popup(parent, title: str, text: str):
+    """Show read-only, selectable text (an image's tags or prompt)."""
+    dialog = QDialog(parent)
+    dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+    dialog.setWindowTitle(title)
+    layout = QVBoxLayout(dialog)
+    text_edit = QPlainTextEdit(text)
+    text_edit.setReadOnly(True)
+    layout.addWidget(text_edit)
+    close_button = QPushButton('Close')
+    close_button.clicked.connect(dialog.accept)
+    button_row = QHBoxLayout()
+    button_row.addStretch()
+    button_row.addWidget(close_button)
+    layout.addLayout(button_row)
+    dialog.resize(480, 300)
+    dialog.exec()
 
 
 class _VerticalWheelForwarder(QObject):
@@ -357,12 +444,15 @@ def choose_keeper(members: list, rule: str, tag_counts: dict):
         resolution = _resolution_key(member)
         if rule == KEEP_LARGEST_FILE:
             return (member.size or 0,) + resolution
-        if rule == KEEP_NEWEST_FILE:
-            return (member.mtime_ns or 0,) + resolution
-        if rule == KEEP_OLDEST_FILE:
+        if rule in (KEEP_NEWEST_CREATED, KEEP_NEWEST_MODIFIED):
+            timestamp = (member.created_ns if rule == KEEP_NEWEST_CREATED
+                         else member.mtime_ns)
+            return (timestamp or 0,) + resolution
+        if rule in (KEEP_OLDEST_CREATED, KEEP_OLDEST_MODIFIED):
+            timestamp = (member.created_ns if rule == KEEP_OLDEST_CREATED
+                         else member.mtime_ns)
             # Files whose date is unknown count as the newest.
-            mtime_ns = member.mtime_ns
-            return ((-mtime_ns if mtime_ns is not None else -float('inf')),
+            return ((-timestamp if timestamp is not None else -float('inf')),
                     ) + resolution
         if rule == KEEP_MOST_TAGS:
             return (tag_counts.get(member.path, 0),) + resolution
@@ -375,6 +465,18 @@ def choose_keeper(members: list, rule: str, tag_counts: dict):
         if member_key > best_key:
             best, best_key = member, member_key
     return best
+
+
+def closest_keeper(member, keepers: list):
+    """Return the kept image `member` most closely matches: an identical
+    file first, then the smallest fingerprint difference."""
+    def distance(keeper):
+        if member.sha256 is not None and member.sha256 == keeper.sha256:
+            return -1
+        if member.dhash is None or keeper.dhash is None:
+            return float('inf')
+        return hamming_distance(member.dhash, keeper.dhash)
+    return min(keepers, key=distance)
 
 
 def describe_relation(member, keeper) -> str:
@@ -411,6 +513,8 @@ class FindDuplicatesDialog(QDialog):
         self._group_selections: list[_GroupCards] = []
         # Image path -> number of tags, for the groups currently shown.
         self._tag_counts: dict[Path, int] = {}
+        # Image path -> (tags, natural language prompt).
+        self._captions: dict[Path, tuple[list[str], str]] = {}
         # Thumbnail state for the current results.
         self._thumbnail_batch = _ThumbnailBatch()
         self._thumbnails: dict[str, QPixmap | None] = {}
@@ -433,19 +537,17 @@ class FindDuplicatesDialog(QDialog):
 
         description = QLabel(
             'Finds identical files and near duplicates (resizes, re-saves or '
-            'minor edits). In each group, choose the image to keep, then act '
+            'minor edits). In each group, choose the images to keep, then act '
             'on the others. Click a thumbnail to view it larger. Deleted '
             'images go to the Recycle Bin.')
         description.setWordWrap(True)
         layout.addWidget(description)
 
         # --- Scan controls --------------------------------------------------
-        # Strictness gets its own row so the slider keeps a usable width next
-        # to the longest strictness description.
-        scan_grid = QGridLayout()
-        scan_grid.setHorizontalSpacing(8)
-        scan_grid.addWidget(QLabel('Scope:'), 0, 0)
+        # Each line is its own row, so a label's width never pads the
+        # control after a shorter label (as a shared grid column would).
         scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel('Scope:'))
         self.scope_combo_box = FocusedScrollSettingsComboBox(
             key='duplicate_scan_scope', default=Scope.ALL_IMAGES.value)
         self.scope_combo_box.addItems(list(Scope))
@@ -462,8 +564,11 @@ class FindDuplicatesDialog(QDialog):
         scope_row.addSpacing(6)
         scope_row.addWidget(self.scope_count_label)
         scope_row.addStretch()
-        scan_grid.addLayout(scope_row, 0, 1, 1, 3)
-        scan_grid.addWidget(QLabel('Strictness:'), 1, 0)
+        layout.addLayout(scope_row)
+        # Strictness gets its own row so the slider keeps a usable width next
+        # to the longest strictness description.
+        strictness_row = QHBoxLayout()
+        strictness_row.addWidget(QLabel('Strictness:'))
         self.strictness_slider = QSlider(Qt.Orientation.Horizontal)
         self.strictness_slider.setMinimum(0)
         self.strictness_slider.setMaximum(_MAX_THRESHOLD)
@@ -472,7 +577,7 @@ class FindDuplicatesDialog(QDialog):
         self.strictness_slider.setTickInterval(2)
         self.strictness_slider.setMinimumWidth(200)
         self.strictness_slider.valueChanged.connect(self._update_strictness_label)
-        scan_grid.addWidget(self.strictness_slider, 1, 1)
+        strictness_row.addWidget(self.strictness_slider, 1)
         self.strictness_label = QLabel()
         # Reserve room for the longest description so the slider doesn't
         # change width while it is dragged.
@@ -480,12 +585,11 @@ class FindDuplicatesDialog(QDialog):
         self.strictness_label.setMinimumWidth(max(
             metrics.horizontalAdvance(_strictness_text(value))
             for value in range(_MAX_THRESHOLD + 1)) + 4)
-        scan_grid.addWidget(self.strictness_label, 1, 2)
+        strictness_row.addWidget(self.strictness_label)
         self.scan_button = QPushButton('Scan')
         self.scan_button.clicked.connect(self.start_scan)
-        scan_grid.addWidget(self.scan_button, 1, 3)
-        scan_grid.setColumnStretch(1, 1)
-        layout.addLayout(scan_grid)
+        strictness_row.addWidget(self.scan_button)
+        layout.addLayout(strictness_row)
         self._update_scope_count_label()
         self._update_strictness_label(self.strictness_slider.value())
 
@@ -516,36 +620,49 @@ class FindDuplicatesDialog(QDialog):
         layout.addLayout(status_row)
 
         # --- Keeper + actions -----------------------------------------------
+        # Each row is its own box layout so every label sits right next to
+        # its controls (a shared grid column would size both labels to the
+        # longer one, leaving a gap after "Other images:").
         actions_box = QGroupBox('Act on the results')
-        actions_layout = QGridLayout(actions_box)
-        actions_layout.setColumnStretch(4, 1)
+        actions_layout = QVBoxLayout(actions_box)
 
-        actions_layout.addWidget(QLabel('Keep in each group:'), 0, 0)
+        keep_row = QHBoxLayout()
+        keep_row.addWidget(QLabel('Keep in each group:'))
         self.keep_rule_combo_box = FocusedScrollSettingsComboBox(
             key='duplicate_keep_rule', default=KEEP_LARGEST_RESOLUTION)
+        saved_rule = self.settings.value('duplicate_keep_rule',
+                                         KEEP_LARGEST_RESOLUTION, type=str)
         self.keep_rule_combo_box.addItems(KEEP_RULES)
-        if self.keep_rule_combo_box.currentText() not in KEEP_RULES:
+        if saved_rule in _LEGACY_KEEP_RULES:
+            self.keep_rule_combo_box.setCurrentText(
+                _LEGACY_KEEP_RULES[saved_rule])
+        elif self.keep_rule_combo_box.currentText() not in KEEP_RULES:
             self.keep_rule_combo_box.setCurrentText(KEEP_LARGEST_RESOLUTION)
-        actions_layout.addWidget(self.keep_rule_combo_box, 0, 1)
+        keep_row.addWidget(self.keep_rule_combo_box)
         self.apply_rule_button = QPushButton('Apply to all groups')
         self.apply_rule_button.clicked.connect(self.apply_keep_rule)
-        actions_layout.addWidget(self.apply_rule_button, 0, 2)
+        keep_row.addWidget(self.apply_rule_button)
+        keep_row.addStretch()
+        actions_layout.addLayout(keep_row)
 
         self.merge_tags_check_box = SettingsBigCheckBox(
             key='duplicate_merge_tags', default=False,
-            text='Copy the tags of the other images to the kept image')
-        actions_layout.addWidget(self.merge_tags_check_box, 1, 0, 1, 5)
+            text='Copy the tags of the other images to the kept images')
+        actions_layout.addWidget(self.merge_tags_check_box)
 
-        actions_layout.addWidget(QLabel('Other images:'), 2, 0)
+        others_row = QHBoxLayout()
+        others_row.addWidget(QLabel('Other images:'))
         self.delete_button = QPushButton('Delete to Recycle Bin')
         self.delete_button.clicked.connect(self.delete_others)
-        actions_layout.addWidget(self.delete_button, 2, 1)
+        others_row.addWidget(self.delete_button)
         self.move_button = QPushButton('Move to folder...')
         self.move_button.clicked.connect(self.move_others)
-        actions_layout.addWidget(self.move_button, 2, 2)
+        others_row.addWidget(self.move_button)
         self.tag_button = QPushButton(f'Tag as "{_DUPLICATE_TAG}"')
         self.tag_button.clicked.connect(self.tag_others)
-        actions_layout.addWidget(self.tag_button, 2, 3)
+        others_row.addWidget(self.tag_button)
+        others_row.addStretch()
+        actions_layout.addLayout(others_row)
         layout.addWidget(actions_box)
 
         self._set_actions_enabled(False)
@@ -688,6 +805,7 @@ class FindDuplicatesDialog(QDialog):
         self._group_selections.clear()
         self._groups = []
         self._tag_counts = {}
+        self._captions = {}
         self.show_more_button.hide()
         while self.results_layout.count():
             item = self.results_layout.takeAt(0)
@@ -711,8 +829,7 @@ class FindDuplicatesDialog(QDialog):
                 f'strictness. Try moving the slider toward "Loose".')
             self._set_actions_enabled(False)
             return
-        self._tag_counts = {path: len(image.tags) for path, (_row, image)
-                            in self._image_lookup().items()}
+        self._refresh_captions(self._image_lookup())
         self._add_group_cards(groups[:_MAX_GROUPS_SHOWN])
         self._set_actions_enabled(True)
         self._update_status()
@@ -762,22 +879,55 @@ class FindDuplicatesDialog(QDialog):
                         'setting.')
         self.status_label.setText(message)
 
+    def _refresh_captions(self, lookup: dict):
+        self._captions = {path: (list(image.tags),
+                                 image.natural_language_prompt or '')
+                          for path, (_row, image) in lookup.items()}
+        self._tag_counts = {path: len(tags)
+                            for path, (tags, _prompt) in self._captions.items()}
+
     def _card_info_text(self, member) -> str:
         if member.dimensions:
             width, height = member.dimensions
             dimensions_text = f'{width}\u00d7{height}'
         else:
             dimensions_text = 'unknown size'
-        tag_count = self._tag_counts.get(member.path)
-        tags_text = ('? tags' if tag_count is None
-                     else f'{tag_count} {pluralize("tag", tag_count)}')
         return (f'{_elide(member.path.name)}\n'
                 f'{dimensions_text}  \u2022  {_format_size(member.size)}\n'
-                f'{_format_modified(member.mtime_ns)}\n'
-                f'{tags_text}')
+                f'{_format_date("Created", member.created_ns)}\n'
+                f'{_format_date("Modified", member.mtime_ns)}')
+
+    def _card_caption_html(self, member) -> str:
+        """The tag count and prompt indicator; each opens its text when
+        clicked (if there is any)."""
+        caption = self._captions.get(member.path)
+        if caption is None:
+            return '? tags'
+        tags, prompt = caption
+        count = len(tags)
+        tags_text = f'{count} {pluralize("tag", count)}'
+        if count:
+            tags_text = f'<a href="tags">{tags_text}</a>'
+        prompt_text = ('<a href="prompt">Prompt</a>' if prompt.strip()
+                       else 'No prompt')
+        return f'{tags_text}&nbsp;&nbsp;\u2022&nbsp;&nbsp;{prompt_text}'
+
+    def _on_caption_link(self, link: str, member):
+        caption = self._captions.get(member.path)
+        if caption is None:
+            return
+        tags, prompt = caption
+        if link == 'tags':
+            _show_text_popup(self, f'Tags \u2014 {member.path.name}',
+                             ', '.join(tags))
+        elif link == 'prompt':
+            _show_text_popup(
+                self, f'Natural language prompt \u2014 {member.path.name}',
+                prompt)
 
     def _build_card(self, member, group_cards) -> tuple:
-        """Return (card, keep radio, relation label, info label)."""
+        """Return (card, keep check box, relation label, info label,
+        caption label)."""
         card = _DuplicateCard()
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(6, 6, 6, 6)
@@ -796,14 +946,25 @@ class FindDuplicatesDialog(QDialog):
         info_label.setToolTip(str(member.path))
         card_layout.addWidget(info_label)
 
+        caption_label = QLabel(self._card_caption_html(member))
+        caption_label.setTextFormat(Qt.TextFormat.RichText)
+        caption_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        caption_label.linkActivated.connect(
+            lambda link, m=member: self._on_caption_link(link, m))
+        card_layout.addWidget(caption_label)
+
         # A space keeps the line's height before the real text is set.
         relation_label = QLabel(' ')
         card_layout.addWidget(relation_label)
 
-        radio = QRadioButton('Keep')
-        _make_indicator_visible(radio)
-        card_layout.addWidget(radio)
-        return card, radio, relation_label, info_label
+        keep_box = QCheckBox('Keep')
+        # Fusion draws the check mark in the Text color made 20% darker, and
+        # the label in WindowText, so only the mark turns green.
+        keep_box.check_mark_color = QColor(_KEPT_GREEN).lighter(120)
+        _make_indicator_visible(keep_box)
+        card_layout.addWidget(keep_box)
+        return card, keep_box, relation_label, info_label, caption_label
 
     # ------------------------------------------------------------------
     # Thumbnails
@@ -837,22 +998,28 @@ class FindDuplicatesDialog(QDialog):
     def _show_preview(self, group_cards, member):
         """Open a large preview that can cycle through the group's images
         and let the user pick which one to keep."""
-        if group_cards is not None and group_cards.radio_members:
-            radio_members = list(group_cards.radio_members)
+        if group_cards is not None and group_cards.keep_box_members:
+            keep_box_members = list(group_cards.keep_box_members)
         else:
             # Fallback: a standalone image with no group/keep context.
-            radio_members = [(None, member)]
+            keep_box_members = [(None, member)]
 
         index = 0
-        for position, (_radio, current) in enumerate(radio_members):
+        for position, (_keep_box, current) in enumerate(keep_box_members):
             if current is member:
                 index = position
                 break
 
-        dialog = _PreviewDialog(self, radio_members, index,
+        dialog = _PreviewDialog(self, keep_box_members, index,
                                 self._thumbnails)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        if group_cards is not None:
+            # The card of the image on show stays undimmed behind the viewer.
+            dialog.current_changed.connect(group_cards.set_viewed)
+            group_cards.set_viewed(keep_box_members[index][1])
         dialog.exec()
+        if group_cards is not None:
+            group_cards.set_viewed(None)
 
     # ------------------------------------------------------------------
     # Selection helpers
@@ -861,25 +1028,54 @@ class FindDuplicatesDialog(QDialog):
     @Slot()
     def apply_keep_rule(self):
         rule = self.keep_rule_combo_box.currentText()
+        several = sum(1 for group_cards in self._group_selections
+                      if len(group_cards.keep_members) > 1)
+        none = sum(1 for group_cards in self._group_selections
+                   if not group_cards.keep_members)
+        if several or none:
+            parts = []
+            if several:
+                parts.append(f'{several} {pluralize("group", several)} '
+                             f'{"keeps" if several == 1 else "keep"} more '
+                             f'than one image')
+            if none:
+                parts.append(f'{none} {pluralize("group", none)} '
+                             f'{"keeps" if none == 1 else "keep"} no images')
+            question = (f'{" and ".join(parts)}. Applying '
+                        f'"{rule}" will keep exactly one image in every '
+                        f'group. Continue?')
+            reply = get_confirmation_dialog_reply('Apply Keep Rule', question)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         for group_cards in self._group_selections:
-            if group_cards.ignored:
-                continue
             group_cards.set_keep(choose_keeper(group_cards.group.members,
                                                rule, self._tag_counts))
 
     def _keeper_targets(self) -> list[tuple]:
-        """Return (kept member, [other members]) for every group that is not
-        ignored. Includes members hidden behind a group's "+N more" tile."""
+        """Return ([kept members], [other members]) for every group. A group
+        that keeps nothing has every image as an "other". Includes members
+        hidden behind a group's "+N more" tile."""
         pairs = []
         for group_cards in self._group_selections:
-            if group_cards.ignored:
-                continue
-            keeper = group_cards.keep_member
+            keepers = list(group_cards.keep_members)
             others = [member for member in group_cards.group.members
-                      if member is not keeper]
+                      if not group_cards.is_kept(member)]
             if others:
-                pairs.append((keeper, others))
+                pairs.append((keepers, others))
         return pairs
+
+    @staticmethod
+    def _no_keeper_warning(pairs, verb: str) -> str:
+        """A warning for groups that keep none of their images."""
+        groups = [others for keepers, others in pairs if not keepers]
+        if not groups:
+            return ''
+        count = len(groups)
+        images = sum(len(others) for others in groups)
+        return (f'\n\nWarning: {count} {pluralize("group", count)} '
+                f'{"keeps" if count == 1 else "keep"} no images, so all '
+                f'{images} of {"its" if count == 1 else "their"} images will '
+                f'be {verb}.')
 
     def _set_actions_enabled(self, enabled: bool):
         for widget in (self.delete_button, self.move_button, self.tag_button,
@@ -892,13 +1088,10 @@ class FindDuplicatesDialog(QDialog):
 
     def _merge_tags_by_row(self, pairs, lookup, acted_on=None) -> dict:
         """Return {model row: tags} adding the other images' tags (that the
-        keeper lacks) to each keeper. Only others in `acted_on` (a set of
-        paths) count, if given."""
+        keepers lack) to every kept image. Only others in `acted_on` (a set
+        of paths) count, if given."""
         tags_by_row = {}
-        for keeper, others in pairs:
-            keeper_entry = lookup.get(keeper.path)
-            if keeper_entry is None:
-                continue
+        for keepers, others in pairs:
             tags = []
             for member in others:
                 if acted_on is not None and member.path not in acted_on:
@@ -906,8 +1099,12 @@ class FindDuplicatesDialog(QDialog):
                 entry = lookup.get(member.path)
                 if entry is not None:
                     tags.extend(entry[1].tags)
-            if tags:
-                tags_by_row.setdefault(keeper_entry[0], []).extend(tags)
+            if not tags:
+                continue
+            for keeper in keepers:
+                keeper_entry = lookup.get(keeper.path)
+                if keeper_entry is not None:
+                    tags_by_row.setdefault(keeper_entry[0], []).extend(tags)
         return tags_by_row
 
     def _add_tags_by_row(self, tags_by_row: dict, action_name: str):
@@ -933,6 +1130,7 @@ class FindDuplicatesDialog(QDialog):
         if merge:
             question += ('\n\nTheir tags will be copied to the kept '
                          'images first.')
+        question += self._no_keeper_warning(pairs, 'deleted')
         reply = get_confirmation_dialog_reply('Delete Duplicates', question)
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -957,6 +1155,15 @@ class FindDuplicatesDialog(QDialog):
         if not targets:
             self._warn_no_targets()
             return
+        warning = self._no_keeper_warning(pairs, 'moved')
+        if warning:
+            reply = get_confirmation_dialog_reply(
+                'Move Duplicates',
+                f'Move {len(targets)} duplicate '
+                f'{pluralize("image", len(targets))} to another folder?'
+                f'{warning}')
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         destination = QFileDialog.getExistingDirectory(
             self, 'Select a folder to move the duplicates into',
             self.settings.value('directory_path', type=str) or '')
@@ -1001,8 +1208,7 @@ class FindDuplicatesDialog(QDialog):
                 'None of these images are loaded any more. Scan again.')
             return
         self._add_tags_by_row(tags_by_row, 'Tag Duplicates')
-        self._tag_counts = {path: len(image.tags)
-                            for path, (_row, image) in lookup.items()}
+        self._refresh_captions(lookup)
         for group_cards in self._group_selections:
             group_cards.refresh_info()
         self.status_label.setText(
@@ -1027,8 +1233,8 @@ class FindDuplicatesDialog(QDialog):
     def _warn_no_targets(self):
         QMessageBox.information(
             self, 'Find Duplicates',
-            'There is nothing to act on: every group is ticked "Ignore". '
-            'Un-ignore a group first.')
+            'There is nothing to act on: every group keeps all of its '
+            'images.')
 
 
 def _set_thumbnail(label: QLabel, pixmap):
@@ -1071,24 +1277,6 @@ class _GroupImagesModel(QAbstractListModel):
         return None
 
 
-_OVERLAY_STYLE = (
-    'QFrame#previewOverlay { background-color: rgba(0, 0, 0, 160);'
-    ' border-radius: 6px; }'
-    'QFrame#previewOverlay QLabel { color: rgba(255, 255, 255, 230);'
-    ' background: transparent; }'
-    'QFrame#previewOverlay QPushButton { color: white;'
-    ' background-color: rgba(255, 255, 255, 28);'
-    ' border: 1px solid rgba(255, 255, 255, 70); border-radius: 4px;'
-    ' padding: 4px 10px; }'
-    'QFrame#previewOverlay QPushButton:hover {'
-    ' background-color: rgba(255, 255, 255, 60); }'
-    'QFrame#previewOverlay QPushButton:pressed {'
-    ' background-color: rgba(255, 255, 255, 90); }'
-    'QFrame#previewOverlay QPushButton:disabled {'
-    ' color: rgba(255, 255, 255, 110);'
-    ' border-color: rgba(255, 255, 255, 35); }')
-# Hide the overlaid controls after this long without mouse movement.
-_OVERLAY_HIDE_DELAY_MS = 2500
 _OVERLAY_MARGIN = 10
 
 
@@ -1114,19 +1302,22 @@ class _PreviewDialog(QDialog):
     whole group, with controls overlaid on the image and a full-screen
     toggle.
 
-    ``radio_members`` is a list of ``(QRadioButton | None, member)`` tuples
-    shared with the main dialog, so "Keep this image" here checks the
-    matching radio back in the results list.
+    ``keep_box_members`` is a list of ``(QCheckBox | None, member)`` tuples
+    shared with the main dialog, so "Keep this image" here toggles the
+    matching Keep box back in the results list.
     """
 
-    def __init__(self, parent, radio_members, index, thumbnails=None):
+    # The member now shown (single view) or current (grid view).
+    current_changed = Signal(object)
+
+    def __init__(self, parent, keep_box_members, index, thumbnails=None):
         super().__init__(parent)
-        self.radio_members = radio_members
+        self.keep_box_members = keep_box_members
         self.index = index
         self._grid = False
         self._was_maximized = False
         self._zoomed_at_double_click = False
-        members = [member for _radio, member in radio_members]
+        members = [member for _keep_box, member in keep_box_members]
         self.model = _GroupImagesModel(members, thumbnails or {}, self)
 
         layout = QVBoxLayout(self)
@@ -1138,56 +1329,44 @@ class _PreviewDialog(QDialog):
         # Top left: what is shown.
         self.info_overlay = self._make_overlay(viewport)
         info_layout = QVBoxLayout(self.info_overlay)
-        info_layout.setContentsMargins(10, 6, 10, 6)
-        info_layout.setSpacing(2)
+        info_layout.setContentsMargins(0, 3, 0, 3)
+        info_layout.setSpacing(0)
         self.name_label = QLabel()
-        name_font = QFont(self.font())
-        name_font.setBold(True)
-        self.name_label.setFont(name_font)
+        self.name_label.setObjectName('overlayTitle')
         self.details_label = QLabel()
         info_layout.addWidget(self.name_label)
         info_layout.addWidget(self.details_label)
 
         # Top right: view controls.
         self.view_overlay = self._make_overlay(viewport)
-        view_layout = QHBoxLayout(self.view_overlay)
-        view_layout.setContentsMargins(6, 6, 6, 6)
         self.grid_button = self._make_button('Grid view (G)')
         self.grid_button.clicked.connect(self.toggle_grid)
         self.full_screen_button = self._make_button('Full screen (F11)')
         self.full_screen_button.clicked.connect(self.toggle_full_screen)
         self.close_button = self._make_button('Close (Esc)')
         self.close_button.clicked.connect(self.reject)
-        for button in (self.grid_button, self.full_screen_button,
-                       self.close_button):
-            view_layout.addWidget(button)
+        self._fill_bar(self.view_overlay, (
+            self.grid_button, self.full_screen_button, self.close_button))
 
         # Bottom centre: paging and the keep decision.
         self.nav_overlay = self._make_overlay(viewport)
-        nav_layout = QHBoxLayout(self.nav_overlay)
-        nav_layout.setContentsMargins(6, 6, 6, 6)
-        self.prev_button = self._make_button('\u2190 Previous')
+        self.prev_button = self._make_button('\u25c0 Previous')
         self.prev_button.clicked.connect(lambda: self._step(-1))
         self.keep_button = self._make_button('Keep this image (K)')
+        self.keep_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.keep_button.clicked.connect(self._keep_current)
-        self.next_button = self._make_button('Next \u2192')
+        self.next_button = self._make_button('Next \u25b6')
         self.next_button.clicked.connect(lambda: self._step(1))
-        for button in (self.prev_button, self.keep_button, self.next_button):
-            nav_layout.addWidget(button)
+        self._fill_bar(self.nav_overlay, (
+            self.prev_button, self.keep_button, self.next_button))
         self.overlays = (self.info_overlay, self.view_overlay,
                          self.nav_overlay)
 
-        self._hide_timer = QTimer(self)
-        self._hide_timer.setSingleShot(True)
-        self._hide_timer.setInterval(_OVERLAY_HIDE_DELAY_MS)
-        self._hide_timer.timeout.connect(self._hide_overlays_if_idle)
-        # Watch mouse movement anywhere over the image to bring the controls
-        # back, and viewport resizes to keep them in their corners.
+        # Watch for double-clicks over the image, and viewport resizes to
+        # keep the controls in their corners.
         for widget in (viewport, self.viewer.image_label):
-            widget.setMouseTracking(True)
             widget.installEventFilter(self)
-        for overlay in self.overlays:
-            overlay.installEventFilter(self)
 
         self.viewer.grid_cell_clicked.connect(self._on_grid_cell_clicked)
         # Double-clicking a grid cell opens it in the single-image view.
@@ -1241,21 +1420,38 @@ class _PreviewDialog(QDialog):
 
     @staticmethod
     def _make_overlay(parent) -> QFrame:
+        # Styled like the main image viewer's focus mode bar.
         overlay = QFrame(parent)
-        overlay.setObjectName('previewOverlay')
-        overlay.setStyleSheet(_OVERLAY_STYLE)
+        overlay.setObjectName('overlayBar')
+        overlay.setStyleSheet(overlay_style_sheet())
         overlay.setCursor(Qt.CursorShape.ArrowCursor)
         # Clicks on the panel itself must not pan the image or pick a cell.
         overlay.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation)
         return overlay
 
     @staticmethod
-    def _make_button(text: str) -> QPushButton:
-        button = QPushButton(text)
+    def _fill_bar(overlay: QFrame, buttons):
+        """Lay ``buttons`` out in a row on ``overlay``, split by thin
+        separators like the focus mode bar."""
+        layout = QHBoxLayout(overlay)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        for position, button in enumerate(buttons):
+            if position:
+                separator = QFrame()
+                separator.setObjectName('overlaySeparator')
+                separator.setFixedWidth(1)
+                layout.addWidget(separator)
+            layout.addWidget(button)
+
+    @staticmethod
+    def _make_button(text: str) -> QToolButton:
+        button = QToolButton()
+        button.setText(text)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
         # Keep keyboard focus off the buttons so the arrow keys, Enter and
         # Esc always reach the viewer's shortcuts.
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        button.setAutoDefault(False)
         return button
 
     # --- Showing images -----------------------------------------------------
@@ -1268,23 +1464,34 @@ class _PreviewDialog(QDialog):
             'variant_grid_cell_cap',
             defaultValue=DEFAULT_SETTINGS['variant_grid_cell_cap'], type=int))
 
-    def _kept_member(self):
-        for radio, member in self.radio_members:
-            if radio is not None and radio.isChecked():
-                return member
-        return None
+    def _kept_members(self) -> list:
+        return [member for keep_box, member in self.keep_box_members
+                if keep_box is not None and keep_box.isChecked()]
+
+    def _update_grid_marks(self):
+        """Dim the grid cells of images that aren't kept, like the main grid
+        dims images without the focused tag. Peek keeps the current cell
+        undimmed; hovering a cell undims it too."""
+        self.viewer.set_grid_peek(True)
+        self.viewer.set_marked_paths(
+            [str(member.path) for member in self._kept_members()])
 
     def _show_current(self, keep_zoom: bool = False):
         """Show the current image, in the single-image or the grid view.
-        With ``keep_zoom`` a zoomed-in view keeps its zoom and position, so
-        the same detail can be compared across the group."""
+        With ``keep_zoom`` the zoom and position carry over, so the same
+        detail can be compared across the group."""
         if self._grid:
+            self._update_grid_marks()
             self.viewer.update_grid_current(self._indices(), self.index,
                                             self._grid_cell_cap())
         else:
             self.viewer.exit_grid()
             index = self.model.index(self.index)
-            if keep_zoom and not self._at_fit_zoom():
+            if keep_zoom:
+                # Unlike load_image, this keeps the previous picture on
+                # screen until the new one is decoded, instead of first
+                # showing a blurry thumbnail placeholder, so small
+                # differences can be compared at fit-to-window zoom too.
                 self.viewer.reload_image(index)
             else:
                 self.viewer.load_image(index)
@@ -1294,8 +1501,8 @@ class _PreviewDialog(QDialog):
         return abs(self.viewer.zoom_factor - 1.0) < 1e-9
 
     def _update_info(self):
-        _radio, member = self.radio_members[self.index]
-        total = len(self.radio_members)
+        _keep_box, member = self.keep_box_members[self.index]
+        total = len(self.keep_box_members)
         self.setWindowTitle(
             f'{member.path}  \u2014  {self.index + 1} of {total}')
         self.name_label.setText(
@@ -1306,10 +1513,11 @@ class _PreviewDialog(QDialog):
             parts.append(f'{width}\u00d7{height}')
         if member.size is not None:
             parts.append(_format_size(member.size))
-        parts.append(_format_modified(member.mtime_ns))
-        kept = self._kept_member()
-        if kept is not None:
-            relation = describe_relation(member, kept)
+        parts.append(_format_date('Created', member.created_ns))
+        parts.append(_format_date('Modified', member.mtime_ns))
+        kept = self._kept_members()
+        if kept and not any(member is other for other in kept):
+            relation = describe_relation(member, closest_keeper(member, kept))
             if relation:
                 parts.append(relation)
         self.details_label.setText('  \u2022  '.join(parts))
@@ -1317,16 +1525,14 @@ class _PreviewDialog(QDialog):
         multiple = total > 1
         self.prev_button.setEnabled(multiple)
         self.next_button.setEnabled(multiple)
-        radio = self.radio_members[self.index][0]
-        if radio is None:
-            self.keep_button.setText('Keep this image (K)')
-            self.keep_button.setEnabled(False)
-        elif radio.isChecked():
-            self.keep_button.setText('\u2713 Keeping this image')
-            self.keep_button.setEnabled(False)
+        keep_box = self.keep_box_members[self.index][0]
+        if keep_box is not None and keep_box.isChecked():
+            self.keep_button.setText('Keeping this image (K)')
+            self.keep_button.setIcon(self._check_mark_icon())
         else:
             self.keep_button.setText('Keep this image (K)')
-            self.keep_button.setEnabled(True)
+            self.keep_button.setIcon(QIcon())
+        self.keep_button.setEnabled(keep_box is not None)
         self.grid_button.setText('Single view (G)' if self._grid
                                  else 'Grid view (G)')
         self.grid_button.setEnabled(multiple or self._grid)
@@ -1334,32 +1540,35 @@ class _PreviewDialog(QDialog):
             'Exit full screen (F11)' if self.isFullScreen()
             else 'Full screen (F11)')
         self._position_overlays()
+        self.current_changed.emit(member)
 
     def _step(self, delta):
-        if len(self.radio_members) < 2:
+        if len(self.keep_box_members) < 2:
             return
-        self.index = (self.index + delta) % len(self.radio_members)
+        self.index = (self.index + delta) % len(self.keep_box_members)
         self._show_current(keep_zoom=True)
-        self._show_overlays()
 
     def _keep_current(self):
-        radio, _member = self.radio_members[self.index]
-        if radio is None or radio.isChecked():
+        """Toggle whether the current image is kept."""
+        keep_box, _member = self.keep_box_members[self.index]
+        if keep_box is None:
             return
-        radio.setChecked(True)
+        keep_box.setChecked(not keep_box.isChecked())
+        if self._grid:
+            self._update_grid_marks()
         self._update_info()
 
     def toggle_grid(self):
-        if not self._grid and len(self.radio_members) < 2:
+        if not self._grid and len(self.keep_box_members) < 2:
             return
         self._grid = not self._grid
         if self._grid:
+            self._update_grid_marks()
             self.viewer.show_grid(self._indices(), self.index,
                                   self._grid_cell_cap())
             self._update_info()
         else:
             self._show_current()
-        self._show_overlays()
 
     def _open_in_single_view(self, row: int):
         self.index = row
@@ -1386,7 +1595,11 @@ class _PreviewDialog(QDialog):
         if self._grid:
             self._open_in_single_view(self.index)
         else:
-            self._keep_current()
+            # Enter only keeps; unkeeping needs K or the button, so a stray
+            # Enter can't drop an image from the keep list.
+            keep_box = self.keep_box_members[self.index][0]
+            if keep_box is not None and not keep_box.isChecked():
+                self._keep_current()
 
     # --- Full screen ----------------------------------------------------------
 
@@ -1403,7 +1616,6 @@ class _PreviewDialog(QDialog):
             self.setAttribute(Qt.WidgetAttribute.WA_Moved, True)
             self.showFullScreen()
         self._update_info()
-        self._show_overlays()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
@@ -1434,34 +1646,29 @@ class _PreviewDialog(QDialog):
         for overlay in self.overlays:
             overlay.raise_()
 
-    def _show_overlays(self):
-        for overlay in self.overlays:
-            overlay.show()
-        self._position_overlays()
-        self.viewer.scroll_area.viewport().unsetCursor()
-        self._hide_timer.start()
-
-    def _hide_overlays_if_idle(self):
-        # Keep the controls while the cursor is on them.
-        if any(overlay.underMouse() for overlay in self.overlays):
-            self._hide_timer.start()
-            return
-        for overlay in self.overlays:
-            overlay.hide()
-        if self.isFullScreen() and not self.viewer.scroll_area.is_dragging:
-            self.viewer.scroll_area.viewport().setCursor(
-                Qt.CursorShape.BlankCursor)
+    def _check_mark_icon(self) -> QIcon:
+        """A green check mark the size of the Keep button's text."""
+        self.keep_button.ensurePolished()
+        metrics = self.keep_button.fontMetrics()
+        ratio = self.devicePixelRatioF()
+        size = QSize(metrics.horizontalAdvance('\u2713'), metrics.height())
+        pixmap = QPixmap(size * ratio)
+        pixmap.setDevicePixelRatio(ratio)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setFont(self.keep_button.font())
+        painter.setPen(QColor(_KEPT_GREEN))
+        painter.drawText(QRect(QPoint(0, 0), size),
+                         Qt.AlignmentFlag.AlignCenter, '\u2713')
+        painter.end()
+        self.keep_button.setIconSize(size)
+        return QIcon(pixmap)
 
     def eventFilter(self, watched, event):
         event_type = event.type()
         if event_type == QEvent.Type.MouseButtonDblClick:
             # Seen before the viewer resets the zoom for the same event.
             self._zoomed_at_double_click = not self._at_fit_zoom()
-        elif event_type == QEvent.Type.MouseMove:
-            if not all(overlay.isVisible() for overlay in self.overlays):
-                self._show_overlays()
-            else:
-                self._hide_timer.start()
         elif (event_type == QEvent.Type.Resize
               and watched is self.viewer.scroll_area.viewport()):
             self._position_overlays()
@@ -1469,7 +1676,7 @@ class _PreviewDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        QTimer.singleShot(0, self._show_overlays)
+        QTimer.singleShot(0, self._position_overlays)
 
 
 class _GroupCards:
@@ -1477,23 +1684,27 @@ class _GroupCards:
 
     Only the first ``_MAX_MEMBERS_PER_GROUP`` images are shown initially; a
     clickable "+N more" tile expands the row to show every image in the group.
-    ``keep_member`` is the image to keep, even when it is hidden.
+    ``keep_members`` are the images to keep (any number, even none), even
+    when they are hidden.
     """
 
     def __init__(self, dialog, group, keep_member):
         self.dialog = dialog
         self.group = group
-        self.keep_member = keep_member
+        self.keep_members = [keep_member]
         self.expanded = False
-        # list of (QRadioButton, member) for the currently shown cards.
-        self.radio_members: list = []
-        # list of (relation QLabel, info QLabel, member) for the shown cards.
+        # The image shown in the large viewer, whose card stays undimmed.
+        self.viewed_member = None
+        # list of (keep QCheckBox, member) for the currently shown cards.
+        self.keep_box_members: list = []
+        # list of (relation QLabel, info QLabel, caption QLabel, member) for
+        # the shown cards.
         self.card_labels: list = []
         self.shown_count = 0
 
-        kind_label = 'Exact duplicates' if group.kind == 'exact' \
-            else 'Near duplicates'
-        self.box = QGroupBox(f'{kind_label} \u2014 {len(group.members)} images')
+        self.kind_label = ('Exact duplicates' if group.kind == 'exact'
+                           else 'Near duplicates')
+        self.box = QGroupBox()
         # Only a title and a divider line, so the images sit directly on the
         # dark results background like in the Images pane.
         self.box.setFlat(True)
@@ -1503,18 +1714,19 @@ class _GroupCards:
         box_layout = QVBoxLayout(self.box)
         box_layout.setContentsMargins(10, 8, 10, 10)
 
-        # "Ignore this group" lets the user protect a whole group: when checked,
-        # none of its images are deleted, moved, or tagged by the action
-        # buttons, and picking a keeper is disabled because it's irrelevant.
-        self.ignore_checkbox = QCheckBox(
-            'Ignore this group (leave all its images untouched)')
-        self.ignore_checkbox.toggled.connect(self._on_ignore_toggled)
         # Only the group's title is bold.
         normal_font = QFont(title_font)
         normal_font.setBold(False)
-        self.ignore_checkbox.setFont(normal_font)
-        _make_indicator_visible(self.ignore_checkbox)
-        box_layout.addWidget(self.ignore_checkbox)
+        buttons_row = QHBoxLayout()
+        self.keep_all_button = QPushButton('Keep all')
+        self.keep_all_button.clicked.connect(self.keep_all)
+        self.keep_none_button = QPushButton('Keep none')
+        self.keep_none_button.clicked.connect(self.keep_none)
+        for button in (self.keep_all_button, self.keep_none_button):
+            button.setFont(normal_font)
+            buttons_row.addWidget(button)
+        buttons_row.addStretch()
+        box_layout.addLayout(buttons_row)
 
         self.cards_scroll = QScrollArea()
         self.cards_scroll.setFont(normal_font)
@@ -1531,20 +1743,8 @@ class _GroupCards:
         box_layout.addWidget(self.cards_scroll)
         self._populate()
 
-    @property
-    def ignored(self) -> bool:
-        return self.ignore_checkbox.isChecked()
-
-    def _on_ignore_toggled(self, ignored: bool):
-        # Dim and disable the thumbnails when the group is ignored so it's
-        # visually obvious it won't be acted on and no keeper can be picked.
-        self.cards_scroll.setEnabled(not ignored)
-
     def _populate(self):
-        button_group = QButtonGroup(self.box)
-        button_group.setExclusive(True)
-        self.button_group = button_group
-        self.radio_members = []
+        self.keep_box_members = []
         self.card_labels = []
         self.cards = []
 
@@ -1556,14 +1756,14 @@ class _GroupCards:
         members = self.group.members
         shown = members if self.expanded else members[:_MAX_MEMBERS_PER_GROUP]
         for position, member in enumerate(shown):
-            card, radio, relation_label, info_label = \
+            card, keep_box, relation_label, info_label, caption_label = \
                 self.dialog._build_card(member, self)
-            radio.setChecked(member is self.keep_member)
-            radio.toggled.connect(
+            keep_box.setChecked(self.is_kept(member))
+            keep_box.toggled.connect(
                 lambda checked, m=member: self._on_keep_toggled(checked, m))
-            button_group.addButton(radio)
-            self.radio_members.append((radio, member))
-            self.card_labels.append((relation_label, info_label, member))
+            self.keep_box_members.append((keep_box, member))
+            self.card_labels.append(
+                (relation_label, info_label, caption_label, member))
             self.cards.append((card, member))
             cards_layout.addWidget(card)
             if self.expanded and position % 20 == 19:
@@ -1590,35 +1790,94 @@ class _GroupCards:
         self.shown_count = len(shown)
         self.update_relations()
 
+    def is_kept(self, member) -> bool:
+        return any(kept is member for kept in self.keep_members)
+
     def _on_keep_toggled(self, checked: bool, member):
-        if checked:
-            self.keep_member = member
-            self.update_relations()
+        if checked and not self.is_kept(member):
+            self.keep_members.append(member)
+        elif not checked:
+            self.keep_members = [kept for kept in self.keep_members
+                                 if kept is not member]
+        self.update_relations()
+
+    def _set_box_checked(self, member, checked: bool):
+        for keep_box, shown in self.keep_box_members:
+            if shown is member:
+                keep_box.blockSignals(True)
+                keep_box.setChecked(checked)
+                keep_box.blockSignals(False)
 
     def update_relations(self):
-        """Refresh the "Kept" / "Differs by N" label on every shown card."""
-        for relation_label, _info_label, member in self.card_labels:
-            text = describe_relation(member, self.keep_member)
-            relation_label.setText(f'<b>{text}</b>' if member
-                                   is self.keep_member else text)
+        """Refresh the title's kept count, the "Kept" / "Differs by N"
+        labels and the card outlines and dimming. Other images are compared
+        with the kept image they most closely match."""
+        kept_count = len(self.keep_members)
+        total = len(self.group.members)
+        self.box.setTitle(f'{self.kind_label} \u2014 {total} images, '
+                          f'{kept_count} kept')
+        for relation_label, _info, _caption, member in self.card_labels:
+            if self.is_kept(member):
+                relation_label.setText('<b>Kept</b>')
+            elif self.keep_members:
+                relation_label.setText(describe_relation(
+                    member, closest_keeper(member, self.keep_members)))
+            else:
+                relation_label.setText(' ')
         for card, member in self.cards:
-            card.set_kept(member is self.keep_member)
+            card.set_kept(self.is_kept(member))
+            card.set_viewed(member is self.viewed_member)
+        self._set_buttons_enabled(kept_count < total, kept_count > 0)
+
+    def _set_buttons_enabled(self, keep_all: bool, keep_none: bool):
+        # Disabling the focused button makes Qt move focus on to the next
+        # widget, and the results scroll area then scrolls to show it. Hand
+        # focus to the other button (which is enabled) first instead.
+        pairs = ((self.keep_all_button, keep_all),
+                 (self.keep_none_button, keep_none))
+        for button, enabled in pairs:
+            if enabled:
+                button.setEnabled(True)
+        for (button, enabled), (other, _) in zip(pairs, reversed(pairs)):
+            if not enabled:
+                if (button is button.window().focusWidget()
+                        and other.isEnabled()):
+                    other.setFocus(Qt.FocusReason.OtherFocusReason)
+                button.setEnabled(False)
+
+    def set_viewed(self, member):
+        """Mark the image shown in the large viewer (None when it closes)."""
+        self.viewed_member = member
+        for card, shown in self.cards:
+            card.set_viewed(shown is member)
 
     def refresh_info(self):
         """Refresh each shown card's details (e.g. its tag count)."""
-        for _relation_label, info_label, member in self.card_labels:
+        for _relation, info_label, caption_label, member in self.card_labels:
             info_label.setText(self.dialog._card_info_text(member))
+            caption_label.setText(self.dialog._card_caption_html(member))
+
+    def _set_keep_members(self, members: list):
+        self.keep_members = list(members)
+        for _keep_box, shown in self.keep_box_members:
+            self._set_box_checked(shown, self.is_kept(shown))
+        self.update_relations()
+
+    def keep_all(self):
+        self._set_keep_members(self.group.members)
+
+    def keep_none(self):
+        self._set_keep_members([])
 
     def set_keep(self, member):
-        """Make `member` the keeper, expanding the group if it is hidden."""
-        if all(shown is not member for _radio, shown in self.radio_members):
-            self.keep_member = member
+        """Make `member` the only kept image, expanding the group if it is
+        hidden."""
+        self.keep_members = [member]
+        if all(shown is not member
+               for _keep_box, shown in self.keep_box_members):
             self.expand()
             return
-        for radio, shown in self.radio_members:
-            if shown is member:
-                radio.setChecked(True)
-                return
+        self._set_keep_members([member])
 
     def expand(self):
         if self.expanded:

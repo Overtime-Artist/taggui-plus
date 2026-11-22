@@ -26,6 +26,7 @@ from dialogs.directory_analytics_dialog import DirectoryAnalyticsDialog
 from dialogs.export_settings_dialog import ExportSettingsDialog
 from dialogs.find_and_replace_dialog import FindAndReplaceDialog
 from dialogs.find_duplicates_dialog import FindDuplicatesDialog
+from dialogs.validation_set_dialog import ValidationSetDialog
 from dialogs.gelbooru_wiki_dialog import GelbooruWikiDialog
 from dialogs.import_settings_preview_dialog import ImportSettingsPreviewDialog
 from dialogs.keyboard_shortcuts_dialog import (KeyboardShortcutsDialog,
@@ -49,6 +50,7 @@ from utils.settings_export_import import (import_settings, load_settings_from_fi
                                           save_settings_to_file)
 from utils.shortcut_remover import ShortcutRemover
 from utils.utils import get_resource_path, pluralize
+from utils.wiki_access import DANBOORU, GELBOORU, is_wiki_enabled
 from widgets.all_tags_editor import AllTagsEditor
 from widgets.auto_captioner import AutoCaptioner
 from widgets.image_list import ImageList
@@ -307,6 +309,7 @@ class MainWindow(QMainWindow):
         self.open_danbooru_wiki_action = QAction('Danbooru Wiki...', parent=self)
         self.open_gelbooru_wiki_action = QAction('Gelbooru Wiki...', parent=self)
         self.create_menus()
+        self.apply_wiki_availability()
         self.app.installEventFilter(self)
 
         self.image_list_selection_model = (self.image_list.list_view
@@ -651,8 +654,8 @@ class MainWindow(QMainWindow):
         self.addActions(self._focus_mode_extra_actions)
         if focus_was_hidden:
             self._focus_image_tags_pane()
-        self.image_viewer.set_focus_overlay_text(
-            self.image_list.image_index_label.text())
+        self._update_focus_navigation_buttons()
+        self._update_focus_caption_button()
         self.image_viewer.set_focus_overlay_enabled(True)
         self.showFullScreen()
 
@@ -705,6 +708,102 @@ class MainWindow(QMainWindow):
                     return_widget.setFocus(Qt.FocusReason.OtherFocusReason)
                 else:
                     self._focus_image_tags_pane()
+
+    def _selected_rows_for_focus_navigation(self) -> list[int]:
+        """Selected rows when ◀ / ▶ should stay inside a multi-selection."""
+        rows = sorted(index.row() for index
+                      in self.image_list.list_view.selectedIndexes())
+        return rows if len(rows) >= 2 else []
+
+    def _step_focus_image(self, direction: int):
+        """◀ / ▶ in the focus mode bar. Like the arrow keys, they move the
+        current image within a multi-image selection (the grid) rather than
+        discarding it; otherwise they go to the previous / next image."""
+        if self._selected_rows_for_focus_navigation():
+            self.image_list.list_view.switch_between_selected_images(direction)
+        elif direction < 0:
+            self.image_list.go_to_previous_image()
+        else:
+            self.image_list.go_to_next_image()
+        self._update_focus_navigation_buttons()
+
+    @Slot()
+    def _update_focus_navigation_buttons(self, *args):
+        """Refresh the focus mode bar's image count and \u25c0 / \u25b6 buttons.
+        Within a multi-image selection (the grid), both count only the
+        selected images."""
+        row = self.image_list_selection_model.currentIndex().row()
+        selected_rows = self._selected_rows_for_focus_navigation()
+        if selected_rows and row in selected_rows:
+            position = selected_rows.index(row)
+            self.image_viewer.set_focus_overlay_text(
+                f'Image {position + 1} / {len(selected_rows)}')
+            self.image_viewer.set_focus_navigation_enabled(
+                position > 0, position < len(selected_rows) - 1)
+            return
+        self.image_viewer.set_focus_overlay_text(
+            self.image_list.image_index_label.text())
+        last_row = self.proxy_image_list_model.rowCount() - 1
+        self.image_viewer.set_focus_navigation_enabled(
+            0 < row, 0 <= row < last_row)
+
+    @Slot()
+    def _update_focus_caption_button(self):
+        """Mirror the Auto-Captioner's Start/Cancel button in the focus mode
+        control bar, which is the only way to see it there."""
+        captioner = self.auto_captioner
+        button = captioner.start_cancel_button
+        if not captioner.is_captioning:
+            self.image_viewer.set_focus_caption_state(
+                'Auto-Caption', button.isEnabled())
+            return
+        if not button.isEnabled():
+            self.image_viewer.set_focus_caption_state(
+                'Canceling\u2026', False)
+            return
+        text = 'Cancel Captioning'
+        progress_bar = captioner.progress_bar
+        progress = None
+        if (not progress_bar.isHidden()
+                and progress_bar.value() >= progress_bar.minimum()):
+            text += f' ({progress_bar.value()}/{progress_bar.maximum()})'
+            if progress_bar.maximum() > progress_bar.minimum():
+                progress = ((progress_bar.value() - progress_bar.minimum())
+                            / (progress_bar.maximum()
+                               - progress_bar.minimum()))
+        self.image_viewer.set_focus_caption_state(
+            text, True, progress)
+
+    @Slot()
+    def _update_focus_caption_highlight(self, *args):
+        """Outline the focus mode bar's caption button while Alt+C has put
+        keyboard focus on the hidden Start button it stands in for."""
+        self.image_viewer.set_focus_caption_highlighted(
+            QApplication.focusWidget()
+            is self.auto_captioner.start_cancel_button)
+
+    @Slot()
+    def _report_focus_mode_caption_error(self):
+        """In focus mode the Auto-Captioner console is hidden, so show a
+        failed run's last console lines in a message box."""
+        captioner = self.auto_captioner
+        thread = captioner.captioning_thread
+        if (not self.is_focus_mode() or thread is None
+                or not thread.is_error or thread.is_canceled
+                # The finish alert already reported it, with the log.
+                or getattr(captioner, '_show_alert_when_finished', False)):
+            return
+        console_lines = captioner.console_text_edit.toPlainText().splitlines()
+        message_box = QMessageBox(self)
+        message_box.setIcon(QMessageBox.Icon.Critical)
+        message_box.setWindowTitle('Auto-Captioning Error')
+        message_box.setText('An error occurred during auto-captioning.')
+        message_box.setInformativeText(
+            'The full log is in the Auto-Captioner console, which is shown '
+            'after leaving focus mode (F11).')
+        if console_lines:
+            message_box.setDetailedText('\n'.join(console_lines[-15:]))
+        message_box.exec()
 
     def _can_return_focus_to(self, widget) -> bool:
         if widget is None:
@@ -1036,6 +1135,7 @@ class MainWindow(QMainWindow):
             self._close_directory_analytics_dialog()
         self.directory_path = new_directory_path
         self.directory_analytics_action.setEnabled(True)
+        self.validation_set_action.setEnabled(True)
         if save_path_to_settings:
             self.settings.setValue('directory_path', str(self.directory_path))
         self.setWindowTitle(path.name)
@@ -1054,6 +1154,7 @@ class MainWindow(QMainWindow):
             self._directory_state_before_load)
         self.directory_path = previous_path
         self.directory_analytics_action.setEnabled(previous_path is not None)
+        self.validation_set_action.setEnabled(previous_path is not None)
         self.setWindowTitle(previous_title)
         if was_saved:
             # Never save an empty path: on the next launch `Path('')` would
@@ -1261,6 +1362,8 @@ class MainWindow(QMainWindow):
         settings_dialog.autocomplete_changed.connect(self.refresh_autocomplete)
         settings_dialog.remove_app_data_requested.connect(
             self.quit_after_removing_app_data)
+        settings_dialog.wiki_availability_changed.connect(
+            self.apply_wiki_availability)
         # Settings that trigger a directory/model scan are applied once on
         # close (by diffing) rather than on every keystroke.
         old_file_formats = self.settings.value(
@@ -1464,6 +1567,7 @@ class MainWindow(QMainWindow):
             ('open_gelbooru_wiki', 'Gelbooru Wiki...', 'Ctrl+G'),
             ('find_duplicates', 'Find Duplicates...', ''),
             ('directory_analytics', 'Directory Analytics...', ''),
+            ('create_validation_set', 'Create Validation Set...', ''),
             ('tag_library', 'Tag Library...', 'Ctrl+L'),
             ('select_all_images', 'Select All Images', 'Ctrl+A'),
             ('mark_complete', 'Mark as Complete', 'Ctrl+K'),
@@ -1515,6 +1619,7 @@ class MainWindow(QMainWindow):
             'open_gelbooru_wiki': self.open_gelbooru_wiki_action,
             'find_duplicates': self.find_duplicates_action,
             'directory_analytics': self.directory_analytics_action,
+            'create_validation_set': self.validation_set_action,
             'tag_library': self.tag_library_action,
             'go_to_previous_image': self.go_to_previous_image_shortcut,
             'go_to_next_image': self.go_to_next_image_shortcut,
@@ -1655,6 +1760,15 @@ class MainWindow(QMainWindow):
         dialog.set_wiki_shortcuts(
             self.open_danbooru_wiki_action.shortcut(),
             self.open_gelbooru_wiki_action.shortcut())
+        dialog.set_wikis_enabled(is_wiki_enabled(DANBOORU),
+                                 is_wiki_enabled(GELBOORU))
+
+    @Slot()
+    def apply_wiki_availability(self):
+        """Show the wiki menu items and shortcuts only for enabled wikis."""
+        self.open_danbooru_wiki_action.setVisible(is_wiki_enabled(DANBOORU))
+        self.open_gelbooru_wiki_action.setVisible(is_wiki_enabled(GELBOORU))
+        self._apply_tag_library_dialog_shortcuts()
 
     @Slot()
     def show_keyboard_shortcuts_dialog(self, parent: QWidget | None = None):
@@ -1770,6 +1884,20 @@ class MainWindow(QMainWindow):
         find_duplicates_dialog.exec()
 
     @Slot()
+    def show_validation_set_dialog(self):
+        if self.directory_path is None:
+            return
+        current_image = self.image_list.list_view.get_current_image()
+        dialog = ValidationSetDialog(
+            parent=self, image_list_model=self.image_list_model,
+            directory_path=self.directory_path,
+            current_image_path=(current_image.path
+                                if current_image is not None else None),
+            reload_callback=self.reload_directory,
+            refresh_callback=self.refresh_changed_image_files)
+        dialog.exec()
+
+    @Slot()
     def show_directory_analytics_dialog(self):
         # Modeless, so the user can keep working while it is open; reuse an
         # open one rather than stacking several.
@@ -1791,7 +1919,7 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
 
         dialog.finished.connect(forget_dialog)
-        dialog.show()
+        dialog.open_after_first_scan()
 
     def _close_directory_analytics_dialog(self):
         if self._directory_analytics_dialog is not None:
@@ -1863,6 +1991,9 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def show_danbooru_wiki_dialog(self, tag: str = ''):
+        # Extra (secondary) shortcuts can still fire while the wiki is off.
+        if not is_wiki_enabled(DANBOORU):
+            return
         in_group_mode = self.image_tags_editor.is_group_mode()
         danbooru_wiki_dialog = DanbooruWikiDialog(
             self, tag if tag.strip() else '',
@@ -1885,6 +2016,8 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def show_gelbooru_wiki_dialog(self, tag: str = ''):
+        if not is_wiki_enabled(GELBOORU):
+            return
         in_group_mode = self.image_tags_editor.is_group_mode()
         gelbooru_wiki_dialog = GelbooruWikiDialog(
             self, tag if tag.strip() else '',
@@ -1994,6 +2127,12 @@ class MainWindow(QMainWindow):
         self.directory_analytics_action.setEnabled(
             self.directory_path is not None)
         tools_menu.addAction(self.directory_analytics_action)
+        self.validation_set_action = QAction('Create Validation Set...',
+                                             parent=self)
+        self.validation_set_action.triggered.connect(
+            self.show_validation_set_dialog)
+        self.validation_set_action.setEnabled(self.directory_path is not None)
+        tools_menu.addAction(self.validation_set_action)
         tools_menu.addSeparator()
         self.tag_library_action = QAction('Tag Library...', parent=self)
         self.tag_library_action.triggered.connect(self.show_tag_library_dialog)
@@ -2095,7 +2234,13 @@ class MainWindow(QMainWindow):
         self.image_list_selection_model.currentChanged.connect(
             self.image_list.update_image_index_label)
         self.image_list.image_index_text_changed.connect(
-            self.image_viewer.set_focus_overlay_text)
+            self._update_focus_navigation_buttons)
+        self.image_list_selection_model.selectionChanged.connect(
+            self._update_focus_navigation_buttons)
+        self.image_viewer.focus_previous_image_requested.connect(
+            lambda: self._step_focus_image(-1))
+        self.image_viewer.focus_next_image_requested.connect(
+            lambda: self._step_focus_image(1))
         self.image_list_selection_model.currentChanged.connect(
             self.image_viewer.load_image)
         self.image_list_selection_model.currentChanged.connect(
@@ -2529,17 +2674,39 @@ class MainWindow(QMainWindow):
                 'Select one or more images in the Images pane first, then try '
                 'again.')
             return
-        is_new_library_tag = not self.tag_library_model.has_tag(tag)
-        # Add the tag to the Tag Library first so the automatic tag-tracking
+        self._add_wiki_tag_to_images(tag, selected_image_indices,
+                                     prompt_parent)
+
+    def _add_wiki_tag_to_images(self, tag: str, image_indices: list,
+                                prompt_parent=None):
+        """Add a wiki tag, plus the tags it implies (following the
+        ``auto_apply_implications`` setting like the other add paths), to the
+        given images as one undo step."""
+        tags_to_add = [tag]
+        apply_mode = get_settings().value(
+            'auto_apply_implications',
+            defaultValue=DEFAULT_SETTINGS['auto_apply_implications'])
+        if isinstance(apply_mode, bool):
+            apply_mode = 'Single image only' if apply_mode else 'Off'
+        allowed = (('Single image only', 'All selected images')
+                   if len(image_indices) == 1 else ('All selected images',))
+        if apply_mode in allowed:
+            tags_to_add += [implied for implied
+                            in self.tag_library_model.get_implied_tags([tag])
+                            if implied != tag]
+        new_library_tags = [tag_to_add for tag_to_add in tags_to_add
+                            if not self.tag_library_model.has_tag(tag_to_add)]
+        # Add the tags to the Tag Library first so the automatic tag-tracking
         # machinery does not also queue its own (main-window-parented) category
         # prompt; we show a dialog-parented prompt below instead.
-        if is_new_library_tag:
-            self.tag_library_model.add_tags([tag])
-        self.image_list_model.add_tags([tag], selected_image_indices)
+        if new_library_tags:
+            self.tag_library_model.add_tags(new_library_tags)
+        self.image_list_model.add_tags(tags_to_add, image_indices)
         self.image_tags_editor.clear_add_tag_box_if_matches(tag)
         self.image_tags_editor.select_last_tag_or_flash()
-        if is_new_library_tag:
-            self.prompt_category_for_new_library_tags([tag], prompt_parent)
+        if new_library_tags:
+            self.prompt_category_for_new_library_tags(new_library_tags,
+                                                      prompt_parent)
 
     def wiki_selected_images_have_tag(self, tag: str):
         """Report whether the currently selected images already contain the
@@ -2577,17 +2744,7 @@ class MainWindow(QMainWindow):
                 prompt_parent or self, 'No Current Image',
                 'There is no current image to add the tag to.')
             return
-        is_new_library_tag = not self.tag_library_model.has_tag(tag)
-        # Add to the Tag Library first so the automatic tag-tracking machinery
-        # does not also queue its own (main-window-parented) category prompt;
-        # a dialog-parented prompt is shown below instead.
-        if is_new_library_tag:
-            self.tag_library_model.add_tags([tag])
-        self.image_list_model.add_tags([tag], [current_index])
-        self.image_tags_editor.clear_add_tag_box_if_matches(tag)
-        self.image_tags_editor.select_last_tag_or_flash()
-        if is_new_library_tag:
-            self.prompt_category_for_new_library_tags([tag], prompt_parent)
+        self._add_wiki_tag_to_images(tag, [current_index], prompt_parent)
 
     def wiki_current_image_has_tag(self, tag: str):
         """Report whether the current grouped-view image already has the wiki
@@ -2823,6 +2980,15 @@ class MainWindow(QMainWindow):
                 self.all_tags_editor.isVisible()))
 
     def connect_auto_captioner_signals(self):
+        self.image_viewer.focus_caption_requested.connect(
+            self.auto_captioner.start_or_cancel_captioning)
+        self.auto_captioner.caption_button_state_changed.connect(
+            self._update_focus_caption_button)
+        self.auto_captioner.captioning_finished.connect(
+            self._report_focus_mode_caption_error)
+        self._update_focus_caption_button()
+        QApplication.instance().focusChanged.connect(
+            self._update_focus_caption_highlight)
         self.auto_captioner.captioning_started.connect(
             self._on_captioning_started)
         self.auto_captioner.captioning_started.connect(

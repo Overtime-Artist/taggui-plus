@@ -46,17 +46,24 @@ Design notes
   the old code did).
 """
 
+import base64
+import hashlib
+import json
 import os
+import re
 import sys
 import threading
+import time
 import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import urlopen as _urllib_urlopen
+from urllib.request import Request, urlopen as _urllib_urlopen
 
 from PySide6.QtCore import (QFile, QIODevice, QObject, Qt, QThread, QTimer,
                             QUrl, Signal, Slot)
 from PySide6.QtWidgets import QApplication
+
+from utils import credentials
 
 # Both the production and beta sites share one Cloudflare zone, so the same
 # clearance applies to any of them. The whole ``*.donmai.us`` zone (including
@@ -71,6 +78,16 @@ _SOLVE_TIMEOUT_MS = 90000
 # Once the ``cf_clearance`` cookie appears, wait briefly for the final
 # navigation/cookies to settle before treating the page as ready.
 _SOLVE_SETTLE_MS = 1500
+# After the user closes the verify window, requests to that host fail at once
+# for this long instead of reopening the window for every queued thumbnail.
+_DISMISS_COOLDOWN_S = 60
+# Hosts whose "/" is an error page (cdn.donmai.us answers it with a 403, and
+# scripts can't run there), so the challenge is solved on the first requested
+# URL instead.
+_HOSTS_WITHOUT_HOME_PAGE = {'cdn.donmai.us'}
+_CHALLENGE_TITLE_PATTERN = re.compile(
+    r'just a moment|attention required|verifying|checking your browser',
+    re.IGNORECASE)
 
 # Name of the shared QtWebEngine profile. Also used by the "Remove app data"
 # cleanup (utils/app_data.py) to locate and delete the on-disk profile folder.
@@ -142,9 +159,14 @@ class _BytesResponse:
         self.status = status
         self.headers = _Headers(content_type)
         self._body = body or b''
+        self._offset = 0
 
-    def read(self):
-        return self._body
+    def read(self, size: int = -1):
+        if size is None or size < 0:
+            return self._body
+        chunk = self._body[self._offset:self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
     def __enter__(self):
         return self
@@ -187,18 +209,20 @@ def _looks_like_challenge(status: int, body: bytes) -> bool:
 
 
 # JavaScript executed inside the cleared Danbooru page to perform one request.
-# ``__RID__`` and ``__URL__`` are substituted per call. The response body is
-# returned (base64-encoded, so binary payloads survive) over the QWebChannel
-# bridge installed as ``window.__tagguiBridge``.
+# ``__RID__``, ``__URL__`` and ``__HEADERS__`` are substituted per call. The
+# response body is returned (base64-encoded, so binary payloads survive) over
+# the QWebChannel bridge installed as ``window.__tagguiBridge``. Chromium drops
+# an ``Authorization`` header if a request is redirected to another origin.
 _FETCH_JS = r'''(function(){
   var rid = "__RID__";
   var url = __URL__;
+  var headers = __HEADERS__;
   function send(status, ct, b64){
     if (window.__tagguiBridge) { window.__tagguiBridge.deliver(rid, status, ct, b64); }
     else { setTimeout(function(){ send(status, ct, b64); }, 50); }
   }
   try {
-    fetch(url, {credentials: 'include'}).then(function(r){
+    fetch(url, {credentials: 'include', headers: headers}).then(function(r){
       var ct = r.headers.get('content-type') || '';
       return r.arrayBuffer().then(function(buf){
         var bytes = new Uint8Array(buf);
@@ -291,6 +315,7 @@ class _OriginSession:
         self.ready = False
         self.solving = False
         self.queued = []
+        self.dismissed_at = None
 
     def ensure_browser(self):
         if self.page is not None:
@@ -370,6 +395,11 @@ class _OriginSession:
         if request['force']:
             self.ready = False
         if not self.ready:
+            if (not self.solving and self.dismissed_at is not None
+                    and time.monotonic() - self.dismissed_at
+                    < _DISMISS_COOLDOWN_S):
+                self._solver._deliver_fail(request['rid'])
+                return
             self.queued.append(request)
             if not self.solving:
                 self.solving = True
@@ -392,13 +422,34 @@ class _OriginSession:
         request_id = request['rid']
         javascript = (_FETCH_JS
                       .replace('__RID__', request_id)
-                      .replace('__URL__', json.dumps(request['url'])))
+                      .replace('__URL__', json.dumps(request['url']))
+                      .replace('__HEADERS__',
+                               json.dumps(request.get('headers') or {})))
         self.page.runJavaScript(javascript)
         # Safety net: if the page never calls back, release the waiter.
         timeout_ms = int(request['timeout'] * 1000) + 5000
         QTimer.singleShot(
             timeout_ms,
             lambda rid=request_id: self._solver._deliver_fail(rid))
+
+    def _load_script_page(self):
+        """Replace the (script-blocking) image document with an empty page
+        that has this origin, so same-origin ``fetch()`` calls can run."""
+        from PySide6.QtCore import QEventLoop
+        loop = QEventLoop()
+        timer = QTimer(self._solver)
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        self.page.loadFinished.connect(loop.quit)
+        timer.start(10000)
+        self.page.setHtml('<!doctype html><html><body></body></html>',
+                          QUrl(self.origin + '/'))
+        loop.exec()
+        timer.stop()
+        try:
+            self.page.loadFinished.disconnect(loop.quit)
+        except Exception:
+            pass
 
     def _solve(self):
         """Clear the challenge for this origin in a modal, always-on-top window.
@@ -488,13 +539,22 @@ class _OriginSession:
         def on_load_finished(ok):
             _log(f'[{self.host}] challenge page navigation finished (ok={ok})')
             # Give the page a moment to run any challenge JS, then inspect it.
-            QTimer.singleShot(
-                400,
-                lambda: self.page.runJavaScript(
-                    _CHALLENGE_PROBE_JS, 0, on_probe_result))
+            QTimer.singleShot(400, probe_page)
+
+        def probe_page():
+            if self.host in _HOSTS_WITHOUT_HOME_PAGE:
+                # The CDN serves images sandboxed, so no script (including
+                # the probe) can run in them. Judge by the title instead: the
+                # challenge always has a recognisable one, an image does not.
+                title = self.page.title() or ''
+                if title and not _CHALLENGE_TITLE_PATTERN.search(title):
+                    mark_cleared()
+                    return
+            self.page.runJavaScript(_CHALLENGE_PROBE_JS, 0, on_probe_result)
 
         def on_window_closed():
             # The user closed the verify window; stop waiting immediately.
+            self.dismissed_at = time.monotonic()
             loop.quit()
 
         cookie_store.cookieAdded.connect(on_cookie_added)
@@ -514,7 +574,10 @@ class _OriginSession:
         reveal_timer.start(4000)
 
         overall_timer.start(_SOLVE_TIMEOUT_MS)
-        self.page.load(QUrl(self.origin + '/'))
+        start_url = self.origin + '/'
+        if self.host in _HOSTS_WITHOUT_HOME_PAGE and self.queued:
+            start_url = self.queued[0]['url']
+        self.page.load(QUrl(start_url))
         loop.exec()
         reveal_timer.stop()
         self.view.hide()
@@ -535,6 +598,8 @@ class _OriginSession:
             pass
 
         self.ready = harvested['ok']
+        if self.ready and self.host in _HOSTS_WITHOUT_HOME_PAGE:
+            self._load_script_page()
         if self.ready:
             _log(f'[{self.host}] cleared Cloudflare challenge; fetching '
                  f'through the browser page')
@@ -576,7 +641,8 @@ class _ChallengeSolver(QObject):
         return self._profile
 
     # --- fetch path (worker side) ------------------------------------------
-    def fetch(self, url: str, timeout: float, force: bool) -> dict:
+    def fetch(self, url: str, timeout: float, force: bool,
+              headers: dict | None = None) -> dict:
         """Called from a worker thread; blocks until the page returns bytes."""
         request_id = uuid.uuid4().hex
         event = threading.Event()
@@ -584,7 +650,7 @@ class _ChallengeSolver(QObject):
         with self._pending_lock:
             self._pending[request_id] = (event, holder)
         request = {'rid': request_id, 'url': url, 'timeout': timeout,
-                   'force': force}
+                   'force': force, 'headers': dict(headers or {})}
         self._fetch_requested.emit(request)
         # The main thread always resolves the request (on success, failure, or
         # one of its safety-net timers), so this wait is only a last-resort
@@ -717,7 +783,165 @@ def cancel_pending_fetches():
         solver.cancel_all()
 
 
-def _try_plain_request(url, timeout):
+def _safe_read(response) -> bytes:
+    try:
+        return response.read() or b''
+    except Exception:
+        return b''
+
+
+def _danbooru_error_message(body: bytes) -> str:
+    try:
+        return str(json.loads(body.decode('utf-8', errors='replace'))
+                   .get('message') or '').strip()
+    except Exception:
+        return ''
+
+
+# --- API key ---------------------------------------------------------------
+# The key is only ever sent to this exact host over HTTPS, and only for API
+# (.json) requests: Danbooru refuses API keys on HTML pages, and the image CDN
+# and any other host must never see it.
+DANBOORU_CREDENTIALS_SITE = 'danbooru'
+_API_HOST = 'danbooru.donmai.us'
+_API_PATH_SUFFIXES = ('.json',)
+
+_auth_lock = threading.Lock()
+# SHA-256 digests (never the key itself) of headers Danbooru rejected with 401
+# this session. A rejected key is not sent again until it is changed.
+_rejected_auth_digests = set()
+_api_key_problem = ''
+
+
+def _auth_digest(auth_header: str) -> str:
+    return hashlib.sha256(auth_header.encode('utf-8')).hexdigest()
+
+
+def _auth_header_for(url: str):
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or '').lower()
+        port = parsed.port
+    except Exception:
+        return None
+    if (parsed.scheme != 'https' or host != _API_HOST
+            or port not in (None, 443)
+            or parsed.username is not None
+            or not parsed.path.lower().endswith(_API_PATH_SUFFIXES)):
+        return None
+    saved = credentials.get_site_credentials(DANBOORU_CREDENTIALS_SITE)
+    if not saved:
+        return None
+    login, api_key = saved
+    token = base64.b64encode(f'{login}:{api_key}'.encode('utf-8'))
+    auth_header = 'Basic ' + token.decode('ascii')
+    with _auth_lock:
+        if _auth_digest(auth_header) in _rejected_auth_digests:
+            return None
+    return auth_header
+
+
+def _set_api_key_problem(message: str):
+    global _api_key_problem
+    with _auth_lock:
+        _api_key_problem = message
+
+
+def _mark_auth_rejected(auth_header: str, danbooru_message: str):
+    global _api_key_problem
+    with _auth_lock:
+        _rejected_auth_digests.add(_auth_digest(auth_header))
+        detail = f' (Danbooru said: "{danbooru_message}")' \
+            if danbooru_message else ''
+        _api_key_problem = (
+            f'Danbooru rejected your API key{detail}, so TagGUI Plus is '
+            f'browsing without it. Check the user name and API key in '
+            f'Settings > Danbooru Wiki.')
+    _log('the saved API key was rejected; continuing without it')
+
+
+def api_key_problem() -> str:
+    """A user-facing explanation if the saved API key was rejected or lacks a
+    permission this session, else an empty string."""
+    with _auth_lock:
+        return _api_key_problem
+
+
+def reset_api_key_state():
+    """Forget earlier rejections, e.g. after the user changes the key."""
+    global _api_key_problem
+    credentials.clear_cache()
+    with _auth_lock:
+        _rejected_auth_digests.clear()
+        _api_key_problem = ''
+
+
+def verify_api_key(timeout=15):
+    """Check the saved API key with Danbooru. Call from a worker thread.
+
+    Returns ``(ok, message)``. ``ok`` is True when Danbooru accepted the key,
+    False when it rejected it, and None when it couldn't be checked."""
+    reset_api_key_state()
+    auth_header = _auth_header_for(f'https://{_API_HOST}/profile.json')
+    if not auth_header:
+        return None, 'No API key is saved.'
+
+    def request(path):
+        try:
+            response = _danbooru_urlopen_once(f'https://{_API_HOST}{path}',
+                                              timeout, auth_header)
+            return getattr(response, 'status', 0), _safe_read(response)
+        except HTTPError as error:
+            return error.code, _safe_read(error)
+        except Exception as exception:
+            return 0, str(exception).encode('utf-8', errors='replace')
+
+    status, body = request('/profile.json')
+    if status == 200:
+        try:
+            profile = json.loads(body.decode('utf-8', errors='replace'))
+        except Exception:
+            profile = {}
+        name = str(profile.get('name') or '').strip()
+        level = str(profile.get('level_string') or '').strip()
+        if name:
+            return True, (f'Signed in as {name}'
+                          + (f' ({level} account).' if level else '.'))
+        return True, 'Danbooru accepted the API key.'
+    if status == 403:
+        # The key may simply not be allowed to read the profile page.
+        status, body = request('/posts.json?limit=1')
+        if status == 200:
+            return True, 'Danbooru accepted the API key.'
+    if status == 401:
+        message = _danbooru_error_message(body)
+        _mark_auth_rejected(auth_header, message)
+        return False, ('Danbooru rejected the API key'
+                       + (f': "{message}"' if message else '.')
+                       + ' Check the user name and API key.')
+    if status == 403:
+        return False, ('Danbooru accepted the key but refused the request. '
+                       'Check the key\'s permissions and IP restrictions on '
+                       'Danbooru.')
+    return None, (f'Couldn\'t reach Danbooru (status {status}). The key is '
+                  f'saved and will be used when Danbooru is reachable.'
+                  if status else
+                  'Couldn\'t reach Danbooru. The key is saved and will be '
+                  'used when Danbooru is reachable.')
+
+
+def _open_plain(url, timeout, auth_header=None):
+    """``urllib`` request, adding the Authorization header when given. It is
+    added as an *unredirected* header, so it is never forwarded if the server
+    redirects the request elsewhere."""
+    if not auth_header:
+        return _urllib_urlopen(url, timeout=timeout)
+    request = Request(url)
+    request.add_unredirected_header('Authorization', auth_header)
+    return _urllib_urlopen(request, timeout=timeout)
+
+
+def _try_plain_request(url, timeout, auth_header=None):
     """Attempt a plain HTTP request.
 
     Returns a response object on success or for a genuine application-level HTTP
@@ -725,7 +949,7 @@ def _try_plain_request(url, timeout):
     request was blocked by a Cloudflare challenge (so the caller should fall
     back to the embedded browser) or a transient network error occurred."""
     try:
-        return _UrllibResponseAdapter(_urllib_urlopen(url, timeout=timeout))
+        return _UrllibResponseAdapter(_open_plain(url, timeout, auth_header))
     except HTTPError as error:
         mitigated = ''
         try:
@@ -773,9 +997,46 @@ def danbooru_urlopen(url, timeout=10):
     tried first; only if Cloudflare actually challenges is the request repeated
     inside the cleared QtWebEngine page (same cookies and TLS fingerprint). This
     means that if Danbooru stops challenging, the embedded browser is never
-    created and behaviour matches the original plain-HTTP app."""
+    created and behaviour matches the original plain-HTTP app.
+
+    When the user has saved a Danbooru API key, it is sent with API requests
+    to ``https://danbooru.donmai.us`` only (see ``_auth_header_for``). If
+    Danbooru rejects it, the request is repeated without it, so the wiki keeps
+    working, and ``api_key_problem()`` explains what went wrong."""
+    auth_header = _auth_header_for(url)
+    if not auth_header:
+        return _danbooru_urlopen_once(url, timeout, None)
+    try:
+        response = _danbooru_urlopen_once(url, timeout, auth_header)
+        status = getattr(response, 'status', 0)
+    except HTTPError as error:
+        if error.code not in (401, 403):
+            raise
+        response = _BytesResponse(error.code, '', _safe_read(error))
+        status = error.code
+    if status not in (401, 403):
+        return response
+    message = _danbooru_error_message(_safe_read(response))
+    try:
+        response.__exit__(None, None, None)
+    except Exception:
+        pass
+    retry = _danbooru_urlopen_once(url, timeout, None)
+    if status == 401:
+        _mark_auth_rejected(auth_header, message)
+    elif getattr(retry, 'status', 0) == 200:
+        _set_api_key_problem(
+            'Your Danbooru API key is missing a permission TagGUI Plus needs, '
+            'so some requests were made without it. Give the key read '
+            'permissions for posts, wiki pages, tags, tag aliases, tag '
+            'implications, media assets and autocomplete, or leave its '
+            'permissions empty.')
+    return retry
+
+
+def _danbooru_urlopen_once(url, timeout, auth_header):
     if not _challenged_host(url):
-        return _UrllibResponseAdapter(_urllib_urlopen(url, timeout=timeout))
+        return _UrllibResponseAdapter(_open_plain(url, timeout, auth_header))
 
     # A worker whose dialog has closed must not start (or retry) a browser
     # fetch: that would keep it busy long after nobody wants the result.
@@ -789,7 +1050,7 @@ def danbooru_urlopen(url, timeout=10):
     # Fast path: until we have actually seen this host challenged, try plain
     # HTTP. If it is not challenged, we return without ever touching the browser.
     if host not in _known_challenged_hosts:
-        plain = _try_plain_request(url, timeout)
+        plain = _try_plain_request(url, timeout, auth_header)
         if plain is not None:
             return plain
         if host:
@@ -801,9 +1062,10 @@ def danbooru_urlopen(url, timeout=10):
     if solver is None:
         _log('challenge solver is not initialized; using a plain urllib '
              'request (challenged endpoints will return 403)')
-        return _UrllibResponseAdapter(_urllib_urlopen(url, timeout=timeout))
+        return _UrllibResponseAdapter(_open_plain(url, timeout, auth_header))
 
-    holder = solver.fetch(url, timeout, force=False)
+    headers = {'Authorization': auth_header} if auth_header else None
+    holder = solver.fetch(url, timeout, force=False, headers=headers)
     status = holder.get('status', 0)
     body = holder.get('body', b'')
 
@@ -811,7 +1073,7 @@ def danbooru_urlopen(url, timeout=10):
         if _current_thread_interrupted():
             raise URLError('request cancelled')
         _log('page fetch was challenged; re-solving the Cloudflare challenge')
-        holder = solver.fetch(url, timeout, force=True)
+        holder = solver.fetch(url, timeout, force=True, headers=headers)
         status = holder.get('status', 0)
         body = holder.get('body', b'')
         if _looks_like_challenge(status, body):
@@ -826,7 +1088,12 @@ def danbooru_urlopen(url, timeout=10):
         # The page machinery produced nothing usable; fall back so the caller
         # still gets a (likely 403) response rather than hanging.
         try:
-            return _UrllibResponseAdapter(_urllib_urlopen(url, timeout=timeout))
+            return _UrllibResponseAdapter(
+                _open_plain(url, timeout, auth_header))
+        except HTTPError as error:
+            if auth_header and error.code in (401, 403):
+                return _BytesResponse(error.code, '', _safe_read(error))
+            return _BytesResponse(0, '', b'')
         except Exception:
             return _BytesResponse(0, '', b'')
 

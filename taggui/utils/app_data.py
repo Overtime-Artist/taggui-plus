@@ -9,6 +9,7 @@ deletes that leftover data:
 * the on-disk cache folder (thumbnails plus every ``*_cache.json`` file); the
   whole ``<cache>/taggui`` folder is removed, which is future-proof against new
   cache files being added there
+* website logins (API keys) saved in the operating system's password store
 * optionally the downloaded captioning models (a custom models directory and/or
   the shared Hugging Face cache)
 
@@ -22,7 +23,10 @@ from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
 
-from utils.danbooru_session import DANBOORU_PROFILE_NAME
+from utils import credentials
+from utils.danbooru_session import (DANBOORU_CREDENTIALS_SITE,
+                                    DANBOORU_PROFILE_NAME)
+from utils.gelbooru_session import GELBOORU_CREDENTIALS_SITE
 from utils.scan_cache import _get_cache_dir
 from utils.settings import DEFAULT_SETTINGS, get_settings
 
@@ -261,3 +265,23 @@ def remove_settings() -> bool:
         return True
     except Exception:
         return False
+
+
+# Sites whose logins (API keys) can be saved in the OS password store.
+SAVED_LOGIN_SITES = {DANBOORU_CREDENTIALS_SITE: 'Danbooru',
+                     GELBOORU_CREDENTIALS_SITE: 'Gelbooru'}
+
+
+def get_saved_login_site_names() -> list[str]:
+    """Display names of the sites with a login saved in the password store."""
+    return [name for site, name in SAVED_LOGIN_SITES.items()
+            if credentials.has_site_credentials(site)]
+
+
+def remove_saved_logins() -> bool:
+    """Delete every saved website login from the OS password store."""
+    ok = True
+    for site in SAVED_LOGIN_SITES:
+        if not credentials.delete_site_credentials(site):
+            ok = False
+    return ok

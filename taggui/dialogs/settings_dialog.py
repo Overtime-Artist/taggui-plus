@@ -1,6 +1,6 @@
 import sys
 
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QGridLayout, QLabel,
                                QLineEdit, QMessageBox, QPushButton, QScrollArea,
@@ -10,6 +10,16 @@ from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QGridLayout, 
 from models.tag_library_model import TagLibraryModel
 from auto_captioning.models_list import MODELS
 from dialogs.remove_app_data_dialog import RemoveAppDataDialog
+from dialogs.wiki_dialog_base import park_running_threads
+from utils import credentials
+from utils.danbooru_session import (DANBOORU_CREDENTIALS_SITE,
+                                    initialize_on_main_thread,
+                                    reset_api_key_state, verify_api_key)
+from utils.gelbooru_session import (
+    GELBOORU_ACCOUNT_OPTIONS_URL, GELBOORU_CREDENTIALS_SITE,
+    parse_api_key_text as parse_gelbooru_api_key_text,
+    reset_api_key_state as reset_gelbooru_api_key_state,
+    verify_api_key as verify_gelbooru_api_key)
 from utils.enums import ThemeMode
 from utils.settings_export_import import (EXPORT_CATEGORIES,
                                           backup_all_settings)
@@ -20,6 +30,34 @@ from utils.settings_widgets import (SettingsBigCheckBox, SettingsComboBox,
                                     FocusedScrollSettingsComboBox,
                                     FocusedScrollSettingsSpinBox)
 from utils.thumbnail_cache import clear_cache, get_cache_size_bytes
+from utils.big_widgets import BigCheckBox
+from utils.wiki_access import (DANBOORU, GELBOORU, WIKI_SITE_NAMES,
+                               confirm_enable_wiki, is_wiki_enabled,
+                               set_wiki_enabled)
+
+
+class _DanbooruKeyCheckThread(QThread):
+    """Checks the saved Danbooru API key off the GUI thread."""
+    checked = Signal(object, str)
+
+    def run(self):
+        try:
+            ok, message = verify_api_key()
+        except Exception as exception:
+            ok, message = None, f'Couldn\'t check the key: {exception}'
+        self.checked.emit(ok, message)
+
+
+class _GelbooruKeyCheckThread(QThread):
+    """Checks the saved Gelbooru API key off the GUI thread."""
+    checked = Signal(object, str)
+
+    def run(self):
+        try:
+            ok, message = verify_gelbooru_api_key()
+        except Exception as exception:
+            ok, message = None, f'Couldn\'t check the key: {exception}'
+        self.checked.emit(ok, message)
 
 
 class IsolatedScrollArea(QScrollArea):
@@ -128,6 +166,7 @@ class SettingsDialog(QDialog):
     tag_separator_changed = Signal()
     autocomplete_changed = Signal()
     remove_app_data_requested = Signal()
+    wiki_availability_changed = Signal()
 
     def __init__(self, parent, tag_library_model: TagLibraryModel,
                  dialog_font: QFont | None = None):
@@ -381,25 +420,11 @@ class SettingsDialog(QDialog):
         show_grid_overlay_check_box = SettingsBigCheckBox(
             key='variant_grid_overlay_show',
             default=DEFAULT_SETTINGS['variant_grid_overlay_show'])
-        grid_overlay_font_size_label = QLabel(
-            'Grid page/count overlay text size (pt)')
+        grid_overlay_font_size_label = QLabel('Overlay text size (pt)')
         grid_overlay_transparency_label = QLabel(
-            'Grid page/count overlay background transparency (%)')
-
-        def update_grid_overlay_sub_settings_enabled(checked: bool):
-            # Grey out the overlay appearance controls when the overlay is off.
-            grid_overlay_font_size_spin_box.setEnabled(checked)
-            grid_overlay_transparency_spin_box.setEnabled(checked)
-            grid_overlay_font_size_label.setEnabled(checked)
-            grid_overlay_transparency_label.setEnabled(checked)
-
-        update_grid_overlay_sub_settings_enabled(
-            show_grid_overlay_check_box.isChecked())
+            'Overlay background transparency (%)')
         show_grid_overlay_check_box.stateChanged.connect(
-            lambda _: (
-                update_grid_overlay_sub_settings_enabled(
-                    show_grid_overlay_check_box.isChecked()),
-                self.variant_grid_overlay_settings_changed.emit()))
+            lambda _: self.variant_grid_overlay_settings_changed.emit())
 
         grid_layout.addWidget(QLabel('Show grid page/count overlay'), row, 0,
                               Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
@@ -679,6 +704,13 @@ class SettingsDialog(QDialog):
         grid_layout.addWidget(self.auto_apply_implications_combo_box, row, 1,
                             Qt.AlignmentFlag.AlignLeft)
 
+        # Danbooru Wiki (on/off + account)
+        self.wiki_enable_check_boxes = {}
+        self._build_danbooru_account_section(add_section('Danbooru Wiki'))
+
+        # Gelbooru Wiki (on/off + account)
+        self._build_gelbooru_account_section(add_section('Gelbooru Wiki'))
+
         # External Tools
         grid_layout = add_section('External Tools')
         row = 0
@@ -771,13 +803,350 @@ class SettingsDialog(QDialog):
         self.warning_label.setText(self.restart_warning)
         self.warning_label.show()
 
+    def _add_wiki_enable_row(self, grid_layout, site: str) -> int:
+        """Add the "Enable ... Wiki" toggle as row 0; returns the next row.
+        Turning it on asks for confirmation (third-party / NSFW content)."""
+        check_box = BigCheckBox()
+        check_box.setChecked(is_wiki_enabled(site))
+        check_box.toggled.connect(
+            lambda checked: self._on_wiki_enable_toggled(site, check_box,
+                                                         checked))
+        self.wiki_enable_check_boxes[site] = check_box
+        grid_layout.addWidget(QLabel(f'Enable {WIKI_SITE_NAMES[site]} Wiki'),
+                              0, 0, Qt.AlignmentFlag.AlignRight
+                              | Qt.AlignmentFlag.AlignTop)
+        grid_layout.addWidget(check_box, 0, 1, Qt.AlignmentFlag.AlignLeft)
+        return 1
+
+    def _on_wiki_enable_toggled(self, site: str, check_box, checked: bool):
+        if checked and not confirm_enable_wiki(self, site):
+            check_box.blockSignals(True)
+            check_box.setChecked(False)
+            check_box.blockSignals(False)
+            return
+        set_wiki_enabled(site, checked)
+        self.wiki_availability_changed.emit()
+
+    def _build_danbooru_account_section(self, grid_layout):
+        """User name + API key, kept in the OS password store (never in
+        QSettings). The saved key is never shown again or put back into the
+        field."""
+        self._danbooru_check_thread = None
+        row = self._add_wiki_enable_row(grid_layout, DANBOORU)
+        self.danbooru_login_line_edit = QLineEdit()
+        self.danbooru_login_line_edit.setPlaceholderText('Your Danbooru user name')
+        self.danbooru_api_key_line_edit = QLineEdit()
+        self.danbooru_api_key_line_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.danbooru_api_key_line_edit.setInputMethodHints(
+            Qt.InputMethodHint.ImhHiddenText
+            | Qt.InputMethodHint.ImhSensitiveData
+            | Qt.InputMethodHint.ImhNoPredictiveText)
+        self.danbooru_api_key_line_edit.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.NoContextMenu)
+        grid_layout.addWidget(QLabel('User name'), row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid_layout.addWidget(self.danbooru_login_line_edit, row, 1)
+        row += 1
+        grid_layout.addWidget(QLabel('API key'), row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid_layout.addWidget(self.danbooru_api_key_line_edit, row, 1)
+        row += 1
+
+        self.danbooru_save_button = QPushButton('Save and Test')
+        self.danbooru_save_button.setAutoDefault(False)
+        self.danbooru_save_button.clicked.connect(self._save_danbooru_account)
+        self.danbooru_remove_button = QPushButton('Remove')
+        self.danbooru_remove_button.setAutoDefault(False)
+        self.danbooru_remove_button.clicked.connect(
+            self._remove_danbooru_account)
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.danbooru_save_button)
+        buttons_layout.addWidget(self.danbooru_remove_button)
+        buttons_layout.addStretch()
+        grid_layout.addLayout(buttons_layout, row, 1)
+        row += 1
+
+        self.danbooru_account_status_label = QLabel()
+        self.danbooru_account_status_label.setWordWrap(True)
+        grid_layout.addWidget(self.danbooru_account_status_label, row, 1)
+        row += 1
+
+        help_label = QLabel(
+            'Optional. Signing in lets the Danbooru wiki use your account\'s '
+            'limits (e.g. searching more tags at once). Create a key at '
+            '<a href="https://danbooru.donmai.us/api_keys">'
+            'danbooru.donmai.us/api_keys</a>. For safety, give it only read '
+            'permissions (posts, wiki pages, tags, tag aliases, tag '
+            'implications, media assets, autocomplete and users:profile). '
+            'The key is only sent to danbooru.donmai.us over HTTPS.')
+        help_label.setWordWrap(True)
+        help_label.setOpenExternalLinks(True)
+        help_label.setTextFormat(Qt.TextFormat.RichText)
+        help_font = QFont()
+        help_font.setPointSize(9)
+        help_label.setFont(help_font)
+        grid_layout.addWidget(help_label, row, 1)
+
+        self._refresh_danbooru_account_state()
+
+    def _refresh_danbooru_account_state(self, status: str = ''):
+        available = credentials.is_store_available()
+        saved = (credentials.get_site_credentials(DANBOORU_CREDENTIALS_SITE)
+                 if available else None)
+        checking = self._danbooru_check_thread is not None
+        for widget in (self.danbooru_login_line_edit,
+                       self.danbooru_api_key_line_edit):
+            widget.setEnabled(available and not checking)
+        self.danbooru_save_button.setEnabled(available and not checking)
+        self.danbooru_remove_button.setEnabled(bool(saved) and not checking)
+        if saved:
+            self.danbooru_login_line_edit.setText(saved[0])
+            self.danbooru_api_key_line_edit.setPlaceholderText(
+                'Saved (hidden). Enter a new key to replace it.')
+        else:
+            self.danbooru_api_key_line_edit.setPlaceholderText(
+                'Paste your API key')
+        if not status:
+            if not available:
+                status = ('No secure password store is available on this '
+                          'computer, so an API key can\'t be saved.')
+                if sys.platform.startswith('linux'):
+                    status += (' Install and unlock a keyring service such '
+                               'as GNOME Keyring or KWallet.')
+            elif saved:
+                status = f'An API key is saved in {credentials.store_name()}.'
+            else:
+                status = 'Not signed in.'
+        self.danbooru_account_status_label.setText(status)
+
+    @Slot()
+    def _save_danbooru_account(self):
+        login = self.danbooru_login_line_edit.text().strip()
+        api_key = self.danbooru_api_key_line_edit.text().strip()
+        saved = credentials.get_site_credentials(DANBOORU_CREDENTIALS_SITE)
+        if not api_key and saved:
+            api_key = saved[1]
+        if not login or not api_key:
+            self._refresh_danbooru_account_state(
+                'Enter both your user name and API key.')
+            return
+        try:
+            credentials.set_site_credentials(
+                DANBOORU_CREDENTIALS_SITE, login, api_key)
+        except Exception as exception:
+            self._refresh_danbooru_account_state(
+                f'The API key could not be saved: {exception}')
+            return
+        self.danbooru_api_key_line_edit.clear()
+        reset_api_key_state()
+        initialize_on_main_thread()
+        thread = _DanbooruKeyCheckThread()
+        thread.checked.connect(self._on_danbooru_key_checked)
+        self._danbooru_check_thread = thread
+        self._refresh_danbooru_account_state('Saved. Checking with Danbooru\u2026')
+        thread.start()
+
+    @Slot(object, str)
+    def _on_danbooru_key_checked(self, ok, message):
+        thread = self._danbooru_check_thread
+        self._danbooru_check_thread = None
+        if thread is not None:
+            # Keeps it alive until run() has fully returned.
+            park_running_threads([thread])
+        if ok is True:
+            message = f'\u2714 {message}'
+        elif ok is False:
+            message = f'\u2716 {message}'
+        self._refresh_danbooru_account_state(message)
+
+    @Slot()
+    def _remove_danbooru_account(self):
+        removed = credentials.delete_site_credentials(DANBOORU_CREDENTIALS_SITE)
+        reset_api_key_state()
+        self.danbooru_api_key_line_edit.clear()
+        if removed:
+            self.danbooru_login_line_edit.clear()
+            self._refresh_danbooru_account_state(
+                'Removed from this computer. To fully revoke it, delete the '
+                'key on danbooru.donmai.us/api_keys.')
+        else:
+            self._refresh_danbooru_account_state(
+                'The API key could not be removed from the password store.')
+
+    def _build_gelbooru_account_section(self, grid_layout):
+        """User ID + API key, kept in the OS password store like Danbooru's.
+        Pasting Gelbooru's whole "&api_key=...&user_id=..." text into the
+        key field fills in both."""
+        self._gelbooru_check_thread = None
+        row = self._add_wiki_enable_row(grid_layout, GELBOORU)
+        self.gelbooru_user_id_line_edit = QLineEdit()
+        self.gelbooru_user_id_line_edit.setPlaceholderText(
+            'Your Gelbooru user ID (a number)')
+        self.gelbooru_api_key_line_edit = QLineEdit()
+        self.gelbooru_api_key_line_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gelbooru_api_key_line_edit.setInputMethodHints(
+            Qt.InputMethodHint.ImhHiddenText
+            | Qt.InputMethodHint.ImhSensitiveData
+            | Qt.InputMethodHint.ImhNoPredictiveText)
+        self.gelbooru_api_key_line_edit.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.NoContextMenu)
+        self.gelbooru_api_key_line_edit.textChanged.connect(
+            self._split_pasted_gelbooru_key)
+        grid_layout.addWidget(QLabel('User ID'), row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid_layout.addWidget(self.gelbooru_user_id_line_edit, row, 1)
+        row += 1
+        grid_layout.addWidget(QLabel('API key'), row, 0,
+                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid_layout.addWidget(self.gelbooru_api_key_line_edit, row, 1)
+        row += 1
+
+        self.gelbooru_save_button = QPushButton('Save and Test')
+        self.gelbooru_save_button.setAutoDefault(False)
+        self.gelbooru_save_button.clicked.connect(self._save_gelbooru_account)
+        self.gelbooru_remove_button = QPushButton('Remove')
+        self.gelbooru_remove_button.setAutoDefault(False)
+        self.gelbooru_remove_button.clicked.connect(
+            self._remove_gelbooru_account)
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.gelbooru_save_button)
+        buttons_layout.addWidget(self.gelbooru_remove_button)
+        buttons_layout.addStretch()
+        grid_layout.addLayout(buttons_layout, row, 1)
+        row += 1
+
+        self.gelbooru_account_status_label = QLabel()
+        self.gelbooru_account_status_label.setWordWrap(True)
+        grid_layout.addWidget(self.gelbooru_account_status_label, row, 1)
+        row += 1
+
+        help_label = QLabel(
+            'Optional. Without a key the Gelbooru wiki reads the Gelbooru '
+            'web pages; with one it uses the faster Gelbooru API. Find your '
+            'key under "API Access Credentials" on '
+            f'<a href="{GELBOORU_ACCOUNT_OPTIONS_URL}">your Gelbooru account '
+            'options</a> and paste the whole line (it fills in both fields). '
+            'The key is only sent to gelbooru.com over HTTPS.')
+        help_label.setWordWrap(True)
+        help_label.setOpenExternalLinks(True)
+        help_label.setTextFormat(Qt.TextFormat.RichText)
+        help_font = QFont()
+        help_font.setPointSize(9)
+        help_label.setFont(help_font)
+        grid_layout.addWidget(help_label, row, 1)
+
+        self._refresh_gelbooru_account_state()
+
+    @Slot(str)
+    def _split_pasted_gelbooru_key(self, text: str):
+        if 'api_key=' not in text:
+            return
+        user_id, api_key = parse_gelbooru_api_key_text(text)
+        if user_id:
+            self.gelbooru_user_id_line_edit.setText(user_id)
+        self.gelbooru_api_key_line_edit.setText(api_key)
+
+    def _refresh_gelbooru_account_state(self, status: str = ''):
+        available = credentials.is_store_available()
+        saved = (credentials.get_site_credentials(GELBOORU_CREDENTIALS_SITE)
+                 if available else None)
+        checking = self._gelbooru_check_thread is not None
+        for widget in (self.gelbooru_user_id_line_edit,
+                       self.gelbooru_api_key_line_edit):
+            widget.setEnabled(available and not checking)
+        self.gelbooru_save_button.setEnabled(available and not checking)
+        self.gelbooru_remove_button.setEnabled(bool(saved) and not checking)
+        if saved:
+            self.gelbooru_user_id_line_edit.setText(saved[0])
+            self.gelbooru_api_key_line_edit.setPlaceholderText(
+                'Saved (hidden). Enter a new key to replace it.')
+        else:
+            self.gelbooru_api_key_line_edit.setPlaceholderText(
+                'Paste your API key')
+        if not status:
+            if not available:
+                status = ('No secure password store is available on this '
+                          'computer, so an API key can\'t be saved.')
+            elif saved:
+                status = f'An API key is saved in {credentials.store_name()}.'
+            else:
+                status = 'Not signed in.'
+        self.gelbooru_account_status_label.setText(status)
+
+    @Slot()
+    def _save_gelbooru_account(self):
+        user_id = self.gelbooru_user_id_line_edit.text().strip()
+        api_key = self.gelbooru_api_key_line_edit.text().strip()
+        saved = credentials.get_site_credentials(GELBOORU_CREDENTIALS_SITE)
+        if not api_key and saved:
+            api_key = saved[1]
+        if not user_id or not api_key:
+            self._refresh_gelbooru_account_state(
+                'Enter both your user ID and API key.')
+            return
+        if not user_id.isdigit():
+            self._refresh_gelbooru_account_state(
+                'The user ID is a number (shown with your API key on the '
+                'account options page), not your user name.')
+            return
+        try:
+            credentials.set_site_credentials(
+                GELBOORU_CREDENTIALS_SITE, user_id, api_key)
+        except Exception as exception:
+            self._refresh_gelbooru_account_state(
+                f'The API key could not be saved: {exception}')
+            return
+        self.gelbooru_api_key_line_edit.clear()
+        reset_gelbooru_api_key_state()
+        thread = _GelbooruKeyCheckThread()
+        thread.checked.connect(self._on_gelbooru_key_checked)
+        self._gelbooru_check_thread = thread
+        self._refresh_gelbooru_account_state('Saved. Checking with Gelbooru\u2026')
+        thread.start()
+
+    @Slot(object, str)
+    def _on_gelbooru_key_checked(self, ok, message):
+        thread = self._gelbooru_check_thread
+        self._gelbooru_check_thread = None
+        if thread is not None:
+            park_running_threads([thread])
+        if ok is True:
+            message = f'\u2714 {message}'
+        elif ok is False:
+            message = f'\u2716 {message}'
+        self._refresh_gelbooru_account_state(message)
+
+    @Slot()
+    def _remove_gelbooru_account(self):
+        removed = credentials.delete_site_credentials(GELBOORU_CREDENTIALS_SITE)
+        reset_gelbooru_api_key_state()
+        self.gelbooru_api_key_line_edit.clear()
+        if removed:
+            self.gelbooru_user_id_line_edit.clear()
+            self._refresh_gelbooru_account_state(
+                'Removed from this computer. To fully revoke it, use "Generate '
+                'New Key" on your Gelbooru account options page.')
+        else:
+            self._refresh_gelbooru_account_state(
+                'The API key could not be removed from the password store.')
+
+    def done(self, result):
+        threads = [self._danbooru_check_thread, self._gelbooru_check_thread]
+        self._danbooru_check_thread = None
+        self._gelbooru_check_thread = None
+        threads = [thread for thread in threads if thread is not None]
+        if threads:
+            park_running_threads(threads)
+        super().done(result)
+
     @Slot()
     def refresh_theme_sensitive_controls(self):
         for check_box in (self.insert_space_after_tag_separator_check_box,
                           self.autocomplete_tags_check_box,
                           self.disable_new_tag_auto_select_check_box,
                           self.ask_before_removing_tag_library_tags_check_box,
-                          self.ask_before_assigning_new_tag_category_check_box):
+                          self.ask_before_assigning_new_tag_category_check_box,
+                          *self.wiki_enable_check_boxes.values()):
             check_box.style().unpolish(check_box)
             check_box.style().polish(check_box)
             check_box.update()
@@ -892,7 +1261,9 @@ class SettingsDialog(QDialog):
         """Show the Remove app data dialog. If the user confirms and data is
         deleted, ask the main window to quit terminally so nothing is rewritten
         during shutdown."""
-        dialog = RemoveAppDataDialog(parent=self, dialog_font=self.font())
+        dialog = RemoveAppDataDialog(
+            parent=self, dialog_font=self.font(),
+            loaded_directory=getattr(self.parent(), 'directory_path', None))
         parent = self.parent()
         if hasattr(parent, 'apply_dialog_title_bar_theme'):
             parent.apply_dialog_title_bar_theme(dialog)

@@ -5,9 +5,10 @@ from pathlib import Path
 from PySide6.QtCore import (QEvent, QModelIndex, QObject, QPoint, QRect,
                              QRunnable, QSize, Qt, QThreadPool, QTimer, Signal,
                              Slot)
-from PySide6.QtGui import (QIcon, QImage, QImageReader, QPainter,
+from PySide6.QtGui import (QColor, QIcon, QImage, QImageReader, QPainter,
                            QPalette, QPen, QPixmap)
-from PySide6.QtWidgets import (QApplication, QLabel, QScrollArea, QSizePolicy,
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
+                               QScrollArea, QSizePolicy, QToolButton,
                                QVBoxLayout, QWidget)
 
 from models.proxy_image_list_model import ProxyImageListModel
@@ -47,6 +48,51 @@ GRID_DIM_OPACITY = 0.28
 # While decoding a page of grid cells, hand finished cells to the GUI at most
 # this often so the grid sharpens progressively instead of all at once.
 GRID_PARTIAL_EMIT_SECONDS = 0.4
+
+
+def transparency_to_alpha(transparency: int) -> int:
+    """Map a transparency percentage (0-100) to an alpha value (0-255).
+
+    Mirrors the resolution badge: 0% transparency -> fully opaque (255),
+    100% transparency -> fully transparent (0).
+    """
+    clamped = max(0, min(int(transparency), 100))
+    return round(255 * (100 - clamped) / 100)
+
+
+def overlay_style_sheet() -> str:
+    """Style sheet for the dark control bars overlaid on images (the grid
+    page bar, the focus mode bar and the Find Duplicates large viewer),
+    using the overlay text size and transparency settings. Bars are QFrames
+    named ``overlayBar`` holding QLabels and QToolButtons, optionally split
+    by 1px-wide QFrames named ``overlaySeparator``; a QLabel named
+    ``overlayTitle`` is bold."""
+    settings = get_settings()
+    font_size = max(1, settings.value(
+        'variant_grid_overlay_font_size',
+        defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_font_size'],
+        type=int))
+    alpha = transparency_to_alpha(settings.value(
+        'variant_grid_overlay_transparency',
+        defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_transparency'],
+        type=int))
+    background = (f'background-color: rgba(0, 0, 0, {alpha}); '
+                  f'border-radius: 6px;')
+    text = (f'color: rgba(255, 255, 255, 220); '
+            f'font-size: {font_size}pt;')
+    return (
+        f'QFrame#overlayBar {{ {background} }}'
+        f'QFrame#overlaySeparator {{ background-color: '
+        f'rgba(255, 255, 255, 60); margin: 5px 0; }}'
+        f'QLabel {{ background: transparent; {text} padding: 3px 8px; }}'
+        f'QLabel#overlayTitle {{ font-weight: bold; }}'
+        f'QToolButton {{ background: transparent; border: none; '
+        f'border-radius: 6px; {text} padding: 3px 8px; }}'
+        f'QToolButton:hover {{ background-color: '
+        f'rgba(255, 255, 255, 50); }}'
+        f'QToolButton:pressed {{ background-color: '
+        f'rgba(255, 255, 255, 90); }}'
+        f'QToolButton:disabled {{ color: rgba(255, 255, 255, 70); }}')
 
 
 class _ImageFileLoader(QObject, QRunnable):
@@ -340,6 +386,56 @@ class ImageScrollArea(QScrollArea):
         return super().eventFilter(obj, event)
 
 
+class _FocusCaptionButton(QToolButton):
+    """The focus mode bar's auto-caption button. While several images are
+    being captioned it fills up from the left like the Auto-Captioner's
+    progress bar, and it is outlined while the Alt+C shortcut has put
+    keyboard focus on the (hidden) Start button it stands in for."""
+
+    def __init__(self):
+        super().__init__()
+        self._progress: float | None = None
+        self._shortcut_highlighted = False
+
+    def set_progress(self, progress: float | None):
+        if progress is not None:
+            progress = max(0.0, min(float(progress), 1.0))
+        if progress != self._progress:
+            self._progress = progress
+            self.update()
+
+    def set_shortcut_highlighted(self, highlighted: bool):
+        if highlighted != self._shortcut_highlighted:
+            self._shortcut_highlighted = highlighted
+            self.update()
+
+    def paintEvent(self, event):
+        highlight = QApplication.palette().color(QPalette.ColorRole.Highlight)
+        radius = 6
+        if self._progress:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            fill = QColor(highlight)
+            fill.setAlpha(190)
+            painter.setBrush(fill)
+            # Clip to the filled width so the rounded corners stay intact.
+            painter.setClipRect(QRect(0, 0, round(self.width()
+                                                  * self._progress),
+                                      self.height()))
+            painter.drawRoundedRect(self.rect(), radius, radius)
+            painter.end()
+        super().paintEvent(event)
+        if self._shortcut_highlighted:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(highlight, 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1),
+                                    radius - 1, radius - 1)
+            painter.end()
+
+
 class ImageViewer(QWidget):
     clicked = Signal()
     # Emitted when a grid cell is clicked (not dragged), carrying the proxy
@@ -355,6 +451,11 @@ class ImageViewer(QWidget):
     # Emitted on a right click over the single-image preview (not the grid),
     # carrying the global screen position where a context menu should appear.
     image_context_menu_requested = Signal(QPoint)
+    # Clicks on the focus mode control bar (bottom-right): previous / next
+    # image and start or cancel auto-captioning.
+    focus_previous_image_requested = Signal()
+    focus_next_image_requested = Signal()
+    focus_caption_requested = Signal()
 
     def __init__(self, proxy_image_list_model: ProxyImageListModel):
         super().__init__()
@@ -402,21 +503,59 @@ class ImageViewer(QWidget):
         # to the viewport so it stays put regardless of zoom or scroll. Its
         # appearance (visibility, text size, background transparency) is
         # controlled by settings and applied via refresh_grid_overlay_style().
-        self._grid_overlay_label = QLabel(self.scroll_area.viewport())
+        # When the grid has several pages, the overlay also gets previous/next
+        # page buttons. The buttons stay even if the page/count text is turned
+        # off in Settings, so mouse users can always change page.
+        self._grid_overlay = QFrame(self.scroll_area.viewport())
+        self._grid_overlay.setObjectName('overlayBar')
+        # Clicks and wheel turns on the overlay must not reach the viewport,
+        # where they would select a cell, start a pan or zoom.
+        self._grid_overlay.setAttribute(
+            Qt.WidgetAttribute.WA_NoMousePropagation)
+        overlay_layout = QHBoxLayout(self._grid_overlay)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.setSpacing(0)
+        self._grid_previous_page_button = self._make_overlay_button(
+            '\u25c0', lambda: self.go_to_grid_page(-1))
+        self._grid_overlay_label = QLabel()
+        self._grid_next_page_button = self._make_overlay_button(
+            '\u25b6', lambda: self.go_to_grid_page(1))
+        overlay_layout.addWidget(self._grid_previous_page_button)
+        overlay_layout.addWidget(self._grid_overlay_label)
+        overlay_layout.addWidget(self._grid_next_page_button)
+        self._grid_overlay.hide()
         self._grid_overlay_show = True
-        self._grid_overlay_font_size = DEFAULT_SETTINGS[
-            'variant_grid_overlay_font_size']
-        self._grid_overlay_background_alpha = self._transparency_to_alpha(
-            DEFAULT_SETTINGS['variant_grid_overlay_transparency'])
         self._grid_overlay_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._grid_overlay_label.hide()
-        # Image-count overlay (bottom-right), shown only in focus mode, where
-        # the Images pane and its "Image N / M" label are hidden.
-        self._focus_overlay_label = QLabel(self.scroll_area.viewport())
+        # Control bar (bottom-right), shown only in focus mode, where the
+        # Images and Auto-Captioner panes are hidden: previous / next image
+        # buttons around the "Image N / M" label, and an auto-caption button.
+        self._focus_overlay = QFrame(self.scroll_area.viewport())
+        self._focus_overlay.setObjectName('overlayBar')
+        self._focus_overlay.setAttribute(
+            Qt.WidgetAttribute.WA_NoMousePropagation)
+        focus_layout = QHBoxLayout(self._focus_overlay)
+        focus_layout.setContentsMargins(0, 0, 0, 0)
+        focus_layout.setSpacing(0)
+        self._focus_previous_image_button = self._make_overlay_button(
+            '\u25c0', self.focus_previous_image_requested.emit)
+        self._focus_overlay_label = QLabel()
         self._focus_overlay_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._focus_overlay_label.hide()
+        self._focus_next_image_button = self._make_overlay_button(
+            '\u25b6', self.focus_next_image_requested.emit)
+        separator = QFrame()
+        separator.setObjectName('overlaySeparator')
+        separator.setFixedWidth(1)
+        self._focus_caption_button = self._make_overlay_button(
+            'Auto-Caption', self.focus_caption_requested.emit,
+            _FocusCaptionButton())
+        for widget in (self._focus_previous_image_button,
+                       self._focus_overlay_label,
+                       self._focus_next_image_button, separator,
+                       self._focus_caption_button):
+            focus_layout.addWidget(widget)
+        self._focus_overlay.hide()
         self._focus_overlay_enabled = False
         self.refresh_grid_overlay_style()
         self.scroll_area.clicked.connect(lambda: self.clicked.emit())
@@ -452,41 +591,16 @@ class ImageViewer(QWidget):
             defaultValue=DEFAULT_SETTINGS['max_image_preview_zoom'],
             type=int))
 
-    @staticmethod
-    def _transparency_to_alpha(transparency: int) -> int:
-        """Map a transparency percentage (0-100) to an alpha value (0-255).
-
-        Mirrors the resolution badge: 0% transparency -> fully opaque (255),
-        100% transparency -> fully transparent (0).
-        """
-        clamped = max(0, min(int(transparency), 100))
-        return round(255 * (100 - clamped) / 100)
-
     def refresh_grid_overlay_style(self):
-        """Re-read the grid overlay settings and apply them to the label."""
-        settings = get_settings()
-        self._grid_overlay_show = settings.value(
+        """Re-read the overlay settings and apply them to the grid page bar
+        and the focus mode bar."""
+        self._grid_overlay_show = get_settings().value(
             'variant_grid_overlay_show',
             defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_show'],
             type=bool)
-        self._grid_overlay_font_size = settings.value(
-            'variant_grid_overlay_font_size',
-            defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_font_size'],
-            type=int)
-        transparency = settings.value(
-            'variant_grid_overlay_transparency',
-            defaultValue=DEFAULT_SETTINGS['variant_grid_overlay_transparency'],
-            type=int)
-        self._grid_overlay_background_alpha = self._transparency_to_alpha(
-            transparency)
-        font_size = max(1, self._grid_overlay_font_size)
-        style = (f'background-color: rgba(0, 0, 0, '
-                 f'{self._grid_overlay_background_alpha}); '
-                 f'color: rgba(255, 255, 255, 220); '
-                 f'padding: 3px 8px; border-radius: 6px; '
-                 f'font-size: {font_size}pt;')
-        self._grid_overlay_label.setStyleSheet(style)
-        self._focus_overlay_label.setStyleSheet(style)
+        style = overlay_style_sheet()
+        self._grid_overlay.setStyleSheet(style)
+        self._focus_overlay.setStyleSheet(style)
         # Show/hide immediately to reflect a toggled "show overlay" setting.
         self._update_grid_overlay()
         self._update_focus_overlay()
@@ -504,56 +618,120 @@ class ImageViewer(QWidget):
         self._focus_overlay_enabled = enabled
         self._update_focus_overlay()
 
+    def set_focus_navigation_enabled(self, has_previous: bool,
+                                     has_next: bool):
+        self._focus_previous_image_button.setEnabled(has_previous)
+        self._focus_next_image_button.setEnabled(has_next)
+
+    def set_focus_caption_state(self, text: str, enabled: bool,
+                                progress: float | None = None):
+        """``progress`` (0-1) fills the button like a progress bar; None
+        shows no fill."""
+        button = self._focus_caption_button
+        button.setText(text)
+        button.setEnabled(enabled)
+        button.set_progress(progress)
+        self._update_focus_overlay()
+
+    def set_focus_caption_highlighted(self, highlighted: bool):
+        self._focus_caption_button.set_shortcut_highlighted(highlighted)
+
     def _update_focus_overlay(self):
-        label = self._focus_overlay_label
-        if not self._focus_overlay_enabled or not label.text():
-            label.hide()
+        overlay = self._focus_overlay
+        if not self._focus_overlay_enabled:
+            overlay.hide()
             return
-        label.adjustSize()
-        label.show()
-        label.raise_()
+        has_image = bool(self._focus_overlay_label.text())
+        self._focus_overlay_label.setVisible(has_image)
+        self._focus_previous_image_button.setVisible(has_image)
+        self._focus_next_image_button.setVisible(has_image)
+        overlay.adjustSize()
+        overlay.show()
+        overlay.raise_()
         self._position_focus_overlay()
 
     def _position_focus_overlay(self):
-        """Keep the focus mode overlay pinned to the bottom-right."""
-        label = self._focus_overlay_label
-        if not label.isVisible():
+        """Keep the focus mode control bar pinned to the bottom-right."""
+        overlay = self._focus_overlay
+        if not overlay.isVisible():
             return
         margin = 10
         viewport = self.scroll_area.viewport()
-        label.move(viewport.width() - label.width() - margin,
-                   viewport.height() - label.height() - margin)
+        # Never let the left edge (the ◀ button) slide off a narrow viewport.
+        overlay.move(max(margin, viewport.width() - overlay.width() - margin),
+                     viewport.height() - overlay.height() - margin)
+
+    @staticmethod
+    def _make_overlay_button(text: str, slot,
+                             button: QToolButton | None = None
+                             ) -> QToolButton:
+        button = button if button is not None else QToolButton()
+        button.setText(text)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Clicking must not take keyboard focus from where the user was.
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.clicked.connect(lambda: slot())
+        return button
+
+    def _grid_page_info(self) -> tuple[int, int, int]:
+        """Return (current page, page count, page size); pages count from 0."""
+        total = len(self._grid_proxy_indices or [])
+        cell_cap = self._grid_cell_cap if self._grid_cell_cap > 0 else total
+        cell_cap = max(1, cell_cap)
+        page_count = max(1, math.ceil(total / cell_cap))
+        return self._grid_current_position // cell_cap, page_count, cell_cap
+
+    def go_to_grid_page(self, step: int):
+        """Make the first image of the page ``step`` pages away current.
+
+        Goes through grid_cell_clicked so MainWindow moves only the current
+        image, exactly like clicking a cell; the selection is unchanged.
+        """
+        if not self._grid_mode or not self._grid_proxy_indices:
+            return
+        page, page_count, cell_cap = self._grid_page_info()
+        target_page = page + step
+        if not 0 <= target_page < page_count:
+            return
+        self.grid_cell_clicked.emit(
+            self._grid_proxy_indices[target_page * cell_cap])
 
     def _update_grid_overlay(self):
         """Refresh and show the subtle page / image-count overlay."""
-        if (not self._grid_overlay_show or not self._grid_mode
-                or self._grid_proxy_indices is None):
-            self._grid_overlay_label.hide()
+        if not self._grid_mode or self._grid_proxy_indices is None:
+            self._grid_overlay.hide()
             return
         total = len(self._grid_proxy_indices)
-        cell_cap = self._grid_cell_cap if self._grid_cell_cap > 0 else total
-        page_count = max(1, math.ceil(total / cell_cap))
-        current_page = self._grid_current_position // cell_cap + 1
+        page, page_count, _ = self._grid_page_info()
+        has_pages = page_count > 1
+        if not self._grid_overlay_show and not has_pages:
+            self._grid_overlay.hide()
+            return
         noun = 'image' if total == 1 else 'images'
-        if page_count > 1:
-            text = f'Page {current_page}/{page_count} \u00b7 {total} {noun}'
+        if has_pages:
+            text = f'Page {page + 1}/{page_count} \u00b7 {total} {noun}'
         else:
             text = f'{total} {noun}'
         self._grid_overlay_label.setText(text)
-        self._grid_overlay_label.adjustSize()
-        self._grid_overlay_label.show()
-        self._grid_overlay_label.raise_()
+        self._grid_overlay_label.setVisible(self._grid_overlay_show)
+        self._grid_previous_page_button.setVisible(has_pages)
+        self._grid_next_page_button.setVisible(has_pages)
+        self._grid_previous_page_button.setEnabled(page > 0)
+        self._grid_next_page_button.setEnabled(page < page_count - 1)
+        self._grid_overlay.adjustSize()
+        self._grid_overlay.show()
+        self._grid_overlay.raise_()
         self._position_grid_overlay()
 
     def _position_grid_overlay(self):
         """Keep the overlay pinned to the bottom-left of the viewport."""
-        if not self._grid_overlay_label.isVisible():
+        if not self._grid_overlay.isVisible():
             return
         margin = 10
         viewport = self.scroll_area.viewport()
-        label = self._grid_overlay_label
-        label.move(margin,
-                   viewport.height() - label.height() - margin)
+        overlay = self._grid_overlay
+        overlay.move(margin,
+                     viewport.height() - overlay.height() - margin)
 
     def _update_scaled_image(self, force_smooth: bool = False):
         anchor = self._pending_zoom_anchor
@@ -863,7 +1041,7 @@ class ImageViewer(QWidget):
         # arrival. The loader keeps its own reference until it finishes (it
         # removes itself in _on_grid_cells_loaded), so we must not drop it here.
         self._grid_render_token += 1
-        self._grid_overlay_label.hide()
+        self._grid_overlay.hide()
 
     def set_marked_paths(self, paths: list[str]):
         """Mark the grid cells whose image path is in ``paths``.

@@ -19,14 +19,14 @@ import sys
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import (QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl,
+from PySide6.QtCore import (QObject, QRunnable, Qt, QThreadPool, QUrl,
                             Signal, Slot)
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDialog,
                                QFileDialog,
                                QHBoxLayout, QHeaderView, QLabel, QMessageBox,
                                QProgressDialog, QPushButton, QStyle,
-                               QTabWidget,
+                               QStyleOptionTabWidgetFrame, QTabWidget,
                                QTextBrowser, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
@@ -143,6 +143,7 @@ class DirectoryAnalyticsDialog(QDialog):
         # NOT_LOADED.
         self.select_image_callback = select_image_callback
         self._scanner: AnalyticsScanner | None = None
+        self._progress: QProgressDialog | None = None
         self._report: AnalyticsReport | None = None
         self._closed = False
         # The window is widened to fit the Per-subfolder table only after the
@@ -239,15 +240,24 @@ class DirectoryAnalyticsDialog(QDialog):
         layout.addLayout(button_row)
 
         self._set_placeholder('Scanning\u2026')
-        # Run the first scan once the dialog is on screen, so the progress
-        # window appears over it rather than on its own beforehand.
-        QTimer.singleShot(0, self.start_scan)
 
+    def open_after_first_scan(self):
+        """Run the first scan with only its progress window on screen, then
+        show the dialog already sized to the results (cancelling closes it)."""
+        self.start_scan()
+
+    def _show_if_hidden(self):
+        # show() on an open dialog the user has dragged re-centres it over
+        # the main window.
+        if not self.isVisible():
+            self.show()
     def done(self, result):
         # Stop a running scan; its result is ignored once the dialog closes.
         self._closed = True
         if self._scanner is not None:
             self._scanner.cancel()
+        if self._progress is not None:
+            self._progress.reset()
         super().done(result)
 
     # ------------------------------------------------------------------
@@ -262,11 +272,13 @@ class DirectoryAnalyticsDialog(QDialog):
             self.status_label.setText('No folder is loaded. Load a directory '
                                       'first, then reopen this tool.')
             self._set_placeholder('No folder loaded.')
+            self._show_if_hidden()
             return
         images = list(self.image_list_model.images)
         if not images:
             self.status_label.setText('No images are loaded in this folder.')
             self._set_placeholder('No images loaded.')
+            self._show_if_hidden()
             return
 
         self.rescan_button.setEnabled(False)
@@ -276,12 +288,17 @@ class DirectoryAnalyticsDialog(QDialog):
 
         # Starts as a busy indicator while the folder is listed (the number of
         # files isn't known yet), then counts the images analysed.
-        progress = QProgressDialog('Listing files\u2026', 'Cancel', 0, 0, self)
+        # Before the dialog is first shown, the progress window sits over the
+        # main window instead.
+        progress = QProgressDialog(
+            'Listing files\u2026', 'Cancel', 0, 0,
+            self if self.isVisible() else self.parentWidget())
         progress.setWindowTitle('Directory Analytics')
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoReset(False)
         progress.setValue(0)
+        self._progress = progress
 
         scanner = AnalyticsScanner(
             images, self.directory_path,
@@ -301,13 +318,21 @@ class DirectoryAnalyticsDialog(QDialog):
             progress.setValue(done)
 
         def on_finished(report):
+            # The progress window may belong to the main window, so it isn't
+            # deleted along with this dialog.
+            progress.reset()
+            progress.deleteLater()
+            if self._progress is progress:
+                self._progress = None
             if self._closed:
                 return
             was_cancelled = scanner.cancelled
             self._scanner = None
-            progress.reset()
             self.rescan_button.setEnabled(True)
             if was_cancelled or report is None:
+                if not self.isVisible():
+                    self.reject()
+                    return
                 self.status_label.setText('Scan cancelled.')
                 self._set_placeholder('Scan cancelled.')
                 return
@@ -321,6 +346,7 @@ class DirectoryAnalyticsDialog(QDialog):
             self.status_label.setText(
                 f'Scanned {report.total_images} images '
                 f'({format_size(report.total_size_bytes)}).')
+            self._show_if_hidden()
 
         scanner.walking.connect(on_walking)
         scanner.progress.connect(on_progress)
@@ -589,11 +615,23 @@ class DirectoryAnalyticsDialog(QDialog):
         tree = self.subfolder_tree
         columns_width = sum(tree.header().sectionSize(column)
                             for column in range(tree.columnCount()))
-        # Everything around the table: dialog margins and tab frame (measured
-        # from the visible page, as hidden pages aren't laid out), the tree's
-        # frame and a vertical scrollbar.
-        page = self.tabs.currentWidget()
-        surrounding = (self.width() - page.width()
+        # Everything around the table: dialog margins and tab frame, the
+        # tree's frame and a vertical scrollbar. The page area comes from the
+        # style, as tab pages aren't laid out until the window is shown.
+        if not self.isVisible():
+            # Lay out the hidden window so the tab widget's size is known.
+            self.layout().activate()
+        tabs = self.tabs
+        option = QStyleOptionTabWidgetFrame()
+        option.initFrom(tabs)
+        option.rect = tabs.rect()
+        option.lineWidth = tabs.style().pixelMetric(
+            QStyle.PixelMetric.PM_DefaultFrameWidth, None, tabs)
+        option.shape = tabs.tabBar().shape()
+        option.tabBarSize = tabs.tabBar().sizeHint()
+        page_width = tabs.style().subElementRect(
+            QStyle.SubElement.SE_TabWidgetTabContents, option, tabs).width()
+        surrounding = (self.width() - page_width
                        + 2 * tree.frameWidth()
                        + tree.style().pixelMetric(
                            QStyle.PixelMetric.PM_ScrollBarExtent, None, tree)
@@ -601,6 +639,10 @@ class DirectoryAnalyticsDialog(QDialog):
         needed = columns_width + surrounding
         target = min(needed, int(available.width() * 0.9))
         if target <= self.width():
+            return
+        if not self.isVisible():
+            # Qt centres it over the main window when it is shown.
+            self.resize(target, self.height())
             return
         center = self.frameGeometry().center()
         self.resize(target, self.height())

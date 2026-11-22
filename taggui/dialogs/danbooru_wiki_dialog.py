@@ -5,21 +5,25 @@ from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlencode
 
-from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QThread, Qt,
-                            QTimer, QUrl, Signal, Slot)
-from PySide6.QtGui import (QColor, QDesktopServices, QFontMetrics, QPainter,
-                           QPainterPath, QPixmap, QStandardItem,
+from PySide6.QtCore import QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import (QDesktopServices, QStandardItem,
                            QStandardItemModel)
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel,
                                QCompleter, QLineEdit, QPushButton, QTextBrowser,
                                QVBoxLayout)
 
+from dialogs.booru_originals import (ORIGINAL_INTERNAL_LINK_PREFIX,
+                                     OriginalsMixin, decode_data_url_image)
 from models.tag_library_model import TagLibraryModel
-from utils.danbooru_session import (cancel_pending_fetches, danbooru_urlopen,
+from utils.danbooru_session import (api_key_problem, cancel_pending_fetches,
+                                    danbooru_urlopen,
                                     initialize_on_main_thread)
 from dialogs.wiki_dialog_base import (AUTOCOMPLETE_ANY_SUFFIX_PATTERN, AUTOCOMPLETE_COUNT_SUFFIX_PATTERN,
                                      BaseWikiDialog, TAG_GROUP_NORMALIZED_PREFIX,
-                                     TAG_GROUP_SEARCH_PREFIX, park_running_threads)
+                                     TAG_GROUP_SEARCH_PREFIX, display_wiki_title,
+                                     join_wiki_namespace, park_running_threads,
+                                     split_wiki_namespace,
+                                     strip_wiki_search_prefix)
 
 DANBOORU_BASE_URL = 'https://danbooru.donmai.us'
 # The Danbooru help page describing what tag deprecation means. Linked from the
@@ -34,6 +38,8 @@ WIKI_INTERNAL_LINK_PREFIX_LEGACY = 'taggui-wiki://'
 # routed by handle_anchor_clicked just like the wiki links above.
 POST_INTERNAL_LINK_PREFIX = 'taggui-post:'
 POSTS_INTERNAL_LINK_PREFIX = 'taggui-posts:'
+# Remembers the folder the last original was saved to.
+DOWNLOAD_DIRECTORY_SETTING = 'danbooru_download_directory'
 HEADING_WITH_ANCHOR_PATTERN = re.compile(
     r'^h([1-6])(?:#([A-Za-z0-9_-]+))?\.\s*(.*)$', re.IGNORECASE
 )
@@ -44,6 +50,7 @@ BULLETED_REFERENCE_LINE_PATTERN = re.compile(
     r'^\s*[\*\-•]\s+(!?(?:post|asset)\s+#\d+)(.*)$',
     re.IGNORECASE
 )
+LIST_ITEM_PATTERN = re.compile(r'^(\*+)\s+(.*)$')
 TOKEN_PATTERN = re.compile(
     r'"[^"]+":\[https?://[^\]\s]+\]'
     r'|"[^"]+":https?://(?:[^\s"<\]()]+|\([^\s"<\]()]*\))+'
@@ -52,8 +59,10 @@ TOKEN_PATTERN = re.compile(
     # URL in build_link_html.
     r'|"[^"]+":\[/[^\]\s]+\]'
     r'|"[^"]+":/[^\s"<\])]+'
+    # DText "<https://...>" (angle brackets delimit the URL and aren't shown).
+    r'|<https?://[^\s<>]+>'
     r'|https?://\S+|\[\[[^\]]+\]\]|\{\{[^}]+\}\}|pool\s+#\d+'
-    r'|!?(?:post|asset)\s+#\d+|"[^"]+":#[A-Za-z0-9_-]+',
+    r'|!?(?:post|asset)\s+#\d+|"[^"]+":\[?#[A-Za-z0-9_-]+\]?',
     re.IGNORECASE
 )
 NAMED_EXTERNAL_LINK_PATTERN = re.compile(
@@ -97,6 +106,21 @@ SPOILER_PATTERN = re.compile(r'\[spoiler\](.*?)\[/spoiler\]',
 # is shielded from the other inline formatting patterns (see
 # apply_inline_formatting_tags).
 CODE_PATTERN = re.compile(r'\[code\](.*?)\[/code\]', re.IGNORECASE | re.DOTALL)
+# DText translation notes used inline, e.g. a thumbnail caption
+# "[[tag]] [tn]| note[/tn]" (a [tn] that starts a line is a block note). DText
+# also accepts the <tn>...</tn> form, which arrives here HTML-escaped.
+INLINE_TN_PATTERN = re.compile(
+    r'(?:\[tn\]|&lt;tn&gt;)(.*?)(?:\[/tn\]|&lt;/tn&gt;)',
+    re.IGNORECASE | re.DOTALL)
+UNCLOSED_TN_PATTERN = re.compile(
+    r'^(.*?)(?:\[tn\]|&lt;tn&gt;)(.*)$', re.IGNORECASE | re.DOTALL)
+ANGLE_TN_TAG_PATTERN = re.compile(r'<(/?)tn>', re.IGNORECASE)
+# DText tables: [table] [thead]/[tbody] [tr] [th]/[td] ... [/table].
+TABLE_ROW_PATTERN = re.compile(r'\[tr\](.*?)\[/tr\]', re.IGNORECASE | re.DOTALL)
+TABLE_CELL_PATTERN = re.compile(
+    r'\[(th|td)((?:\s+[^\]]*)?)\](.*?)\[/\1\]', re.IGNORECASE | re.DOTALL)
+TABLE_CELL_ATTRIBUTE_PATTERN = re.compile(
+    r'(colspan|rowspan|align)\s*=\s*"?([A-Za-z0-9]+)"?', re.IGNORECASE)
 # Anchor style attribute inside a spoiler, so links are hidden by the black bar
 # too (Qt would otherwise draw them in the visible link colour).
 SPOILER_ANCHOR_STYLE_PATTERN = re.compile(r'(<a\b[^>]*?)\s+style="[^"]*"',
@@ -116,10 +140,6 @@ POSTS_PER_PAGE = 20
 # Typing this prefix in the search box (e.g. "posts:no humans") searches posts
 # for that tag directly instead of opening its wiki page.
 POSTS_SEARCH_PREFIX = 'posts:'
-# Longest edge (in pixels) of Danbooru's "sample"/large image, which is what we
-# embed on a single-post view. We never display it larger than this so the image
-# is never upscaled (which would look blurry).
-POST_VIEW_MAX_IMAGE_EDGE = 850
 # Danbooru tag categories → display colours (light theme, dark theme).
 TAG_CATEGORY_COLORS = {
     'copyright': ('#a800aa', '#c973cd'),
@@ -176,6 +196,47 @@ def image_url_to_data_url(image_url: str, interruption_check=None) -> str:
     return f'data:{content_type};base64,{encoded_image}'
 
 
+def post_unavailable_reason(post, preview_url: str) -> str:
+    """Short reason a post shows no thumbnail, for the placeholder label."""
+    if not isinstance(post, dict):
+        return 'Not found'
+    if preview_url:
+        # Danbooru offered an image, but downloading it failed.
+        return "Couldn't load"
+    if post.get('is_banned'):
+        return 'Banned'
+    if post.get('is_deleted'):
+        return 'Deleted'
+    status = _media_status_reason(post.get('media_asset'))
+    if status:
+        return status
+    # Danbooru withholds the image links (with no flag) for posts with tags
+    # restricted to higher account levels.
+    return 'Restricted (account level)'
+
+
+def asset_unavailable_reason(asset, preview_url: str) -> str:
+    """Short reason a media asset shows no thumbnail."""
+    if not isinstance(asset, dict):
+        return 'Not found'
+    if preview_url:
+        return "Couldn't load"
+    return (_media_status_reason(asset)
+            or ('Restricted' if asset.get('is_public') is False
+                else 'No preview'))
+
+
+def _media_status_reason(asset) -> str:
+    if not isinstance(asset, dict):
+        return ''
+    status = str(asset.get('status') or '')
+    if not status or status == 'active':
+        return ''
+    return {'deleted': 'Image deleted', 'expunged': 'Image removed',
+            'processing': 'Still processing',
+            'failed': 'Upload failed'}.get(status, f'Image {status}')
+
+
 def build_post_summaries_concurrently(posts: list, interruption_check=None) -> list:
     """Turn raw Danbooru post dicts into lightweight summaries with an inline
     thumbnail data URL, downloading the thumbnails in parallel."""
@@ -184,11 +245,14 @@ def build_post_summaries_concurrently(posts: list, interruption_check=None) -> l
     if not valid_posts:
         return []
 
-    def thumbnail_for(post: dict) -> str:
+    def thumbnail_for(post: dict) -> tuple[str, str]:
         preview_url = str(post.get('preview_file_url')
                           or post.get('large_file_url')
                           or post.get('file_url') or '')
-        return image_url_to_data_url(preview_url, interruption_check)
+        data_url = image_url_to_data_url(preview_url, interruption_check)
+        reason = ('' if data_url
+                  else post_unavailable_reason(post, preview_url))
+        return data_url, reason
 
     summaries = []
     with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
@@ -198,9 +262,11 @@ def build_post_summaries_concurrently(posts: list, interruption_check=None) -> l
         }
         for post in valid_posts:
             post_id = post.get('id')
+            data_url, reason = thumbnail_futures[post_id].result()
             summaries.append({
                 'id': post_id,
-                'thumbnail_data_url': thumbnail_futures[post_id].result(),
+                'thumbnail_data_url': data_url,
+                'unavailable_reason': reason,
                 'image_width': post.get('image_width') or 0,
                 'image_height': post.get('image_height') or 0,
             })
@@ -526,6 +592,7 @@ class DanbooruWikiFetchThread(QThread):
         if not post_ids or self.isInterruptionRequested():
             return details_by_id
         posts_by_id = {}
+        failed_ids = set()
         batch_size = 200
         for start in range(0, len(post_ids), batch_size):
             if self.isInterruptionRequested():
@@ -537,10 +604,12 @@ class DanbooruWikiFetchThread(QThread):
             try:
                 with danbooru_urlopen(posts_url, timeout=15) as response:
                     if response.status != 200:
+                        failed_ids.update(chunk)
                         continue
                     posts = json.loads(
                         response.read().decode('utf-8', errors='replace'))
             except Exception:
+                failed_ids.update(chunk)
                 continue
             if isinstance(posts, list):
                 for post in posts:
@@ -551,10 +620,13 @@ class DanbooruWikiFetchThread(QThread):
             post_data = posts_by_id.get(post_id)
             if not isinstance(post_data, dict):
                 return None
+            preview_url = self._post_preview_url(post_data)
+            data_url = self.fetch_thumbnail_data_url(preview_url)
             return {
                 'post': post_data,
-                'thumbnail_data_url': self.fetch_thumbnail_data_url(
-                    self._post_preview_url(post_data))
+                'thumbnail_data_url': data_url,
+                'unavailable_reason': '' if data_url else
+                post_unavailable_reason(post_data, preview_url),
             }
         with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
             futures = {post_id: executor.submit(build, post_id)
@@ -563,6 +635,14 @@ class DanbooruWikiFetchThread(QThread):
                 data = future.result()
                 if data is not None:
                     details_by_id[post_id] = data
+        # Posts the search did not return: removed, or hidden from searches.
+        for post_id in post_ids:
+            if post_id not in details_by_id:
+                details_by_id[post_id] = {
+                    'post': None, 'thumbnail_data_url': '',
+                    'unavailable_reason': ("Couldn't load"
+                                           if post_id in failed_ids
+                                           else 'Not found')}
         return details_by_id
 
     def fetch_assets_details_batched(self, asset_ids: list) -> dict:
@@ -573,6 +653,7 @@ class DanbooruWikiFetchThread(QThread):
         if not asset_ids or self.isInterruptionRequested():
             return details_by_id
         assets_by_id = {}
+        failed_ids = set()
         batch_size = 200
         for start in range(0, len(asset_ids), batch_size):
             if self.isInterruptionRequested():
@@ -584,10 +665,12 @@ class DanbooruWikiFetchThread(QThread):
             try:
                 with danbooru_urlopen(assets_url, timeout=15) as response:
                     if response.status != 200:
+                        failed_ids.update(chunk)
                         continue
                     assets = json.loads(
                         response.read().decode('utf-8', errors='replace'))
             except Exception:
+                failed_ids.update(chunk)
                 continue
             if isinstance(assets, list):
                 for asset in assets:
@@ -598,10 +681,13 @@ class DanbooruWikiFetchThread(QThread):
             asset_data = assets_by_id.get(asset_id)
             if not isinstance(asset_data, dict):
                 return None
+            preview_url = self._asset_preview_url(asset_data)
+            data_url = self.fetch_thumbnail_data_url(preview_url)
             return {
                 'asset': asset_data,
-                'thumbnail_data_url': self.fetch_thumbnail_data_url(
-                    self._asset_preview_url(asset_data))
+                'thumbnail_data_url': data_url,
+                'unavailable_reason': '' if data_url else
+                asset_unavailable_reason(asset_data, preview_url),
             }
         with ThreadPoolExecutor(max_workers=FETCH_WORKER_COUNT) as executor:
             futures = {asset_id: executor.submit(build, asset_id)
@@ -610,6 +696,13 @@ class DanbooruWikiFetchThread(QThread):
                 data = future.result()
                 if data is not None:
                     details_by_id[asset_id] = data
+        for asset_id in asset_ids:
+            if asset_id not in details_by_id:
+                details_by_id[asset_id] = {
+                    'asset': None, 'thumbnail_data_url': '',
+                    'unavailable_reason': ("Couldn't load"
+                                           if asset_id in failed_ids
+                                           else 'Not found')}
         return details_by_id
 
     def fetch_thumbnail_data_url(self, image_url: str):
@@ -662,8 +755,16 @@ class DanbooruPostsSearchThread(QThread):
         try:
             with danbooru_urlopen(posts_url, timeout=10) as response:
                 if response.status != 200:
+                    # Danbooru explains rejected searches (e.g. "You cannot
+                    # search for more than 2 tags at a time") in a JSON body.
+                    message = ''
+                    try:
+                        message = str(json.loads(response.read().decode(
+                            'utf-8', errors='replace')).get('message') or '')
+                    except Exception:
+                        pass
                     self.posts_failed.emit(
-                        self.request_key,
+                        self.request_key, message or
                         f'Danbooru returned status {response.status}.')
                     return
                 payload = response.read().decode('utf-8', errors='replace')
@@ -723,6 +824,8 @@ class DanbooruPostViewThread(QThread):
                         or post.get('preview_file_url') or '')
         post['_taggui_image_data_url'] = image_url_to_data_url(
             image_url, self.isInterruptionRequested)
+        post['_taggui_image'] = decode_data_url_image(
+            post['_taggui_image_data_url'])
         self.post_ready.emit(self.request_key, post)
 
 
@@ -735,7 +838,8 @@ class DanbooruTagAutocompleteThread(QThread):
         self.query_text = query_text
 
     def run(self):
-        original_query_text = self.query_text.strip()
+        original_query_text = join_wiki_namespace(
+            strip_wiki_search_prefix(self.query_text)[1])
         if not original_query_text:
             self.suggestions_ready.emit(self.query_text, [])
             return
@@ -839,7 +943,7 @@ class DanbooruTagAutocompleteThread(QThread):
             self.suggestions_ready.emit(self.query_text, [])
             return
 
-        group_filter = query_text[len(TAG_GROUP_NORMALIZED_PREFIX):].strip()
+        group_filter = query_text[len(TAG_GROUP_NORMALIZED_PREFIX):].strip(' _')
         group_filter = group_filter.replace(' ', '_').casefold()
         group_titles = self.get_tag_group_titles()
         if not group_titles:
@@ -892,12 +996,24 @@ class DanbooruTagAutocompleteThread(QThread):
         return deduped_titles
 
 
-class DanbooruWikiDialog(BaseWikiDialog):
+class DanbooruWikiDialog(OriginalsMixin, BaseWikiDialog):
     SITE_NAME = 'Danbooru'
+    DOWNLOAD_DIRECTORY_SETTING = DOWNLOAD_DIRECTORY_SETTING
     WINDOW_TITLE = 'Danbooru Wiki'
     EMPTY_TAG_MESSAGE = ('Enter a tag name in the search box to view wiki '
                          'pages from Danbooru.')
     AUTOCOMPLETE_THREAD_CLASS = DanbooruTagAutocompleteThread
+
+    def hide_loading(self):
+        """Keep a warning visible while the saved API key isn't working."""
+        problem = api_key_problem()
+        if not problem:
+            self.status_label.setToolTip('')
+            super().hide_loading()
+            return
+        self.show_status_message(
+            'Your Danbooru API key isn\'t fully working (hover for details).')
+        self.status_label.setToolTip(f'<p>{html.escape(problem)}</p>')
 
     def __init__(self, parent, tag: str,
                  tag_library_model: TagLibraryModel | None = None,
@@ -945,6 +1061,7 @@ class DanbooruWikiDialog(BaseWikiDialog):
         # added to the Tag Library / images, so a typo like "heart on cheeks"
         # -- which has no wiki page AND no posts -- stays non-addable.
         self._valid_posts_tags: set[str] = set()
+        self._init_originals_state()
         self._torn_down = False
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -973,9 +1090,14 @@ class DanbooruWikiDialog(BaseWikiDialog):
         self.stop_all_fetch_threads()
         self.stop_all_autocomplete_threads(wait=True)
         self.stop_all_posts_threads()
+        self._teardown_originals(park_running_threads)
         # Then release any worker blocked on an in-flight browser page fetch so
         # the parked threads wind down promptly.
         cancel_pending_fetches()
+        self._remove_originals_directory()
+
+    def _open_original_url(self, url: str, timeout: int):
+        return danbooru_urlopen(url, timeout=timeout)
 
     def done(self, result):
         self._teardown()
@@ -1023,74 +1145,8 @@ class DanbooruWikiDialog(BaseWikiDialog):
         internal_url = f'{WIKI_INTERNAL_LINK_PREFIX}{quote(normalized)}'
         return f'<a href="{internal_url}">{html.escape(label)}</a>'
 
-    def _render_chip_data_url(self, text: str, is_dark: bool) -> tuple:
-        """Render a single synonym chip (rounded rectangle + text) to a PNG
-        data URL. QTextBrowser ignores padding/border-radius on inline HTML,
-        so we draw the chip as an image to get true rounded corners. Returns
-        (data_url, logical_width, logical_height)."""
-        scale = max(1.0, self.devicePixelRatioF())
-        font = self.content_browser.font()
-        metrics = QFontMetrics(font)
-        padding_x = 8
-        padding_y = 3
-        text_width = metrics.horizontalAdvance(text)
-        text_height = metrics.height()
-        logical_width = text_width + padding_x * 2
-        logical_height = text_height + padding_y * 2
-
-        pixmap = QPixmap(round(logical_width * scale), round(logical_height * scale))
-        pixmap.setDevicePixelRatio(scale)
-        pixmap.fill(Qt.GlobalColor.transparent)
-
-        background = QColor('#3a3f4b' if is_dark else '#eef1f5')
-        text_color = QColor('#d7dae0' if is_dark else '#333333')
-
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setFont(font)
-        path = QPainterPath()
-        path.addRoundedRect(0.5, 0.5, logical_width - 1.0,
-                            logical_height - 1.0, 5.0, 5.0)
-        painter.fillPath(path, background)
-        painter.setPen(text_color)
-        painter.drawText(0, 0, logical_width, logical_height,
-                         int(Qt.AlignmentFlag.AlignCenter), text)
-        painter.end()
-
-        byte_array = QByteArray()
-        buffer = QBuffer(byte_array)
-        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-        pixmap.save(buffer, 'PNG')
-        buffer.close()
-        encoded = bytes(byte_array.toBase64()).decode('ascii')
-        return (f'data:image/png;base64,{encoded}',
-                logical_width, logical_height)
-
     def _build_other_names_html(self, is_dark: bool) -> str:
-        names = [str(name).strip() for name in (self._stored_other_names or [])
-                 if str(name).strip()]
-        if not names:
-            return ''
-        # All chips share the same height (same font), so compute a tight,
-        # pixel-based line-height: just the chip height plus a small gap so that
-        # wrapped rows sit as close together as the inline gap between chips.
-        metrics = QFontMetrics(self.content_browser.font())
-        chip_pixel_height = metrics.height() + 6
-        row_gap = 5
-        line_height = chip_pixel_height + row_gap
-        chips = []
-        for name in names:
-            label = name.replace('_', ' ')
-            data_url, chip_width, chip_height = self._render_chip_data_url(
-                label, is_dark)
-            # Let the browser copy this chip image as its text.
-            self.content_browser.register_image_text(data_url, label)
-            chips.append(
-                f'<img src="{data_url}" width="{chip_width}" '
-                f'height="{chip_height}" '
-                f'style="vertical-align: middle;">')
-        return (f'<div style="margin: 2px 0 3px 0; line-height: {line_height}px;">'
-                f'{"&nbsp;".join(chips)}</div>')
+        return self._build_chips_html(self._stored_other_names, is_dark)
 
     def _build_deprecated_note_html(self, is_dark: bool) -> str:
         """The small "This tag is deprecated..." footnote, mirroring the notice
@@ -1147,7 +1203,7 @@ class DanbooruWikiDialog(BaseWikiDialog):
         is_dark = self.palette().color(self.backgroundRole()).lightness() < 128
         title_color = (self._wiki_link_color(self._stored_wiki_title)
                        or ('#6baef6' if is_dark else '#0066cc'))
-        display_title = self._stored_wiki_title.replace('_', ' ')
+        display_title = display_wiki_title(self._stored_wiki_title)
         rendered_body = self.convert_dtext_to_html(self._stored_wiki_body)
         other_names_html = self._build_other_names_html(is_dark)
         deprecated_html = self._build_deprecated_note_html(is_dark)
@@ -1182,12 +1238,14 @@ class DanbooruWikiDialog(BaseWikiDialog):
                 'border: 1px solid palette(mid);" '
                 f'alt="Post #{html.escape(str(post_id))}">')
         else:
-            # Some posts have no usable thumbnail (e.g. video/flash) — show a
-            # simple labelled placeholder that still links to the post.
+            # Some posts have no usable thumbnail (e.g. banned or restricted)
+            # — show a labelled placeholder that still links to the post.
+            reason = str(post.get('unavailable_reason') or '')
+            reason_html = (f'<br>({html.escape(reason)})' if reason else '')
             inner = (
                 '<span style="display: inline-block; padding: 24px 10px; '
                 'border: 1px solid palette(mid); color: palette(mid);">'
-                f'post #{html.escape(str(post_id))}</span>')
+                f'post #{html.escape(str(post_id))}{reason_html}</span>')
         return (
             f'<td align="center" style="padding: 6px; vertical-align: middle;">'
             f'<a href="{html.escape(internal_url, quote=True)}">{inner}</a>'
@@ -1240,19 +1298,11 @@ class DanbooruWikiDialog(BaseWikiDialog):
 
 
     def normalize_tag(self, tag: str) -> str:
-        normalized = str(tag).strip()
-        normalized_casefold = normalized.casefold()
-        if normalized_casefold.startswith(TAG_GROUP_SEARCH_PREFIX):
-            normalized = ('tag_group:'
-                          + normalized[len(TAG_GROUP_SEARCH_PREFIX):].lstrip())
-        elif normalized_casefold.startswith(TAG_GROUP_NORMALIZED_PREFIX):
-            normalized = ('tag_group:'
-                          + normalized[len(TAG_GROUP_NORMALIZED_PREFIX):].lstrip())
-        normalized = normalized.replace(' ', '_')
-        if normalized.casefold().startswith(TAG_GROUP_NORMALIZED_PREFIX):
-            normalized = ('tag_group:'
-                          + normalized[len(TAG_GROUP_NORMALIZED_PREFIX):]
-                          .casefold())
+        # "tag group: birds" / "help: pixiv" -> "tag_group:birds" /
+        # "help:pixiv". Danbooru's namespaced wiki titles are all lowercase.
+        normalized = join_wiki_namespace(tag).replace(' ', '_')
+        if split_wiki_namespace(normalized) is not None:
+            normalized = normalized.casefold()
         return normalized
 
 
@@ -1273,13 +1323,25 @@ class DanbooruWikiDialog(BaseWikiDialog):
             if popup is not None:
                 popup.hide()
             self.stop_all_autocomplete_threads()
-            tag = self.normalize_tag(
-                self.extract_tag_name_from_search_text(remainder))
-            if not tag:
+            # Commas separate tags ("posts: dog, cat"); spaces within a tag
+            # become underscores as usual.
+            tags = []
+            for part in remainder.split(','):
+                tag = self.normalize_tag(
+                    self.extract_tag_name_from_search_text(part))
+                if tag and tag not in tags:
+                    tags.append(tag)
+            if not tags:
                 return
-            self.load_posts_search(tag, 1, add_to_history=True)
+            self.load_posts_search(' '.join(tags), 1, add_to_history=True)
             return
         super().search_tag()
+
+    @staticmethod
+    def _posts_display_tags(tags: str) -> str:
+        """Readable form of a posts search, e.g. "dog cat_ears" ->
+        "dog, cat ears"."""
+        return ', '.join(tag.replace('_', ' ') for tag in str(tags).split())
 
     @Slot(str, str)
     def show_not_found(self, request_key: str, normalized_tag: str):
@@ -1288,8 +1350,9 @@ class DanbooruWikiDialog(BaseWikiDialog):
         a bad numeric wiki-page id still shows the normal "not found" message."""
         if request_key != self.current_request_key:
             return
-        if request_key.startswith('tag:') and str(normalized_tag or '').strip():
-            self._fallback_to_posts_search(str(normalized_tag).strip())
+        tags = self.posts_fallback_tags(request_key, normalized_tag)
+        if tags:
+            self._fallback_to_posts_search(tags)
             return
         super().show_not_found(request_key, normalized_tag)
 
@@ -1318,7 +1381,7 @@ class DanbooruWikiDialog(BaseWikiDialog):
         else:
             self.pending_history_update = True
 
-        display_tag = normalized_tag.replace('_', ' ')
+        display_tag = display_wiki_title(normalized_tag)
         self.current_request_key = f'tag:{normalized_tag}'
         self.setWindowTitle(f'Danbooru Wiki: {display_tag}')
         self.set_search_text_silently(display_tag)
@@ -1438,10 +1501,12 @@ class DanbooruWikiDialog(BaseWikiDialog):
             self.tag_history.append({'type': 'posts', 'tags': tags,
                                      'page': page})
             self.history_index = len(self.tag_history) - 1
-        display_tags = tags.replace('_', ' ')
+        display_tags = self._posts_display_tags(tags)
         self.current_request_key = f'posts:{tags}:{page}'
         self.setWindowTitle(f'Danbooru Posts: {display_tags} (page {page})')
-        self.set_search_text_silently(display_tags)
+        # Posts searches always show their "posts:" prefix, so the box reads
+        # the same however the search was started and Enter repeats it.
+        self.set_search_text_silently(f'posts: {display_tags}')
         self._active_composer = None
         self.show_loading()
         self._set_browser_html('')
@@ -1504,7 +1569,7 @@ class DanbooruWikiDialog(BaseWikiDialog):
         category_color = self._category_id_to_color(state.get('category'))
         if category_color:
             heading_color = category_color
-        display_tags = tags.replace('_', ' ')
+        display_tags = self._posts_display_tags(tags)
         # Record the ordered ids so a post opened from this grid can offer
         # prev/next and a link back to this search page.
         self._grid_context = {
@@ -1588,6 +1653,7 @@ class DanbooruWikiDialog(BaseWikiDialog):
         self._set_browser_html(self._compose_post_html())
         self.hide_loading()
         self.update_add_to_library_button_state()
+        self._update_open_viewer(post)
 
     def _compose_post_html(self) -> str:
         post = self._stored_post or {}
@@ -1603,9 +1669,10 @@ class DanbooruWikiDialog(BaseWikiDialog):
         nav_html = self._build_post_nav_html(
             post_id, query, neighbors, page, is_dark)
         image_html = self._build_post_image_html(post)
+        original_html = self._build_post_original_html(post, is_dark)
         info_html = self._build_post_info_html(post, is_dark)
         tags_html = self._build_post_tags_html(post, is_dark)
-        return nav_html + image_html + info_html + tags_html
+        return nav_html + image_html + original_html + info_html + tags_html
 
     def _build_post_nav_html(self, post_id: str, query: str, neighbors: list,
                              page: int, is_dark: bool) -> str:
@@ -1651,25 +1718,9 @@ class DanbooruWikiDialog(BaseWikiDialog):
             return ('<p style="color: palette(mid); margin: 4px 0;">'
                     'This post cannot be previewed here '
                     '(it may be a video, animation, or restricted).</p>' + link)
-        width = int(post.get('image_width') or 0)
-        height = int(post.get('image_height') or 0)
-        if width > 0 and height > 0:
-            # `width`/`height` are the ORIGINAL dimensions, but the image we embed
-            # is Danbooru's sample (long edge <= POST_VIEW_MAX_IMAGE_EDGE). Work
-            # out the sample's natural width so we never scale it up.
-            longest_edge = max(width, height)
-            if longest_edge > POST_VIEW_MAX_IMAGE_EDGE:
-                natural_width = max(
-                    1, round(width * POST_VIEW_MAX_IMAGE_EDGE / longest_edge))
-            else:
-                natural_width = width
-            viewport_width = self.content_browser.viewport().width() - 32
-            display_width = max(1, min(natural_width, viewport_width))
-            size_attr = f'width="{display_width}"'
-        else:
-            size_attr = 'style="max-width: 100%;"'
-        return ('<p style="margin: 4px 0;"><img src="'
-                f'{html.escape(data_url, quote=True)}" {size_attr}></p>')
+        image_html = self._link_image_to_original(
+            post, self._fitted_post_image_html(post))
+        return f'<p style="margin: 4px 0;">{image_html}</p>'
 
     def _build_post_info_html(self, post: dict, is_dark: bool) -> str:
         note_color = '#9aa0aa' if is_dark else '#555555'
@@ -1768,14 +1819,17 @@ class DanbooruWikiDialog(BaseWikiDialog):
             escaped_url = html.escape(f'{DANBOORU_BASE_URL}{path}', quote=True)
             return f'<a href="{escaped_url}">{html.escape(label)}</a>'
 
+        if token.startswith('<http') and token.endswith('>'):
+            token = token[1:-1]
         if token.startswith('http'):
             escaped_url = html.escape(token, quote=True)
             return f'<a href="{escaped_url}">{html.escape(token)}</a>'
 
-        if token.startswith('"') and '":#' in token:
-            quoted_label, anchor_target = token.split('":#', 1)
+        if token.startswith('"') and ('":#' in token or '":[#' in token):
+            separator = '":[#' if '":[#' in token else '":#'
+            quoted_label, anchor_target = token.split(separator, 1)
             anchor_label = quoted_label[1:].strip()
-            normalized_anchor_target = anchor_target.strip()
+            normalized_anchor_target = anchor_target.strip().rstrip(']')
             if not normalized_anchor_target:
                 return html.escape(token)
             return (
@@ -1857,6 +1911,16 @@ class DanbooruWikiDialog(BaseWikiDialog):
             text = text.replace('[br]', '<br>')
         else:
             text = text.replace('[br]', ' ')
+        # Inline [code] is literal: hide it from link detection (otherwise
+        # "[code]http://[/code]" becomes a link that swallows "[/code]") and
+        # put it back for apply_inline_formatting_tags to render.
+        code_spans: list[str] = []
+
+        def hide_code(match: re.Match) -> str:
+            code_spans.append(match.group(0))
+            return f'\x00RAWCODE{len(code_spans) - 1}\x00'
+
+        text = CODE_PATTERN.sub(hide_code, text)
         html_parts = []
         position = 0
         for token_match in TOKEN_PATTERN.finditer(text):
@@ -1873,7 +1937,11 @@ class DanbooruWikiDialog(BaseWikiDialog):
             html_parts.append(self.build_link_html(token, link_label_suffix=trailing_suffix))
             position = new_position
         html_parts.append(html.escape(text[position:]).replace('&lt;br&gt;', '<br>'))
-        return self.apply_inline_formatting_tags(''.join(html_parts))
+        joined_html = ''.join(html_parts)
+        for index, span in enumerate(code_spans):
+            joined_html = joined_html.replace(
+                f'\x00RAWCODE{index}\x00', html.escape(span, quote=False))
+        return self.apply_inline_formatting_tags(joined_html)
 
     def apply_inline_formatting_tags(self, text_html: str) -> str:
         # [code]...[/code] is literal monospace text. Stash each span behind a
@@ -1897,6 +1965,19 @@ class DanbooruWikiDialog(BaseWikiDialog):
                 formatted_text
             )
         formatted_text = self.apply_spoiler_tags(formatted_text)
+        formatted_text = INLINE_TN_PATTERN.sub(
+            lambda match: (
+                f'<span style="font-size: 0.85em; '
+                f'color: {self._muted_note_color()};">'
+                f'{match.group(1).strip()}</span>'),
+            formatted_text)
+        # Danbooru closes an unclosed [tn] at the end of its paragraph.
+        formatted_text = UNCLOSED_TN_PATTERN.sub(
+            lambda match: (
+                f'{match.group(1)}<span style="font-size: 0.85em; '
+                f'color: {self._muted_note_color()};">'
+                f'{match.group(2).strip()}</span>'),
+            formatted_text)
         for index, rendered in enumerate(code_placeholders):
             formatted_text = formatted_text.replace(
                 f'\x00CODE{index}\x00', rendered)
@@ -1953,14 +2034,73 @@ class DanbooruWikiDialog(BaseWikiDialog):
             f'{inner_html}</td></tr></table>'
         )
 
+    def _build_table_html(self, table_dtext: str) -> str:
+        """Render a DText [table] like Danbooru: bold headers over a strong
+        rule, thin lines between rows and alternate rows shaded. Qt rich text
+        draws per-cell borders reliably, so the rules are cell borders."""
+        rows_html = []
+        body_row_index = 0
+        for row_match in TABLE_ROW_PATTERN.finditer(table_dtext):
+            cells = list(TABLE_CELL_PATTERN.finditer(row_match.group(1)))
+            if not cells:
+                continue
+            is_header = all(cell.group(1).casefold() == 'th' for cell in cells)
+            if is_header:
+                cell_style = ('border-bottom: 2px solid palette(text); '
+                              'padding: 3px 24px 3px 6px; font-weight: bold; '
+                              'text-align: left;')
+            else:
+                shade = ('background-color: palette(alternate-base); '
+                         if body_row_index % 2 else '')
+                cell_style = (f'{shade}border-bottom: 1px solid palette(mid); '
+                              'padding: 3px 24px 3px 6px;')
+                body_row_index += 1
+            cells_html = []
+            for cell in cells:
+                tag = 'th' if cell.group(1).casefold() == 'th' else 'td'
+                attributes = ''
+                for name, value in TABLE_CELL_ATTRIBUTE_PATTERN.findall(
+                        cell.group(2) or ''):
+                    attributes += (f' {name.lower()}='
+                                   f'"{html.escape(value, quote=True)}"')
+                content = ' '.join(
+                    part.strip() for part in cell.group(3).splitlines()
+                    if part.strip())
+                cells_html.append(
+                    f'<{tag}{attributes} style="{cell_style}">'
+                    f'{self.linkify_inline_text(content)}</{tag}>')
+            rows_html.append(f'<tr>{"".join(cells_html)}</tr>')
+        if not rows_html:
+            return ''
+        return ('<table cellspacing="0" style="border-collapse: collapse; '
+                f'margin: 4px 0 16px 0;">{"".join(rows_html)}</table>')
+
+    def _unavailable_thumbnail_html(self, url: str, label: str,
+                                    details) -> str:
+        """Clickable "post #N" text plus a muted reason for the missing
+        thumbnail."""
+        reason = ''
+        if isinstance(details, dict):
+            reason = str(details.get('unavailable_reason') or '')
+        else:
+            # Ids past MAX_PREVIEW_POSTS are never fetched.
+            reason = 'Not loaded'
+        link = (f'<a href="{html.escape(url, quote=True)}">'
+                f'{html.escape(label)}</a>')
+        if not reason:
+            return link
+        return (f'{link} <span style="color: {self._muted_note_color()};">'
+                f'({html.escape(reason)})</span>')
+
     def build_post_thumbnail_html(self, post_id: str) -> str:
         post_data = self.post_details_by_id.get(post_id)
         post_url = f'{DANBOORU_BASE_URL}/posts/{quote(post_id)}'
-        if not isinstance(post_data, dict):
-            return f'<a href="{html.escape(post_url, quote=True)}">post #{html.escape(post_id)}</a>'
-        thumbnail_data_url = str(post_data.get('thumbnail_data_url') or '')
+        thumbnail_data_url = ''
+        if isinstance(post_data, dict):
+            thumbnail_data_url = str(post_data.get('thumbnail_data_url') or '')
         if not thumbnail_data_url:
-            return f'<a href="{html.escape(post_url, quote=True)}">post #{html.escape(post_id)}</a>'
+            return self._unavailable_thumbnail_html(
+                post_url, f'post #{post_id}', post_data)
         return (
             f'<a href="{html.escape(post_url, quote=True)}">'
             f'<img src="{html.escape(thumbnail_data_url, quote=True)}" '
@@ -1972,11 +2112,12 @@ class DanbooruWikiDialog(BaseWikiDialog):
     def build_asset_thumbnail_html(self, asset_id: str) -> str:
         asset_data = self.asset_details_by_id.get(asset_id)
         asset_url = f'{DANBOORU_BASE_URL}/media_assets/{quote(asset_id)}'
-        if not isinstance(asset_data, dict):
-            return f'<a href="{html.escape(asset_url, quote=True)}">asset #{html.escape(asset_id)}</a>'
-        thumbnail_data_url = str(asset_data.get('thumbnail_data_url') or '')
+        thumbnail_data_url = ''
+        if isinstance(asset_data, dict):
+            thumbnail_data_url = str(asset_data.get('thumbnail_data_url') or '')
         if not thumbnail_data_url:
-            return f'<a href="{html.escape(asset_url, quote=True)}">asset #{html.escape(asset_id)}</a>'
+            return self._unavailable_thumbnail_html(
+                asset_url, f'asset #{asset_id}', asset_data)
         return (
             f'<a href="{html.escape(asset_url, quote=True)}">'
             f'<img src="{html.escape(thumbnail_data_url, quote=True)}" '
@@ -1986,6 +2127,7 @@ class DanbooruWikiDialog(BaseWikiDialog):
         )
 
     def convert_dtext_to_html(self, body: str) -> str:
+        body = ANGLE_TN_TAG_PATTERN.sub(r'[\1tn]', body)
         lines = body.splitlines()
         html_lines = []
         thumbnail_buffer = []  # list of (thumb_html, caption_html)
@@ -2070,6 +2212,59 @@ class DanbooruWikiDialog(BaseWikiDialog):
             # A stray closing tag with no matching opener: drop it silently
             # rather than printing the literal marker.
             if casefolded_line == '[/quote]':
+                continue
+
+            # A block [code] ... [/code] on their own lines: literal,
+            # preformatted text on a shaded background.
+            if casefolded_line == '[code]':
+                flush_thumbnails()
+                while html_lines and html_lines[-1] == '<br>':
+                    html_lines.pop()
+                scan_index = index + 1
+                while (scan_index < len(lines)
+                       and lines[scan_index].strip().casefold() != '[/code]'):
+                    scan_index += 1
+                skip_until = scan_index + 1
+                code_text = '\n'.join(
+                    lines[index + 1:scan_index]).strip('\r\n')
+                html_lines.append(
+                    '<table cellspacing="0" style="margin: 2px 0 14px 0;">'
+                    '<tr><td style="background-color: palette(alternate-base);'
+                    ' padding: 6px 10px;"><pre style="margin: 0; '
+                    f'font-family: monospace;">{html.escape(code_text)}</pre>'
+                    '</td></tr></table>')
+                continue
+            if casefolded_line == '[/code]':
+                continue
+
+            if casefolded_line == '[hr]':
+                flush_thumbnails()
+                while html_lines and html_lines[-1] == '<br>':
+                    html_lines.pop()
+                # A plain <hr> after a table starts at the table's right
+                # edge in QTextBrowser, so draw the rule as a full-width table.
+                html_lines.append(
+                    '<table width="100%" cellspacing="0" '
+                    'style="margin: 6px 0 10px 0;"><tr><td '
+                    'style="border-top: 1px solid palette(mid);"></td></tr>'
+                    '</table>')
+                continue
+
+            # DText tables: everything from [table] to [/table], usually one
+            # tag per line, rendered as a real table.
+            if casefolded_line.startswith('[table]'):
+                flush_thumbnails()
+                while html_lines and html_lines[-1] == '<br>':
+                    html_lines.pop()
+                scan_index = index
+                while (scan_index < len(lines) - 1 and '[/table]'
+                       not in lines[scan_index].casefold()):
+                    scan_index += 1
+                skip_until = scan_index + 1
+                html_lines.append(self._build_table_html(
+                    '\n'.join(lines[index:scan_index + 1])))
+                continue
+            if casefolded_line == '[/table]':
                 continue
 
             # DText translation notes: [tn]...[/tn]. Danbooru renders these as a
@@ -2205,31 +2400,17 @@ class DanbooruWikiDialog(BaseWikiDialog):
 
             # List items: use inline <p> with text bullet to avoid Qt's
             # oversized <li> disc bullets and large default list indentation.
-            # Check *** before ** before * since each is a prefix of the next.
-            if stripped_line.startswith('*** '):
-                flush_thumbnails()
-                while html_lines and html_lines[-1] == '<br>':
-                    html_lines.pop()
-                list_item = self.linkify_inline_text(stripped_line[4:].strip())
-                html_lines.append(
-                    f'<p style="margin: 0 0 0 32px;">&bull;&nbsp;{list_item}</p>')
-                continue
-            if stripped_line.startswith('** '):
+            # The number of leading asterisks is the nesting depth.
+            list_match = LIST_ITEM_PATTERN.match(stripped_line)
+            if list_match:
                 flush_thumbnails()
                 # Strip heading's trailing <br> so list items sit close to the heading.
                 while html_lines and html_lines[-1] == '<br>':
                     html_lines.pop()
-                list_item = self.linkify_inline_text(stripped_line[3:].strip())
+                indent = 16 * (len(list_match.group(1)) - 1)
+                list_item = self.linkify_inline_text(list_match.group(2).strip())
                 html_lines.append(
-                    f'<p style="margin: 0 0 0 16px;">&bull;&nbsp;{list_item}</p>')
-                continue
-            if stripped_line.startswith('* '):
-                flush_thumbnails()
-                while html_lines and html_lines[-1] == '<br>':
-                    html_lines.pop()
-                list_item = self.linkify_inline_text(stripped_line[2:].strip())
-                html_lines.append(
-                    f'<p style="margin: 0;">&bull;&nbsp;{list_item}</p>')
+                    f'<p style="margin: 0 0 0 {indent}px;">&bull;&nbsp;{list_item}</p>')
                 continue
 
             flush_thumbnails()
@@ -2286,7 +2467,7 @@ class DanbooruWikiDialog(BaseWikiDialog):
             self.history_index = len(self.tag_history) - 1
             self.pending_history_append_on_load = False
             self.update_navigation_buttons()
-        display_tag = title.replace('_', ' ')
+        display_tag = display_wiki_title(title)
         self.setWindowTitle(f'Danbooru Wiki: {display_tag}')
         self.set_search_text_silently(display_tag)
         self.update_add_to_library_button_state()
@@ -2305,7 +2486,8 @@ class DanbooruWikiDialog(BaseWikiDialog):
         if url_text.startswith(WIKI_INTERNAL_LINK_PREFIX):
             return False
         if (url_text.startswith(POST_INTERNAL_LINK_PREFIX)
-                or url_text.startswith(POSTS_INTERNAL_LINK_PREFIX)):
+                or url_text.startswith(POSTS_INTERNAL_LINK_PREFIX)
+                or url_text.startswith(ORIGINAL_INTERNAL_LINK_PREFIX)):
             return False
         # The deprecation-notice help page is opened in the external browser
         # rather than navigated to inside the dialog.
@@ -2364,6 +2546,8 @@ class DanbooruWikiDialog(BaseWikiDialog):
                 self.load_posts_search(search_tags, search_page,
                                        add_to_history=True)
             return
+        if self.handle_original_link(url_text):
+            return
 
         decoded_url_text = unquote(url_text)
         parsed_url = urlparse(decoded_url_text)
@@ -2403,9 +2587,14 @@ class DanbooruWikiDialog(BaseWikiDialog):
 
     @Slot(str)
     def on_search_text_changed(self, text: str):
-        if '(' in text and ')' in text:
-            cleaned = AUTOCOMPLETE_COUNT_SUFFIX_PATTERN.sub('', text).strip()
-            if cleaned and cleaned != text:
+        # Drop a pasted autocomplete count like " (1.2k)". Only rewrite the
+        # box when one was actually removed: tags such as "nice nature
+        # (umamusume)" also contain parentheses, and stripping the text
+        # anyway would eat the space typed after them.
+        cleaned, removed = AUTOCOMPLETE_COUNT_SUFFIX_PATTERN.subn('', text)
+        if removed:
+            cleaned = cleaned.strip()
+            if cleaned:
                 self.search_line_edit.setText(cleaned)
                 text = cleaned
         self.queue_autocomplete_search(text)

@@ -57,8 +57,8 @@ captioning.
 - **Completion tracking** — mark images as done to keep your place, with an
   optional check icon on finished thumbnails.
 - **Integrated token counter** for estimating caption length.
-- **Directory analytics**, **duplicate image detection**, and **booru wiki
-  lookups** built in.
+- **Directory analytics**, **duplicate image detection**, **tag-balanced
+  validation sets**, and **booru wiki lookups** built in.
 - **Import / export settings** and full **keyboard-shortcut customization**.
 
 ## Installation
@@ -205,6 +205,11 @@ want it gone, delete only the model files inside it by hand. Settings backups
 made by **Reset to Defaults** live in the cache folder, so removing the caches
 also removes those backups.
 
+Validation set "never pick" marks are saved in hidden `.taggui_validation.json`
+files next to your images, not with the app. If the loaded folder (or any of
+its subfolders) has any, the tool shows an extra, unticked option to delete
+them. Load each dataset folder in turn to clear its marks.
+
 You can also clear just the thumbnail cache from
 **`Settings` → `Clear Thumbnail Cache`**.
 
@@ -220,7 +225,9 @@ You can also clear just the thumbnail cache from
 | Scan caches (`dimension_cache.json`, `caption_cache.json`, `completion_cache.json`) | `%LOCALAPPDATA%\taggui` | `~/Library/Caches/taggui` | `~/.cache/taggui` |
 | Settings backups made by Reset to Defaults (`settings-backup-*.json`) | `%LOCALAPPDATA%\taggui` | `~/Library/Caches/taggui` | `~/.cache/taggui` |
 | Danbooru wiki browser profile (Cloudflare/login cookies and a small cache) | `%APPDATA%\taggui\taggui\QtWebEngine\taggui-danbooru` and `%LOCALAPPDATA%\taggui\taggui\cache\QtWebEngine\taggui-danbooru` | A `QtWebEngine/taggui-danbooru` folder under `~/Library/Application Support/taggui` and under `~/Library/Caches/taggui` | A `QtWebEngine/taggui-danbooru` folder under `~/.local/share/taggui` and under `~/.cache/taggui` |
+| Saved Danbooru API key (only if you added one) | Windows Credential Manager, generic credential `TagGUI Plus` | Keychain, service `TagGUI Plus` | Secret Service keyring, service `TagGUI Plus` |
 | Downloaded captioning models (often several GB) | Your configured models directory, or the Hugging Face cache `%USERPROFILE%\.cache\huggingface` (or wherever `HF_HUB_CACHE` / `HF_HOME` points) | Your models directory, or `~/.cache/huggingface` | Your models directory, or `~/.cache/huggingface` |
+| Validation set "never pick" marks | Hidden `.taggui_validation.json` in each image folder that has marks | Same | Same |
 
 </details>
 
@@ -448,6 +455,9 @@ When you **select two or more images** (with the feature enabled in
   across all of them at once. The **current** image has a **blue outline**; use
   `Left` / `Right` to move the current image through the selection without
   changing what is selected.
+  If the selection has more images than fit on one page, the label at the
+  bottom-left of the preview shows the page (for example **Page 2/3**), with
+  **◀** / **▶** buttons to jump to the previous or next page.
 - **Grouped Image Tags pane** — the pane shows a single combined tag list, but
   each tag now carries a **`k/N` badge** for how many of the selected images
   have it:
@@ -490,7 +500,7 @@ scope matches what you're looking at.
 > You can turn this off (and always keep the single-image view) with
 > **`Settings` → Images pane → `Group tags & show grid when multiple images are
 > selected`**. The **`Max grid cells for multi-image preview`** setting caps how
-> many images are drawn in the grid at once, for performance.
+> many images are drawn in the grid at once (one page), for performance.
 
 ## The tools
 
@@ -557,33 +567,53 @@ using perceptual hashing and shows each group side by side.
 
 - A **strictness slider** controls how similar images must be to count as
   duplicates (0 = visually identical, higher = more lenient).
-- For each group you **keep one image**; the rest can be sent to the **Recycle
-  Bin/Trash**, **moved to a folder**, or **tagged as `duplicate`** for later
-  review.
-- **Keep in each group** picks the kept image automatically: *Largest
-  resolution*, *Largest file*, *Newest file*, *Oldest file* or *Most tags*.
-  *Newest* and *Oldest* compare each file's **modified** date, which is shown
-  on every image. **Apply to all groups** replaces any picks you made by hand
-  and skips groups marked *Ignore this group*.
-- **Copy the tags of the other images to the kept image** adds any tags the
+- For each group you tick **Keep** on any number of images; the rest can be
+  sent to the **Recycle Bin/Trash**, **moved to a folder**, or **tagged as
+  `duplicate`** for later review. Ticking **Keep** again unkeeps an image.
+  Each group's title shows how many of its images are kept, and its **Keep
+  all** and **Keep none** buttons tick or clear every image at once. Images
+  that aren't kept are dimmed (like images without the focused tag in the
+  grid view) until you point at them.
+- A group that keeps **none** of its images has **all** of them deleted,
+  moved or tagged; deleting or moving asks for confirmation with a warning
+  first. Use **Keep all** to leave a group untouched.
+- **Keep in each group** picks one kept image automatically: *Largest
+  resolution*, *Largest file*, *Newest (created date)*, *Oldest (created
+  date)*, *Newest (modified date)*, *Oldest (modified date)* or *Most tags*.
+  Both dates are shown on every image. Copying a file gives the copy a new
+  created date but keeps the original's modified date. **Apply to all
+  groups** replaces any picks you made by hand, and asks first if any group
+  keeps more than one image or none.
+- Each image shows its tag count and whether it has a natural language
+  prompt (**Prompt** or *No prompt*). Click the tag count or **Prompt** to
+  read them.
+- **Copy the tags of the other images to the kept images** adds any tags each
   kept image is missing (at the end of its tag list) before the others are
   deleted, moved or tagged.
-- Each image is labelled with how it relates to the kept one: **Identical
-  file** means byte-for-byte the same file; **Looks identical** or **Differs
-  by N** compare a 256-bit visual fingerprint, where N is how many of those
-  bits differ (lower = more alike).
+- Each image is labelled with how it relates to the kept image it most closely
+  matches: **Identical file** means byte-for-byte the same file; **Looks
+  identical** or **Differs by N** compare a 256-bit visual fingerprint, where N
+  is how many of those bits differ (lower = more alike).
 - Mouse-wheel scrolling over a group's row scrolls the results list; use
   `Shift`+wheel (or sideways scrolling on a touchpad) to scroll along the row.
 - **Click a thumbnail** to open the group in a larger viewer:
   - Zoom with the mouse wheel, `+`/`-` or the main window's zoom keys
     (`Ctrl`+`+`, `Ctrl`+`-`), drag to pan, and press `0`/`Ctrl`+`0` or
     double-click to reset the zoom. The zoom level is kept when moving between
-    images, so you can compare the same detail.
+    images, so you can compare the same detail, and each image appears only
+    once it is fully loaded (no blurry preview first), so even small
+    differences stand out at fit-to-window zoom.
   - `←`/`→` move between the group's images, `G` toggles a grid of the whole
-    group (in the grid, double-click or `Enter` opens an image; if the grid is
-    zoomed, the first double-click only resets the zoom), `K` or `Enter` keeps
-    the shown image, `F11` toggles full screen and `Esc` leaves full screen or
-    closes the viewer.
+    group (in the grid, images that aren't kept are dimmed except the current
+    one and the one under the mouse; double-click or `Enter` opens an image;
+    if the grid is zoomed, the first double-click only resets the zoom), `K`
+    (or the **Keep this image** button) keeps or unkeeps the shown image,
+    `Enter` keeps it, `F11` toggles full screen and `Esc` leaves full screen
+    or closes the viewer. The controls stay on screen; their text size and
+    transparency follow the overlay settings in **Settings → Images pane**.
+    A kept image shows a green check mark next to **Keeping this image**,
+    matching the green **Keep** check boxes in the results list. The image on show stays undimmed in the
+    results list.
 
 > [!WARNING]
 > The strictness slider is **very sensitive to variant sets** — groups of images
@@ -623,6 +653,55 @@ as non-image files.
   <img src='images/TagGUI_Directory_Analytics.png' alt='TagGUI Plus Directory Analytics'>
 </p>
 
+### Create Validation Set
+
+**`Tools` → `Create Validation Set…`** (available once a folder is loaded).
+Sets aside a share of a folder's images as a **validation set** for LoRA or
+fine-tuning, and moves them (with their caption files) into a subfolder.
+
+- **Folder** — the folder to take images from, listed with its image count. It
+  starts on the folder of the current image. Tick **Include subfolders** to
+  also use the images in its subfolders.
+- **Validation share** — the percentage to set aside (rounded up, so 10% of 41
+  images is 5). Images already in the validation subfolder count toward it, so
+  running the tool again only tops the set up.
+- **Subfolder name** — where the picks go, inside the chosen folder
+  (`Validation_Set` by default). Folders with this name are never used as a
+  source.
+- **Keep variants together** — near-identical variants of an image are picked
+  (or skipped) together, so no near-copy ends up on both sides of the split.
+  **Exact / identical only** groups only byte-identical copies and is quick,
+  because it doesn't need to open the images. **Strict**, **Medium** and
+  **Loose** also catch edited variants, but the first check of a folder reads
+  every image (the results are shared with Find Duplicates, so later checks are
+  quick). **Off** skips the check entirely. Images already in the validation
+  subfolder are checked too: any variant of one of them is picked
+  automatically so it joins it, even if that goes over the share. If such a
+  variant is marked "never pick" or dropped, the status line says it will
+  stay in training.
+
+Click **Pick Images**. Images are chosen so that each tag appears in the
+validation set about as often as in the whole folder, and the line below shows
+how many of the tags that are common enough to expect in a set this size are
+covered. Click **Missed Tags** to list the ones that are missed. Picks have a
+green outline, images already set aside a dashed blue one. Review the picks and:
+
+- **Drop Pick** — leave the selected picks out; replacements are picked
+  automatically.
+- **Never Pick** / **Allow** — permanently keep the selected images out of
+  every validation set (for example your best training images). The marks are
+  saved in a hidden `.taggui_validation.json` file in the image's folder, so
+  they travel with the dataset. To clear them all, set Show to "Never pick",
+  select everything and click **Allow**, or use the
+  "never pick" option in **Settings → Remove App Data…**.
+- **Re-roll** — pick a fresh random set.
+- **Return to Folder** — move the selected images already set aside (and their
+  captions) back out of the validation subfolder into the folder it is in.
+
+Double-click a thumbnail to open the image. **Move** and **Return to Folder**
+ask for confirmation, move the images and captions (completion marks move with
+them), and reload the folder.
+
 ### Danbooru / Gelbooru Wiki
 
 **`Tools` → `Danbooru Wiki…`** (`Ctrl`+`D`) and
@@ -631,6 +710,14 @@ tag. These look up a tag's meaning on the Danbooru or Gelbooru wikis so you can
 learn what a tag means and see related tags, then add it to your Tag Library, to
 the selected images, or — in the [grid view](#tagging-variant-images) — to just
 the current image.
+
+**Both wikis are off by default.** They show content from third-party sites,
+which may include NSFW material. To turn one on, open **`Settings` →
+`Danbooru Wiki`** (or **`Gelbooru Wiki`**), tick **Enable Danbooru Wiki** (or
+**Enable Gelbooru Wiki**), and choose **Enable** in the warning that appears.
+While a wiki is off, its menu items, right-click entries and shortcut are hidden.
+This switch is not included in settings exports, so importing settings never
+turns a wiki on.
 
 The **Danbooru Wiki** in particular does more than a plain tag lookup:
 
@@ -648,14 +735,78 @@ You reach tag groups and post search through the **search bar** using simple
 prefixes:
 
 - To search a **tag group**, type `tag group:` followed by the group name — for
-  example `tag group:hair`. Typing just `tag group:` on its own suggests
+  example `tag group: hair` (the space after the colon is optional). Typing
+  just `tag group:` on its own suggests
   matching groups via autocomplete, but for a **complete list** it's better to
   look up the **`tag groups`** wiki page itself (type `tag groups` into the
   search bar with no prefix), which lists every tag group in its table of
   contents.
+- Danbooru's other special pages work the same way: `help:`, `howto:`,
+  `about:`, `api:` and `pool group:` (e.g. `help: pixiv`). The search bar and
+  page heading always show them with a space after the colon. If such a page
+  doesn't exist you get a "not found" message rather than a posts search.
 - To search **posts** for a tag, type `posts:` followed by the tag — for example
-  `posts:no humans`.
+  `posts: no humans`. Separate several tags with commas to find posts that have
+  all of them, e.g. `posts: dog, cat`. Danbooru limits how many tags you can
+  search at once; signing in (below) raises that limit. Without `posts:`, a
+  search that has no wiki page (including several comma-separated tags) shows
+  the matching posts instead. Whichever way a posts search starts, the search
+  bar shows it as `posts: …`.
+- To look up **only** a wiki page, type `wiki:` first (e.g. `wiki: cats`). If
+  there's no such page you get a "not found" message instead of posts.
+- On a post's page, the image fits the window's width (never enlarged past the
+  size the site provides). **View full size** (or clicking the image) opens the
+  original image in a zoomable window, and **Download original** saves it
+  (the save dialog starts in the folder you last used). Videos offer only the
+  download.
+- The full-size window opens fitted to the window, but a small image is never
+  enlarged past its actual size. The current zoom percentage is shown next to
+  the buttons at the top. **Double-click** switches between fit and 100%
+  (actual size); **`1`** jumps to 100%, **`0`** fits to the window, and
+  **`+`** / **`-`** or the mouse wheel zoom (pausing at exactly 100% on the
+  way). While it's open, it follows along: viewing another post in the wiki
+  shows that post's image in the full-size window too.
+- The **Left** / **Right** arrow keys go to the previous / next page of a posts
+  search, or the previous / next post on a post's page. While typing in the
+  search bar, the arrow keys move the text cursor as usual.
 - Typing anything without a prefix does a normal wiki lookup for that tag.
+
+**Signing in to Danbooru (optional):** in **`Settings` → `Danbooru Wiki`**,
+enter your Danbooru user name and an API key (create one at
+[danbooru.donmai.us/api_keys](https://danbooru.donmai.us/api_keys)), then press
+**Save and Test**. The wiki then uses your account's limits. For safety:
+
+- Give the key only read permissions (`posts`, `wiki_pages`, `tags`,
+  `tag_aliases`, `tag_implications`, `media_assets`, `autocomplete` and
+  `users:profile`), or leave the permissions empty to allow everything.
+- The key is kept in your system password store (Windows Credential Manager,
+  macOS Keychain, or the Secret Service keyring on Linux), never in TagGUI's
+  settings or settings exports, and is only sent to `danbooru.donmai.us` over
+  HTTPS. It is never shown again after saving.
+- **Remove** in Settings (or **Remove app data**) deletes it from this computer.
+  To revoke the key completely, also delete it on the Danbooru API keys page.
+
+The **Gelbooru Wiki** works the same way, apart from tag groups (Gelbooru
+doesn't have them):
+
+- Tags are **coloured by type** (artist, character, copyright, metadata, …) in
+  the wiki, post pages and autocomplete, and a wiki page shows example posts.
+- **Post search** uses the same `posts:` prefix, e.g. `posts: dog, cat`.
+  Gelbooru has no limit on how many tags you can combine. Looking up a tag
+  (or several comma-separated tags) that has no wiki page shows its posts
+  instead, and the `wiki:` prefix works here too.
+- Post pages offer the same **View full size** and **Download original**
+  buttons.
+
+**Gelbooru account (optional):** in **`Settings` → `Gelbooru Wiki`**, enter
+your numeric user ID and API key — the easiest way is to copy the whole API
+access line from your
+[Gelbooru account options page](https://gelbooru.com/index.php?page=account&s=options)
+(it looks like `&api_key=…&user_id=…`) and paste it into the API key box, which
+fills in both — then press **Save and Test**. With a key, TagGUI Plus uses
+Gelbooru's API, which is faster and more reliable; without one it reads the
+normal web pages. The key is stored and removed in the same safe way as the
+Danbooru key above, and is only sent to `gelbooru.com` over HTTPS.
 
 > [!NOTE]
 > You can add **any legitimate Danbooru tag** to your Tag Library or images, even
@@ -688,7 +839,9 @@ prefixes:
   max preview zoom, auto-focusing the Add Tag box when you type, and the
   **variant grid view** (group tags and show a synchronized grid when multiple
   images are selected, plus its max cell count — see
-  [Tagging variant images](#tagging-variant-images)). **Note:**
+  [Tagging variant images](#tagging-variant-images)), and the text size and
+  background transparency of the overlays drawn on images (the grid page bar,
+  the focus mode bar and the Find Duplicates large viewer). **Note:**
   setting the **max preview zoom** very high can cause performance issues when
   zoomed in on large images. TagGUI Plus mitigates this — for example it
   automatically switches to faster (lower-quality) rendering above 10x zoom and
@@ -993,7 +1146,7 @@ shortcuts`**; the defaults are listed below.
 | Previous / next image | `Ctrl`+`Up` / `Ctrl`+`Down` |
 | Jump to first untagged / incomplete image | `Ctrl`+`J` / `Ctrl`+`Shift`+`J` |
 | Toggle `Natural language mode` / `Current image only` (mode button) | `Ctrl`+`Space` |
-| Focus mode (also in the `View` menu): full screen showing only the image preview, with an image-count overlay, and the Image Tags pane; `Esc` also exits, and `Alt+F` / `Alt+S` exit before focusing their box; after starting auto-captioning with `Alt+C`, `Enter`, focus returns to where it was (e.g. the selected tag); leaving focus mode also keeps focus where it was | `F11` |
+| Focus mode (also in the `View` menu): full screen showing only the image preview, with a bottom-right control bar (◀ / ▶ previous / next image — within a multi-image selection they move through the selected images like `Left` / `Right`, turning grid pages as needed, without losing the selection — the image count (within a selection, e.g. `Image 1 / 4` for a grid of 4), and an `Auto-Caption` button that turns into `Cancel Captioning` with progress while a run is going, filling up like a progress bar when captioning several images; captioning errors pop up because the console is hidden), and the Image Tags pane; `Esc` also exits, and `Alt+F` / `Alt+S` exit before focusing their box; `Alt+C` outlines the `Auto-Caption` button; after starting auto-captioning with `Alt+C`, `Enter`, focus returns to where it was (e.g. the selected tag); leaving focus mode also keeps focus where it was | `F11` |
 
 ### Focus shortcuts
 

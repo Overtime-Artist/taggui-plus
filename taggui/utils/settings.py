@@ -111,6 +111,12 @@ DEFAULT_SETTINGS = {
     # (exact / byte-identical). This is the default; raise it in the dialog to
     # also catch visually similar near-duplicates.
     'duplicate_detection_strictness': 0,
+    # Tools > Create Validation Set: the share of images to set aside, the
+    # name of the subfolder they are moved into, and whether images in
+    # subfolders of the chosen folder count too.
+    'validation_set_percentage': 10,
+    'validation_set_folder_name': 'Validation_Set',
+    'validation_set_include_subfolders': False,
     # When enabled, selecting two or more images switches the Image Tags pane
     # into a grouped Common/Partial view and the center preview into a
     # synchronized grid of the selected images. Disable to keep the classic
@@ -127,6 +133,10 @@ DEFAULT_SETTINGS = {
     'variant_grid_overlay_show': True,
     'variant_grid_overlay_font_size': 10,
     'variant_grid_overlay_transparency': 55,
+    # The Danbooru/Gelbooru wikis show third-party (often NSFW) content, so
+    # they stay off until the user enables them in Settings.
+    'danbooru_wiki_enabled': False,
+    'gelbooru_wiki_enabled': False,
 }
 
 
