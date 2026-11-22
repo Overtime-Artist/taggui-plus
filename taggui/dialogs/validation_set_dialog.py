@@ -39,7 +39,6 @@ from utils.validation_set import (DEFAULT_FOLDER_NAME,
 from widgets.image_list import transfer_images
 
 _CELL_SIZE = 150
-_TEXT_HEIGHT = 18
 
 SHOW_PICKS = 'Picks'
 SHOW_ALL = 'All images'
@@ -92,7 +91,8 @@ class _ThumbnailDelegate(QStyledItemDelegate):
         self.dialog = dialog
 
     def sizeHint(self, option, index):
-        return QSize(_CELL_SIZE + 8, _CELL_SIZE + _TEXT_HEIGHT + 8)
+        text_height = option.fontMetrics.height() + 4
+        return QSize(_CELL_SIZE + 8, _CELL_SIZE + text_height + 8)
 
     def paint(self, painter: QPainter, option, index):
         item = index.data(Qt.ItemDataRole.UserRole)
@@ -136,8 +136,8 @@ class _ThumbnailDelegate(QStyledItemDelegate):
             self._draw_badge(painter, image_rect,
                              f'{unit_size} variants', top_right=False)
         painter.setFont(option.font)
-        text_rect = QRect(cell.left(), image_rect.bottom() + 2, cell.width(),
-                          _TEXT_HEIGHT)
+        text_rect = QRect(cell.left(), image_rect.bottom() + 1, cell.width(),
+                          cell.bottom() - image_rect.bottom())
         if option.state & QStyle.StateFlag.State_Selected:
             painter.setPen(palette.highlightedText().color())
         else:
