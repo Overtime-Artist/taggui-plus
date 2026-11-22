@@ -143,6 +143,7 @@ class DirectoryAnalyticsDialog(QDialog):
         # NOT_LOADED.
         self.select_image_callback = select_image_callback
         self._scanner: AnalyticsScanner | None = None
+        self._progress: QProgressDialog | None = None
         self._report: AnalyticsReport | None = None
         self._closed = False
         # The window is widened to fit the Per-subfolder table only after the
@@ -255,6 +256,8 @@ class DirectoryAnalyticsDialog(QDialog):
         self._closed = True
         if self._scanner is not None:
             self._scanner.cancel()
+        if self._progress is not None:
+            self._progress.reset()
         super().done(result)
 
     # ------------------------------------------------------------------
@@ -295,6 +298,7 @@ class DirectoryAnalyticsDialog(QDialog):
         progress.setMinimumDuration(0)
         progress.setAutoReset(False)
         progress.setValue(0)
+        self._progress = progress
 
         scanner = AnalyticsScanner(
             images, self.directory_path,
@@ -314,11 +318,16 @@ class DirectoryAnalyticsDialog(QDialog):
             progress.setValue(done)
 
         def on_finished(report):
+            # The progress window may belong to the main window, so it isn't
+            # deleted along with this dialog.
+            progress.reset()
+            progress.deleteLater()
+            if self._progress is progress:
+                self._progress = None
             if self._closed:
                 return
             was_cancelled = scanner.cancelled
             self._scanner = None
-            progress.reset()
             self.rescan_button.setEnabled(True)
             if was_cancelled or report is None:
                 if not self.isVisible():
