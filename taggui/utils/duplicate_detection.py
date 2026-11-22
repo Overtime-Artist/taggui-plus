@@ -24,6 +24,7 @@ recomputes files whose modification time changed.
 from __future__ import annotations
 
 import os
+import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -173,21 +174,36 @@ class ImageRecord:
     """Lightweight per-image data used during a duplicate scan."""
 
     def __init__(self, path: Path, dimensions, size: int | None,
-                 mtime_ns: int | None, sha256: str | None, dhash: int | None):
+                 mtime_ns: int | None, sha256: str | None, dhash: int | None,
+                 created_ns: int | None = None):
         self.path = path
         self.dimensions = dimensions
         self.size = size
         self.mtime_ns = mtime_ns
+        self.created_ns = created_ns
         self.sha256 = sha256
         self.dhash = dhash
 
 
-def _stat_size_mtime(path: Path) -> tuple[int | None, int | None]:
+def _created_ns(stat) -> int | None:
+    """The file's creation time, or None where the OS doesn't record it."""
+    birth_ns = getattr(stat, 'st_birthtime_ns', None)
+    if birth_ns is not None:
+        return birth_ns
+    # Before Python 3.12, st_ctime is the creation time on Windows (but the
+    # last metadata change elsewhere).
+    if sys.platform == 'win32':
+        return stat.st_ctime_ns
+    return None
+
+
+def _stat_file(path: Path) -> tuple[int | None, int | None, int | None]:
+    """Return (size, modified ns, created ns)."""
     try:
         stat = path.stat()
-        return stat.st_size, stat.st_mtime_ns
+        return stat.st_size, stat.st_mtime_ns, _created_ns(stat)
     except OSError:
-        return None, None
+        return None, None, None
 
 
 # Bits set in each byte value, for numpy versions without `bitwise_count`.
@@ -245,10 +261,11 @@ def find_duplicate_groups(images, threshold: int,
     done = 0
     for index, image in enumerate(image_list):
         path = Path(image.path)
-        size, mtime_ns = _stat_size_mtime(path)
+        size, mtime_ns, created_ns = _stat_file(path)
         records[index] = ImageRecord(
             path=path, dimensions=getattr(image, 'dimensions', None),
-            size=size, mtime_ns=mtime_ns, sha256=None, dhash=None)
+            size=size, mtime_ns=mtime_ns, sha256=None, dhash=None,
+            created_ns=created_ns)
     if exact_only:
         # Identical files must be the same size, so only files sharing a
         # size with another file are read, and none are decoded.

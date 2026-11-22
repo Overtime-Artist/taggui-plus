@@ -567,17 +567,27 @@ using perceptual hashing and shows each group side by side.
 
 - A **strictness slider** controls how similar images must be to count as
   duplicates (0 = visually identical, higher = more lenient).
-- For each group you tick **Keep** on one or more images; the rest can be sent
-  to the **Recycle Bin/Trash**, **moved to a folder**, or **tagged as
-  `duplicate`** for later review. Ticking **Keep** again unkeeps an image. A
-  group always keeps at least one image, so the last kept image's **Keep** box
-  is greyed out until you keep another.
+- For each group you tick **Keep** on any number of images; the rest can be
+  sent to the **Recycle Bin/Trash**, **moved to a folder**, or **tagged as
+  `duplicate`** for later review. Ticking **Keep** again unkeeps an image.
+  Each group's title shows how many of its images are kept, and its **Keep
+  all** and **Keep none** buttons tick or clear every image at once. Images
+  that aren't kept are dimmed (like images without the focused tag in the
+  grid view) until you point at them.
+- A group that keeps **none** of its images has **all** of them deleted,
+  moved or tagged; deleting or moving asks for confirmation with a warning
+  first. Use **Keep all** to leave a group untouched.
 - **Keep in each group** picks one kept image automatically: *Largest
-  resolution*, *Largest file*, *Newest file*, *Oldest file* or *Most tags*.
-  *Newest* and *Oldest* compare each file's **modified** date, which is shown
-  on every image. **Apply to all groups** replaces any picks you made by hand
-  and skips groups marked *Ignore this group*.
-- **Copy the tags of the other images to the kept image** adds any tags each
+  resolution*, *Largest file*, *Newest (created date)*, *Oldest (created
+  date)*, *Newest (modified date)*, *Oldest (modified date)* or *Most tags*.
+  Both dates are shown on every image. Copying a file gives the copy a new
+  created date but keeps the original's modified date. **Apply to all
+  groups** replaces any picks you made by hand, and asks first if any group
+  keeps more than one image or none.
+- Each image shows its tag count and whether it has a natural language
+  prompt (**Prompt** or *No prompt*). Click the tag count or **Prompt** to
+  read them.
+- **Copy the tags of the other images to the kept images** adds any tags each
   kept image is missing (at the end of its tag list) before the others are
   deleted, moved or tagged.
 - Each image is labelled with how it relates to the kept image it most closely
@@ -594,11 +604,13 @@ using perceptual hashing and shows each group side by side.
     once it is fully loaded (no blurry preview first), so even small
     differences stand out at fit-to-window zoom.
   - `←`/`→` move between the group's images, `G` toggles a grid of the whole
-    group (in the grid, double-click or `Enter` opens an image; if the grid is
-    zoomed, the first double-click only resets the zoom), `K` (or the **Keep
-    this image** button) keeps or unkeeps the shown image, `Enter` keeps it,
-    `F11` toggles full screen and `Esc` leaves full screen or closes the
-    viewer.
+    group (in the grid, images that aren't kept are dimmed except the current
+    one and the one under the mouse; double-click or `Enter` opens an image;
+    if the grid is zoomed, the first double-click only resets the zoom), `K`
+    (or the **Keep this image** button) keeps or unkeeps the shown image,
+    `Enter` keeps it, `F11` toggles full screen and `Esc` leaves full screen
+    or closes the viewer. The image on show stays undimmed in the results
+    list.
 
 > [!WARNING]
 > The strictness slider is **very sensitive to variant sets** — groups of images
